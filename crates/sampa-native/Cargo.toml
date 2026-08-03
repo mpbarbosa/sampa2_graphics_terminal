@@ -1,0 +1,37 @@
+[package]
+name = "sampa-native"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Sampa — Rust-only (native) graphical terminal (Path C)."
+
+[[bin]]
+name = "sampa"
+path = "src/main.rs"
+
+# --- Shared headless core (origin repo), per ADR 0002 -------------------------
+# Local N0 development uses path deps against a sibling checkout. Committed/CI
+# builds should switch to a git dep pinned to a rev, e.g.:
+#   pty-core = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "36e344b8f727fe62d94ae5fe0b9467821b26b684" }
+# (Cargo searches the repo's subdirectories for each crate.)
+[dependencies]
+pty-core       = { path = "../../../sampa_graphics_terminal/crates/pty-core" }
+sampa-config   = { path = "../../../sampa_graphics_terminal/crates/config" }
+sampa-cli      = { path = "../../../sampa_graphics_terminal/crates/cli" }
+sampa-shellint = { path = "../../../sampa_graphics_terminal/crates/shellint" }
+sampa-palette  = { path = "../../../sampa_graphics_terminal/crates/palette" }
+sampa-man      = { path = "../../../sampa_graphics_terminal/crates/man" }
+sampa-preview  = { path = "../../../sampa_graphics_terminal/crates/preview" }
+
+anyhow = "1"
+winit = "0.30.13"
+alacritty_terminal = "0.26.0"
+glyphon = "0.12.0"
+wgpu = "30.0.0"
+pollster = "1.0.1"
+arboard = "3.6.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# --- Native stack (ADR 0003) — added incrementally for the N0 window ----------
+# winit, wgpu, cosmic-text, alacritty_terminal, arboard land in the N0 spike.
