@@ -63,10 +63,17 @@ Path B / xterm.js is ~305). The remaining ~272 are **genuine feature gaps in the
 10 DECSEL · 8 DECCRA · 8 BS · 22 color edge-cases (special/dynamic/change) …
 ```
 
+### Correctness notes (no esctest delta)
+
+- **`CSI 8;h;w t` (XTWINOPS resize) is now honored** — the scanner detects it and resizes
+  the grid + PTY (the engine ignored it). +0 on esctest (the rest of XtermWinops probes
+  iconify/maximize/position/state, which need real window manipulation and aren't
+  feasible headless), but it's a real feature for apps that resize via escape.
+
 ## Follow-up (to raise the baseline) — roughly by leverage
 
-1. **XtermWinops (28)** — real resize on `CSI 8;h;w t` (resize the PTY + grid), plus the
-   position/size reports it queries.
+1. **XtermWinops reports (partial)** — the position/size/state reports it queries
+   (`CSI 11/13/14/19 t`); the manipulation ops (iconify/maximize) can't pass headless.
 2. **DECRQM extended modes (24)** — cover modes esctest probes that alacritty reports as
    "not recognized"; several are legitimate "known bugs".
 3. **Selective erase (DECSED/DECSEL, 25)** — DECSCA protected attributes.
