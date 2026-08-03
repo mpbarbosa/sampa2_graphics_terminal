@@ -74,6 +74,7 @@ struct CellVis {
     italic: bool,
     underline: bool,
     strike: bool,
+    hyperlink: bool,
 }
 
 /// One frame's worth of grid content, extracted under the term lock.
@@ -712,6 +713,30 @@ impl App {
         }
     }
 
+    /// Open an OSC-8 hyperlink under the given cell, if any and if its scheme is safe.
+    /// Explicit-action only (Ctrl+click); shows the target in the title, never auto-opens.
+    fn open_hyperlink_at(&mut self, col: usize, row: usize) -> bool {
+        let uri = match self.state.lock() {
+            Ok(g) => {
+                let d = g.term.grid().display_offset() as i32;
+                g.term.grid()[Line(row as i32 - d)][Column(col)]
+                    .hyperlink()
+                    .map(|h| h.uri().to_string())
+            }
+            Err(_) => None,
+        };
+        match uri {
+            Some(uri) if is_safe_url(&uri) => {
+                if let Some(w) = &self.window {
+                    w.set_title(&format!("↗ {}", sanitize_title(&uri)));
+                }
+                let _ = std::process::Command::new("xdg-open").arg(&uri).spawn();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn on_mouse_button(&mut self, button: MouseButton, pressed: bool) {
         let cb_base = match button {
             MouseButton::Left => 0,
@@ -719,6 +744,13 @@ impl App {
             MouseButton::Right => 2,
             _ => return,
         };
+        // Ctrl+click opens a hyperlink under the cursor (explicit action, §13).
+        if button == MouseButton::Left && pressed && self.modifiers.control_key() {
+            let (col, row) = (self.mouse_col, self.mouse_row);
+            if self.open_hyperlink_at(col, row) {
+                return;
+            }
+        }
         if button == MouseButton::Left {
             self.left_down = pressed;
         }
@@ -1122,7 +1154,15 @@ fn cell_vis(
         italic: flags.contains(Flags::ITALIC),
         underline,
         strike: flags.contains(Flags::STRIKEOUT),
+        hyperlink: cell.hyperlink().is_some(),
     }
+}
+
+/// Whether a URL is safe to hand to the OS opener — http/https only (§13: never open
+/// `file:`, `javascript:`, or other schemes from terminal output).
+fn is_safe_url(uri: &str) -> bool {
+    let u = uri.trim();
+    u.starts_with("http://") || u.starts_with("https://")
 }
 
 fn rgb_arr(c: Rgb) -> [u8; 3] {
@@ -1392,7 +1432,7 @@ impl Renderer {
                         color: self.color4(cell.bg),
                     });
                 }
-                if cell.underline {
+                if cell.underline || cell.hyperlink {
                     deco_quads.push(QuadInstance {
                         rect: [x, y + self.line_h - 2.0, self.cell_w, 1.5],
                         color: self.color4(cell.fg),
@@ -1588,7 +1628,7 @@ impl Gfx {
 /// Offscreen render of a color demo to a PNG. Proves the color/cursor pipeline
 /// visually without a display server, and doubles as a CI screenshot test.
 fn capture(path: &str) -> Result<()> {
-    const DEMO: &[u8] = b"\x1b[31mRED \x1b[32mGREEN \x1b[33mYELLOW \x1b[34mBLUE \x1b[35mMAGENTA \x1b[36mCYAN\x1b[0m\r\n\x1b[1;91mBOLD-BRIGHT-RED\x1b[0m  \x1b[7mINVERSE\x1b[0m  \x1b[2mDIM\x1b[0m\r\n\x1b[38;2;255;140;0mTRUECOLOR-ORANGE\x1b[0m  \x1b[44;97m white-on-blue \x1b[0m\r\n\x1b[4mUNDERLINE\x1b[0m  \x1b[9mSTRIKETHROUGH\x1b[0m\r\nSEAM_OK color demo\r\n";
+    const DEMO: &[u8] = b"\x1b[31mRED \x1b[32mGREEN \x1b[33mYELLOW \x1b[34mBLUE \x1b[35mMAGENTA \x1b[36mCYAN\x1b[0m\r\n\x1b[1;91mBOLD-BRIGHT-RED\x1b[0m  \x1b[7mINVERSE\x1b[0m  \x1b[2mDIM\x1b[0m\r\n\x1b[38;2;255;140;0mTRUECOLOR-ORANGE\x1b[0m  \x1b[44;97m white-on-blue \x1b[0m\r\n\x1b[4mUNDERLINE\x1b[0m  \x1b[9mSTRIKETHROUGH\x1b[0m  \x1b]8;;https://example.com\x1b\\OSC8-LINK\x1b]8;;\x1b\\\r\nSEAM_OK color demo\r\n";
     let (cols, rows) = (64usize, 8usize);
 
     let mut parser: Processor = Processor::new();
@@ -1742,6 +1782,26 @@ mod tests {
         let curs = cell_vis(&term.grid()[Line(0)][Column(0)], colors, true, false);
         assert_eq!(curs.fg, plain.bg);
         assert_eq!(curs.bg, plain.fg);
+    }
+
+    #[test]
+    fn osc8_hyperlink_tracked() {
+        let (mut term, _r, _a) = proxy_term(20, 2);
+        let mut parser: Processor = Processor::new();
+        // OSC 8 ; ; https://example.com  <X>  OSC 8 ; ;  (close)
+        parser.advance(&mut term, b"\x1b]8;;https://example.com\x1b\\X\x1b]8;;\x1b\\");
+        let colors = term.renderable_content().colors;
+        let cell = cell_vis(&term.grid()[Line(0)][Column(0)], colors, false, false);
+        assert!(cell.hyperlink, "cell should carry an OSC-8 hyperlink");
+    }
+
+    #[test]
+    fn safe_url_scheme_gate() {
+        assert!(is_safe_url("https://example.com"));
+        assert!(is_safe_url("http://x"));
+        assert!(!is_safe_url("file:///etc/passwd"));
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("mailto:a@b.c"));
     }
 
     #[test]

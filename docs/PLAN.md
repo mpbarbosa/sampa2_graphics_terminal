@@ -182,12 +182,15 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
 **Exit (§17):** palette inserts (not runs); man opens/closes correctly; preview
 refuses writes (file provably untouched) and clears on Enter.
 
-### N5 — Graphics, links, i18n, a11y ⬜  *(the native long tail — §19)*
+### N5 — Graphics, links, i18n, a11y 🔨  *(the native long tail — §19)*
 - **Images:** decode sixel + iTerm/kitty; **composite into the GPU scene** at cell
   coords, clipped by scroll region, freed on scroll-out; **cap dims/mem/count** (§13
   OOM guard). Replaces `addon-image`.
-- **OSC 8 hyperlinks:** plain + OSC-8 detection, **click-to-open with target shown**,
-  scheme re-validated (http/https). Replaces `addon-web-links`.
+- 🔨 **OSC 8 hyperlinks:** ✅ OSC-8 tracked (via `alacritty_terminal`), rendered
+  **underlined**, **Ctrl+click-to-open** with the target shown in the title and a strict
+  **http/https scheme gate** (§13 — never `file:`/`javascript:`); auto-opens nothing.
+  2 unit tests + PNG. ⬜ still: **plain-URL** detection (no OSC-8), an in-window
+  confirm/preview overlay (vs. title), hover affordance.
 - **IME / dead keys / compose:** wire IBus/fcitx via winit IME events — *historically
   where native terminals sink time* (feasibility §4). CJK/emoji width from the text
   stack.
