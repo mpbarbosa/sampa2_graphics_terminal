@@ -224,6 +224,7 @@ struct DecrqcraScanner {
 enum ScanEvent {
     Decrqcra(Decrqcra),
     Decstr,
+    Resize { rows: u16, cols: u16 },
 }
 
 impl DecrqcraScanner {
@@ -276,13 +277,27 @@ impl DecrqcraScanner {
                     0x2a => self.star = true, // '*'
                     0x21 => self.bang = true, // '!'
                     0x40..=0x7e => {
-                        // DECRQCRA: CSI … * y
-                        if b == b'y' && self.star && !self.bang && !self.bad {
-                            self.params.push(self.cur.min(0xffff) as u16);
-                            out.push((i + 1, ScanEvent::Decrqcra(self.request())));
-                        // DECSTR: CSI ! p
-                        } else if b == b'p' && self.bang && !self.star && !self.bad {
-                            out.push((i + 1, ScanEvent::Decstr));
+                        if !self.bad {
+                            if b == b'y' && self.star && !self.bang {
+                                // DECRQCRA: CSI … * y
+                                self.params.push(self.cur.min(0xffff) as u16);
+                                out.push((i + 1, ScanEvent::Decrqcra(self.request())));
+                            } else if b == b'p' && self.bang && !self.star {
+                                // DECSTR: CSI ! p
+                                out.push((i + 1, ScanEvent::Decstr));
+                            } else if b == b't' && !self.star && !self.bang {
+                                // XTWINOPS resize: CSI 8 ; rows ; cols t
+                                self.params.push(self.cur.min(0xffff) as u16);
+                                if self.params.first() == Some(&8) && self.params.len() >= 3 {
+                                    let d = |i: usize, dflt: u16| {
+                                        self.params.get(i).copied().filter(|&v| v > 0).unwrap_or(dflt)
+                                    };
+                                    out.push((
+                                        i + 1,
+                                        ScanEvent::Resize { rows: d(1, 24), cols: d(2, 80) },
+                                    ));
+                                }
+                            }
                         }
                         self.state = DecrqcraState::Ground;
                     }
@@ -443,6 +458,7 @@ fn pump(
                 // them back to the PTY synchronously (a query must be answered before
                 // the next output byte is processed — that's what apps block on).
                 let mut replies: Vec<Vec<u8>> = Vec::new();
+                let mut pty_resize: Option<(u16, u16)> = None;
                 if let Ok(mut g) = state.lock() {
                     let g = &mut *g;
                     // Split the feed at each DECRQCRA so the checksum sees the exact
@@ -461,10 +477,21 @@ fn pump(
                             }
                             // alacritty ignores DECSTR — apply the soft reset ourselves.
                             ScanEvent::Decstr => g.parser.advance(&mut g.term, DECSTR_RESET),
+                            // alacritty ignores XTWINOPS resize — resize the grid here,
+                            // and remember to resize the PTY once we release the lock.
+                            ScanEvent::Resize { rows, cols } => {
+                                g.term.resize(TermSize::new(cols as usize, rows as usize));
+                                pty_resize = Some((cols, rows));
+                            }
                         }
                     }
                     g.parser.advance(&mut g.term, &bytes[cursor..]);
                     replies.extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
+                }
+                if let Some((cols, rows)) = pty_resize {
+                    if let Ok(p) = pty.lock() {
+                        let _ = p.resize(cols, rows, 0, 0);
+                    }
                 }
                 if !replies.is_empty() {
                     if let Ok(mut p) = pty.lock() {
@@ -1936,6 +1963,15 @@ mod tests {
         assert!(matches!(ev[0].1, ScanEvent::Decstr));
         // DECRQM (`CSI $ p`) must NOT be mistaken for DECSTR.
         assert!(DecrqcraScanner::new().feed(b"\x1b[4$p").is_empty());
+    }
+
+    #[test]
+    fn scanner_detects_resize() {
+        let ev = DecrqcraScanner::new().feed(b"\x1b[8;25;80t");
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(ev[0].1, ScanEvent::Resize { rows: 25, cols: 80 }));
+        // A report winop (CSI 18 t) is not a resize.
+        assert!(DecrqcraScanner::new().feed(b"\x1b[18t").is_empty());
     }
 
     #[test]
