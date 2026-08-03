@@ -189,8 +189,9 @@ refuses writes (file provably untouched) and clears on Enter.
 - 🔨 **OSC 8 hyperlinks:** ✅ OSC-8 tracked (via `alacritty_terminal`), rendered
   **underlined**, **Ctrl+click-to-open** with the target shown in the title and a strict
   **http/https scheme gate** (§13 — never `file:`/`javascript:`); auto-opens nothing.
-  2 unit tests + PNG. ⬜ still: **plain-URL** detection (no OSC-8), an in-window
-  confirm/preview overlay (vs. title), hover affordance.
+  ✅ **plain-URL detection** too (`url_at`: whitespace token under the cursor → extract
+  http/https, trim punctuation) so links work without OSC-8. 3 unit tests + PNG.
+  ⬜ still: an in-window confirm/preview overlay (vs. title), hover affordance.
 - **IME / dead keys / compose:** wire IBus/fcitx via winit IME events — *historically
   where native terminals sink time* (feasibility §4). CJK/emoji width from the text
   stack.
