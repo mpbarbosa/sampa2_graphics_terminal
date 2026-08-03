@@ -1,0 +1,16 @@
+# Sampa native (Path C) — Rust-only graphical terminal.
+# Reuses the seven headless crates from the origin repo (sampa_graphics_terminal)
+# per ADR 0002: path deps for local N0 development; committed/CI builds should pin a
+# git rev instead (see the commented block in crates/sampa-native/Cargo.toml).
+[workspace]
+resolver = "2"
+members = ["crates/sampa-native"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+# Shared release profile — the native build's payoff is throughput/latency (DESIGN §14).
+[profile.release]
+opt-level = 3
+lto = "thin"
