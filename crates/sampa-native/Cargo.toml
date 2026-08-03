@@ -31,7 +31,8 @@ wgpu = "30.0.0"
 pollster = "1.0.1"
 arboard = "3.6.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+base64 = "0.23.0"
 
 # --- Native stack (ADR 0003) — added incrementally for the N0 window ----------
 # winit, wgpu, cosmic-text, alacritty_terminal, arboard land in the N0 spike.

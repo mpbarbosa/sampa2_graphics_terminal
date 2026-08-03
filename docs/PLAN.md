@@ -183,9 +183,12 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
 refuses writes (file provably untouched) and clears on Enter.
 
 ### N5 — Graphics, links, i18n, a11y 🔨  *(the native long tail — §19)*
-- **Images:** decode sixel + iTerm/kitty; **composite into the GPU scene** at cell
-  coords, clipped by scroll region, freed on scroll-out; **cap dims/mem/count** (§13
-  OOM guard). Replaces `addon-image`.
+- 🔨 **Images:** ✅ **iTerm2 inline images (OSC 1337)** end-to-end — an OSC scanner
+  extracts the payload (chunk-split-safe), `image` decodes it, and a wgpu **textured
+  pipeline composites** it into the scene at the cursor; **§13 OOM caps** (max dims,
+  source bytes, in-flight OSC bytes, live-image count with oldest-evicted). 3 unit tests
+  + PNG. ⬜ still: **sixel** + **kitty** protocols; precise **scroll-out lifecycle**
+  (anchored to an absolute line — drifts if the grid scrolls after insert).
 - 🔨 **OSC 8 hyperlinks:** ✅ OSC-8 tracked (via `alacritty_terminal`), rendered
   **underlined**, **Ctrl+click-to-open** with the target shown in the title and a strict
   **http/https scheme gate** (§13 — never `file:`/`javascript:`); auto-opens nothing.

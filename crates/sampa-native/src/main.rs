@@ -18,6 +18,7 @@
 
 mod smoke;
 
+use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -81,6 +82,7 @@ struct CellVis {
 struct Snapshot {
     cols: usize,
     rows: usize,
+    offset: i32, // display_offset: image at absolute line L shows at row L + offset
     cells: Vec<CellVis>, // row-major, len == cols * rows
 }
 
@@ -317,6 +319,170 @@ impl DecrqcraScanner {
 /// SGR, and cursor home. Injected into the parser at the point the `CSI ! p` appears.
 const DECSTR_RESET: &[u8] = b"\x1b[?6l\x1b[r\x1b[4l\x1b[?1l\x1b[?25h\x1b[m\x1b[H";
 
+// --- Inline images (iTerm2 OSC 1337, §6.4) -----------------------------------
+// alacritty has no image support, so we watch the output stream for
+// `OSC 1337 ; File = <args> : <base64> ST`, decode it (with §13 OOM caps), and
+// composite it into the GPU scene at the cursor.
+
+const MAX_IMAGE_DIM: u32 = 4096; // reject absurd dimensions
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024; // decoded-source cap
+const MAX_OSC_BYTES: usize = 12 * 1024 * 1024; // in-flight OSC accumulation cap
+const MAX_IMAGES: usize = 32; // live image cap (oldest evicted)
+
+struct DecodedImage {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+/// Decode an iTerm2 `1337;File=<args>:<base64>` OSC body into RGBA, enforcing caps.
+fn parse_iterm_image(payload: &[u8]) -> Option<DecodedImage> {
+    let rest = payload.strip_prefix(b"1337;File=")?;
+    let colon = rest.iter().position(|&b| b == b':')?;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&rest[colon + 1..])
+        .ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 || width > MAX_IMAGE_DIM || height > MAX_IMAGE_DIM {
+        return None;
+    }
+    Some(DecodedImage { width, height, rgba: rgba.into_raw() })
+}
+
+#[derive(Default, PartialEq)]
+enum OscState {
+    #[default]
+    Ground,
+    Esc,
+    Osc,
+    EscInOsc,
+}
+
+/// Watches the output stream for `OSC 1337 ; … ST/BEL` and returns the payloads of
+/// completed image OSCs (only buffering ones that begin `1337;`, capped at
+/// `MAX_OSC_BYTES`). Runs in parallel with the VT parser (which ignores OSC 1337).
+#[derive(Default)]
+struct ImageScanner {
+    state: OscState,
+    buf: Vec<u8>,
+    is_image: bool,
+    checked: bool,
+    overflow: bool,
+}
+
+impl ImageScanner {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn begin(&mut self) {
+        self.state = OscState::Osc;
+        self.buf.clear();
+        self.is_image = true;
+        self.checked = false;
+        self.overflow = false;
+    }
+
+    fn push(&mut self, b: u8) {
+        if self.overflow || !self.is_image {
+            return;
+        }
+        self.buf.push(b);
+        if self.buf.len() > MAX_OSC_BYTES {
+            self.overflow = true;
+            self.buf = Vec::new();
+            self.is_image = false;
+        } else if !self.checked && self.buf.len() >= 5 {
+            self.checked = true;
+            if !self.buf.starts_with(b"1337;") {
+                self.is_image = false;
+                self.buf = Vec::new();
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        let out = (self.is_image && !self.overflow && self.buf.starts_with(b"1337;"))
+            .then(|| std::mem::take(&mut self.buf));
+        self.buf = Vec::new();
+        self.state = OscState::Ground;
+        out
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            match self.state {
+                OscState::Ground => {
+                    if b == 0x1b {
+                        self.state = OscState::Esc;
+                    }
+                }
+                OscState::Esc => match b {
+                    b']' => self.begin(),
+                    0x1b => {}
+                    _ => self.state = OscState::Ground,
+                },
+                OscState::Osc => match b {
+                    0x07 => out.extend(self.finish()), // BEL terminator
+                    0x1b => self.state = OscState::EscInOsc,
+                    _ => self.push(b),
+                },
+                OscState::EscInOsc => match b {
+                    b'\\' => out.extend(self.finish()), // ST terminator
+                    _ => {
+                        self.buf = Vec::new();
+                        self.state = if b == 0x1b { OscState::Esc } else { OscState::Ground };
+                    }
+                },
+            }
+        }
+        out
+    }
+}
+
+/// One decoded image placed on the grid. `anchor` is an absolute grid line at insert
+/// time; the renderer draws it at `anchor - display_offset`. `id` keys the GPU texture.
+struct PlacedImage {
+    id: u64,
+    anchor: i32,
+    col: usize,
+    width: u32,
+    height: u32,
+    rgba: Option<Vec<u8>>, // taken by the renderer on first upload
+}
+
+/// Live inline images, shared between the parser thread (adds) and the renderer
+/// (uploads + composites). Capped at `MAX_IMAGES`, oldest evicted.
+#[derive(Default)]
+struct ImageStore {
+    images: Vec<PlacedImage>,
+    next_id: u64,
+}
+
+impl ImageStore {
+    fn add(&mut self, anchor: i32, col: usize, img: DecodedImage) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.images.push(PlacedImage {
+            id,
+            anchor,
+            col,
+            width: img.width,
+            height: img.height,
+            rgba: Some(img.rgba),
+        });
+        if self.images.len() > MAX_IMAGES {
+            self.images.remove(0);
+        }
+    }
+}
+
 /// Compute the DECRQCRA reply for `req` against the current grid.
 fn compute_decrqcra<L: EventListener>(term: &Term<L>, req: &Decrqcra) -> Vec<u8> {
     let grid = term.grid();
@@ -339,6 +505,7 @@ struct TermState {
     parser: Processor,
     term: Term<EventProxy>,
     decrqcra: DecrqcraScanner,
+    image_scanner: ImageScanner,
 }
 
 #[derive(Debug, Clone)]
@@ -401,7 +568,9 @@ fn main() -> Result<()> {
             EventProxy { reply_tx, app_tx },
         ),
         decrqcra: DecrqcraScanner::new(),
+        image_scanner: ImageScanner::new(),
     }));
+    let images = Arc::new(Mutex::new(ImageStore::default()));
 
     let (tx, rx) = channel();
     let pty = Arc::new(Mutex::new(spawn(
@@ -419,8 +588,8 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     thread::spawn({
-        let (state, pty) = (Arc::clone(&state), Arc::clone(&pty));
-        move || pump(rx, state, proxy, reply_rx, pty)
+        let (state, pty, images) = (Arc::clone(&state), Arc::clone(&pty), Arc::clone(&images));
+        move || pump(rx, state, proxy, reply_rx, pty, images)
     });
 
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -440,6 +609,7 @@ fn main() -> Result<()> {
         app_rx,
         osc52_allow: std::env::var("SAMPA_OSC52").map(|v| v == "allow").unwrap_or(false),
         title: win_title,
+        images,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -451,6 +621,7 @@ fn pump(
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     reply_rx: Receiver<Reply>,
     pty: Arc<Mutex<PtyHandle>>,
+    image_store: Arc<Mutex<ImageStore>>,
 ) {
     for ev in rx {
         match ev {
@@ -460,6 +631,7 @@ fn pump(
                 // the next output byte is processed — that's what apps block on).
                 let mut replies: Vec<Vec<u8>> = Vec::new();
                 let mut pty_resize: Option<(u16, u16)> = None;
+                let mut image_adds: Vec<(i32, usize, DecodedImage)> = Vec::new();
                 if let Ok(mut g) = state.lock() {
                     let g = &mut *g;
                     // Split the feed at each DECRQCRA so the checksum sees the exact
@@ -488,6 +660,25 @@ fn pump(
                     }
                     g.parser.advance(&mut g.term, &bytes[cursor..]);
                     replies.extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
+
+                    // Inline images (iTerm2 OSC 1337): decode each, anchor at the
+                    // cursor, and reserve vertical space so following text flows below.
+                    for payload in g.image_scanner.feed(&bytes) {
+                        if let Some(img) = parse_iterm_image(&payload) {
+                            let cur = g.term.renderable_content().cursor.point;
+                            let (anchor, col) = (cur.line.0, cur.column.0);
+                            let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
+                            g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
+                            image_adds.push((anchor, col, img));
+                        }
+                    }
+                }
+                if !image_adds.is_empty() {
+                    if let Ok(mut store) = image_store.lock() {
+                        for (anchor, col, img) in image_adds {
+                            store.add(anchor, col, img);
+                        }
+                    }
                 }
                 if let Some((cols, rows)) = pty_resize {
                     if let Ok(p) = pty.lock() {
@@ -528,6 +719,7 @@ struct App {
     app_rx: Receiver<AppEvent>,
     osc52_allow: bool,
     title: String,
+    images: Arc<Mutex<ImageStore>>,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -537,7 +729,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attrs = Window::default_attributes().with_title(&self.title);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let gfx = pollster::block_on(Gfx::new(Arc::clone(&window)));
+        let gfx = pollster::block_on(Gfx::new(Arc::clone(&window), Arc::clone(&self.images)));
         self.window = Some(window);
         self.gfx = Some(gfx);
         if let Ok(cmd) = std::env::var("SAMPA_AUTORUN") {
@@ -1098,7 +1290,7 @@ fn build_snapshot<L: EventListener>(term: &Term<L>) -> Snapshot {
             ));
         }
     }
-    Snapshot { cols, rows, cells }
+    Snapshot { cols, rows, offset, cells }
 }
 
 /// Whether grid cell (line, col) falls inside a selection range.
@@ -1257,6 +1449,29 @@ fn vs(@builtin(vertex_index) vi: u32,
 fn fs(in: VsOut) -> @location(0) vec4<f32> { return in.color; }
 "#;
 
+const IMAGE_SHADER: &str = r#"
+struct Screen { size: vec2<f32>, _pad: vec2<f32> };
+@group(0) @binding(0) var<uniform> screen: Screen;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(1) @binding(1) var samp: sampler;
+
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @location(0) rect: vec4<f32>) -> VsOut {
+    let corner = vec2<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u));
+    let px = rect.xy + corner * rect.zw;
+    let ndc = vec2<f32>(px.x / screen.size.x * 2.0 - 1.0, 1.0 - px.y / screen.size.y * 2.0);
+    var out: VsOut;
+    out.pos = vec4<f32>(ndc, 0.0, 1.0);
+    out.uv = corner;
+    return out;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> { return textureSample(tex, samp, in.uv); }
+"#;
+
 /// Target-agnostic render core: owns the device/queue, glyphon pipeline, and the
 /// solid-quad pipeline. `paint` draws a `Snapshot` into any texture view (a window
 /// surface frame, or an offscreen texture for `--capture`).
@@ -1275,10 +1490,21 @@ struct Renderer {
     quad_pipeline: wgpu::RenderPipeline,
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
+    // inline images
+    image_pipeline: wgpu::RenderPipeline,
+    image_bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    image_textures: HashMap<u64, (wgpu::Texture, wgpu::BindGroup)>,
+    images: Arc<Mutex<ImageStore>>,
 }
 
 impl Renderer {
-    fn new(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+    fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        format: wgpu::TextureFormat,
+        images: Arc<Mutex<ImageStore>>,
+    ) -> Self {
         let srgb = format.is_srgb();
         let mut font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
@@ -1379,6 +1605,77 @@ impl Renderer {
             cache: None,
         });
 
+        // Image pipeline: group 0 = screen uniform (reuses `bgl`), group 1 = texture+sampler.
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("image-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let image_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("image-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image"),
+            source: wgpu::ShaderSource::Wgsl(IMAGE_SHADER.into()),
+        });
+        let image_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("image-layout"),
+            bind_group_layouts: &[Some(&bgl), Some(&image_bgl)],
+            immediate_size: 0,
+        });
+        const IMG_ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x4];
+        let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("image-pipeline"),
+            layout: Some(&image_layout),
+            vertex: wgpu::VertexState {
+                module: &image_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 16,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &IMG_ATTRS,
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &image_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             device,
             queue,
@@ -1394,7 +1691,82 @@ impl Renderer {
             quad_pipeline,
             quad_uniform,
             quad_bind_group,
+            image_pipeline,
+            image_bgl,
+            sampler,
+            image_textures: HashMap::new(),
+            images,
         }
+    }
+
+    /// Upload any newly-added images to GPU textures and drop textures for evicted
+    /// images. Returns the per-image draw rects (in pixels) for the current frame.
+    fn sync_images(&mut self, offset: i32, w: u32, h: u32) -> Vec<(u64, [f32; 4])> {
+        let mut rects = Vec::new();
+        let Ok(mut store) = self.images.lock() else {
+            return rects;
+        };
+        let live: std::collections::HashSet<u64> = store.images.iter().map(|i| i.id).collect();
+        self.image_textures.retain(|id, _| live.contains(id));
+
+        for img in &mut store.images {
+            // Lazily upload the pixels the first time we see this image.
+            if let Some(rgba) = img.rgba.take() {
+                let size = wgpu::Extent3d {
+                    width: img.width,
+                    height: img.height,
+                    depth_or_array_layers: 1,
+                };
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("image"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(img.width * 4),
+                        rows_per_image: Some(img.height),
+                    },
+                    size,
+                );
+                let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+                let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("image-bg"),
+                    layout: &self.image_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                });
+                self.image_textures.insert(img.id, (tex, bind));
+            }
+            // Place at (col, absolute anchor + display_offset), natural pixel size.
+            let x = PAD + img.col as f32 * self.cell_w;
+            let y = PAD + (img.anchor + offset) as f32 * self.line_h;
+            if x < w as f32 && y < h as f32 && y + img.height as f32 > 0.0 {
+                rects.push((img.id, [x, y, img.width as f32, img.height as f32]));
+            }
+        }
+        rects
     }
 
     fn chan(&self, v: u8) -> f32 {
@@ -1512,6 +1884,19 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&ScreenUniform { size: [w as f32, h as f32], _pad: [0.0, 0.0] }),
         );
+        // Upload/evict image textures and build a one-rect vertex buffer per image.
+        let image_rects = self.sync_images(snap.offset, w, h);
+        let image_bufs: Vec<(u64, wgpu::Buffer)> = image_rects
+            .iter()
+            .map(|(id, rect)| {
+                let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("image-quad"),
+                    contents: bytemuck::bytes_of(rect),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                (*id, buf)
+            })
+            .collect();
         let mk_buf = |device: &wgpu::Device, quads: &[QuadInstance]| {
             (!quads.is_empty()).then(|| {
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1566,6 +1951,18 @@ impl Renderer {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..4, 0..deco_quads.len() as u32);
             }
+            // Inline images composite on top.
+            if !image_bufs.is_empty() {
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_bind_group(0, &self.quad_bind_group, &[]);
+                for (id, buf) in &image_bufs {
+                    if let Some((_, bind)) = self.image_textures.get(id) {
+                        pass.set_bind_group(1, bind, &[]);
+                        pass.set_vertex_buffer(0, buf.slice(..));
+                        pass.draw(0..4, 0..1);
+                    }
+                }
+            }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         self.atlas.trim();
@@ -1580,7 +1977,7 @@ struct Gfx {
 }
 
 impl Gfx {
-    async fn new(window: Arc<Window>) -> Self {
+    async fn new(window: Arc<Window>, images: Arc<Mutex<ImageStore>>) -> Self {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
         let instance = wgpu::Instance::default();
@@ -1603,7 +2000,7 @@ impl Gfx {
             .expect("surface default config");
         let format = config.format;
         surface.configure(&device, &config);
-        Gfx { surface, config, r: Renderer::new(device, queue, format) }
+        Gfx { surface, config, r: Renderer::new(device, queue, format, images) }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -1656,7 +2053,27 @@ fn capture(path: &str) -> Result<()> {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .expect("request device");
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut r = Renderer::new(device, queue, format);
+    // A small gradient image, placed below the text, to exercise the image pipeline.
+    let images = Arc::new(Mutex::new(ImageStore::default()));
+    {
+        let (iw, ih) = (72u32, 28u32);
+        let mut rgba = Vec::with_capacity((iw * ih * 4) as usize);
+        for y in 0..ih {
+            for x in 0..iw {
+                rgba.extend_from_slice(&[
+                    (x * 255 / iw) as u8,
+                    (y * 255 / ih) as u8,
+                    140,
+                    255,
+                ]);
+            }
+        }
+        images
+            .lock()
+            .unwrap()
+            .add(6, 2, DecodedImage { width: iw, height: ih, rgba });
+    }
+    let mut r = Renderer::new(device, queue, format, images);
 
     let w = (PAD * 2.0 + cols as f32 * r.cell_w).ceil() as u32;
     let h = (PAD * 2.0 + rows as f32 * r.line_h).ceil() as u32;
@@ -1793,6 +2210,38 @@ mod tests {
         let colors = term.renderable_content().colors;
         let cell = cell_vis(&term.grid()[Line(0)][Column(0)], colors, false, false);
         assert!(cell.hyperlink, "cell should carry an OSC-8 hyperlink");
+    }
+
+    #[test]
+    fn iterm_image_decodes_and_caps() {
+        use base64::Engine;
+        use std::io::Cursor;
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 2, image::Rgba([9, 9, 9, 255])))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let payload = format!("1337;File=inline=1:{b64}").into_bytes();
+        let dec = parse_iterm_image(&payload).expect("decode");
+        assert_eq!((dec.width, dec.height), (2, 2));
+        assert_eq!(dec.rgba.len(), 2 * 2 * 4);
+        // Wrong prefix / bad base64 → None.
+        assert!(parse_iterm_image(b"9999;File=x:AAAA").is_none());
+        assert!(parse_iterm_image(b"1337;File=inline=1:not base64!!").is_none());
+    }
+
+    #[test]
+    fn image_scanner_extracts_osc1337() {
+        let mut sc = ImageScanner::new();
+        let p = sc.feed(b"\x1b]1337;File=inline=1:AAAA\x07"); // BEL-terminated
+        assert_eq!(p.len(), 1);
+        assert!(p[0].starts_with(b"1337;File="));
+        // A non-1337 OSC (title) is ignored.
+        assert!(ImageScanner::new().feed(b"\x1b]0;title\x07").is_empty());
+        // Split across chunks, ST-terminated.
+        let mut sc2 = ImageScanner::new();
+        assert!(sc2.feed(b"\x1b]1337;File=x:AA").is_empty());
+        assert_eq!(sc2.feed(b"AA\x1b\\").len(), 1);
     }
 
     #[test]
