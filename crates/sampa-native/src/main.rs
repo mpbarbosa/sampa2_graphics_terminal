@@ -114,7 +114,7 @@ enum AppEvent {
 /// `app_tx` for the UI thread. OSC-52 **reads** and pixel size probes are dropped so
 /// nothing echoes attacker-controlled data back to input.
 struct EventProxy {
-    reply_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    reply_tx: std::sync::mpsc::Sender<Reply>,
     app_tx: std::sync::mpsc::Sender<AppEvent>,
 }
 
@@ -122,10 +122,11 @@ impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
         match event {
             TermEvent::PtyWrite(s) => {
-                let _ = self.reply_tx.send(s.into_bytes());
+                let _ = self.reply_tx.send(Reply::Bytes(s.into_bytes()));
             }
             TermEvent::ColorRequest(idx, fmt) => {
-                let _ = self.reply_tx.send(fmt(palette_rgb(idx)).into_bytes());
+                // Resolved against the live color table at drain time (§ color queries).
+                let _ = self.reply_tx.send(Reply::Color(idx, fmt));
             }
             TermEvent::Title(s) => {
                 let _ = self.app_tx.send(AppEvent::Title(s));
@@ -146,7 +147,7 @@ impl EventListener for EventProxy {
     }
 }
 
-/// A fixed, safe RGB for an OSC 4/10/11 color query — never attacker input.
+/// The default RGB for a color index when the app hasn't set one — never attacker input.
 fn palette_rgb(idx: usize) -> Rgb {
     let [r, g, b] = match idx {
         257 => DEFAULT_BG,                 // Background
@@ -154,6 +155,25 @@ fn palette_rgb(idx: usize) -> Rgb {
         _ => DEFAULT_FG,                   // Foreground(256)/Cursor(258)/other
     };
     Rgb { r, g, b }
+}
+
+/// A reply the parser thread must send back to the PTY. Color queries are resolved
+/// against the *live* color table at drain time (so an OSC 4/10/11 *set* is reflected),
+/// which is why they carry the formatter rather than pre-rendered bytes.
+enum Reply {
+    Bytes(Vec<u8>),
+    Color(usize, Arc<dyn Fn(Rgb) -> String + Send + Sync>),
+}
+
+/// Turn a queued `Reply` into bytes, reading the current color for a color query.
+fn resolve_reply<L: EventListener>(reply: Reply, term: &Term<L>) -> Vec<u8> {
+    match reply {
+        Reply::Bytes(b) => b,
+        Reply::Color(idx, fmt) => {
+            let rgb = term.colors()[idx].unwrap_or_else(|| palette_rgb(idx));
+            fmt(rgb).into_bytes()
+        }
+    }
 }
 
 /// Strip control characters and cap length — OSC 0/2 titles are attacker-controlled.
@@ -356,7 +376,7 @@ fn main() -> Result<()> {
 
     let (cols, rows) = (80u16, 24u16);
     let (app_tx, app_rx) = channel();
-    let (reply_tx, reply_rx) = channel::<Vec<u8>>();
+    let (reply_tx, reply_rx) = channel::<Reply>();
     let state = Arc::new(Mutex::new(TermState {
         parser: Processor::new(),
         term: Term::new(
@@ -413,7 +433,7 @@ fn pump(
     rx: Receiver<PtyEvent>,
     state: Arc<Mutex<TermState>>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-    reply_rx: Receiver<Vec<u8>>,
+    reply_rx: Receiver<Reply>,
     pty: Arc<Mutex<PtyHandle>>,
 ) {
     for ev in rx {
@@ -434,7 +454,9 @@ fn pump(
                         cursor = pos;
                         match ev {
                             ScanEvent::Decrqcra(req) => {
-                                replies.extend(reply_rx.try_iter()); // DA/DSR/color so far
+                                // DA/DSR/color replies queued so far, then the checksum.
+                                replies
+                                    .extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
                                 replies.push(compute_decrqcra(&g.term, &req));
                             }
                             // alacritty ignores DECSTR — apply the soft reset ourselves.
@@ -442,7 +464,7 @@ fn pump(
                         }
                     }
                     g.parser.advance(&mut g.term, &bytes[cursor..]);
-                    replies.extend(reply_rx.try_iter());
+                    replies.extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
                 }
                 if !replies.is_empty() {
                     if let Ok(mut p) = pty.lock() {
@@ -1826,7 +1848,7 @@ mod tests {
         rows: usize,
     ) -> (
         Term<EventProxy>,
-        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::sync::mpsc::Receiver<Reply>,
         std::sync::mpsc::Receiver<AppEvent>,
     ) {
         use std::sync::mpsc::channel;
@@ -1845,10 +1867,28 @@ mod tests {
         let (mut term, reply_rx, _app_rx) = proxy_term(10, 2);
         let mut parser: Processor = Processor::new();
         parser.advance(&mut term, b"\x1b[c"); // Primary Device Attributes
-        let replies: Vec<_> = reply_rx.try_iter().collect();
+        let replies: Vec<Vec<u8>> =
+            reply_rx.try_iter().map(|r| resolve_reply(r, &term)).collect();
         assert!(
             replies.iter().any(|b| b.starts_with(b"\x1b[?")),
             "DA query produced no device-attributes reply"
+        );
+    }
+
+    #[test]
+    fn osc4_color_query_reflects_set_value() {
+        let (mut term, reply_rx, _app_rx) = proxy_term(4, 2);
+        let mut parser: Processor = Processor::new();
+        // Set palette color 1 to pure red, then query it (OSC 4 ; 1 ; ?).
+        parser.advance(&mut term, b"\x1b]4;1;rgb:ff/00/00\x1b\\\x1b]4;1;?\x1b\\");
+        let out: Vec<u8> = reply_rx
+            .try_iter()
+            .flat_map(|r| resolve_reply(r, &term))
+            .collect();
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("rgb:ffff/0000/0000"),
+            "color query should report the app-set red, got {s:?}"
         );
     }
 
