@@ -897,6 +897,8 @@ fn main() -> Result<()> {
         mouse_col: 0,
         mouse_row: 0,
         left_down: false,
+        last_click: None,
+        click_count: 0,
         clipboard: arboard::Clipboard::new().ok(),
         app_rx,
         osc52_allow: std::env::var("SAMPA_OSC52").map(|v| v == "allow").unwrap_or(false),
@@ -1060,6 +1062,8 @@ struct App {
     mouse_col: usize,
     mouse_row: usize,
     left_down: bool,
+    last_click: Option<(std::time::Instant, usize, usize)>,
+    click_count: u8,
     clipboard: Option<arboard::Clipboard>,
     app_rx: Receiver<AppEvent>,
     osc52_allow: bool,
@@ -1306,13 +1310,26 @@ impl App {
         match button {
             MouseButton::Left if pressed => {
                 let (col, row) = (self.mouse_col, self.mouse_row);
+                // Count rapid clicks on the same cell: 1 = char, 2 = word, 3 = line.
+                let now = std::time::Instant::now();
+                let (same, elapsed) = match self.last_click {
+                    Some((t, c, r)) => (c == col && r == row, now.saturating_duration_since(t).as_millis()),
+                    None => (false, u128::MAX),
+                };
+                self.click_count = next_click_count(self.click_count, same, elapsed);
+                self.last_click = Some((now, col, row));
+                let ty = selection_type_for(self.click_count);
                 if let Ok(mut g) = self.state.lock() {
                     let d = g.term.grid().display_offset() as i32;
                     g.term.selection = Some(Selection::new(
-                        SelectionType::Simple,
+                        ty,
                         Point::new(Line(row as i32 - d), Column(col)),
                         Side::Left,
                     ));
+                }
+                // Word/line selections are complete on press — copy them immediately.
+                if self.click_count >= 2 {
+                    self.copy_selection();
                 }
                 self.request_redraw();
             }
@@ -1654,6 +1671,28 @@ fn in_selection(range: &SelectionRange, line: i32, col: usize) -> bool {
         line >= sl && line <= el && col >= sc.min(ec) && col <= sc.max(ec)
     } else {
         (line > sl || (line == sl && col >= sc)) && (line < el || (line == el && col <= ec))
+    }
+}
+
+/// Multi-click window for word/line selection.
+const MULTI_CLICK_MS: u128 = 400;
+
+/// Advance the click counter: a rapid click on the same cell counts up (capped at 3,
+/// then wraps to 1); anything else restarts at 1.
+fn next_click_count(prev: u8, same_cell: bool, elapsed_ms: u128) -> u8 {
+    if same_cell && elapsed_ms < MULTI_CLICK_MS && (1..3).contains(&prev) {
+        prev + 1
+    } else {
+        1
+    }
+}
+
+/// Selection granularity for a click count: 1 = char, 2 = word, 3 = line.
+fn selection_type_for(count: u8) -> SelectionType {
+    match count {
+        2 => SelectionType::Semantic,
+        3 => SelectionType::Lines,
+        _ => SelectionType::Simple,
     }
 }
 
@@ -2756,6 +2795,33 @@ mod tests {
         assert!(in_selection(&range, 0, 5));
         assert!(!in_selection(&range, 0, 1));
         assert!(!in_selection(&range, 1, 3));
+    }
+
+    #[test]
+    fn multi_click_counting_and_granularity() {
+        assert_eq!(next_click_count(0, false, 0), 1); // first click
+        assert_eq!(next_click_count(1, true, 100), 2); // double
+        assert_eq!(next_click_count(2, true, 100), 3); // triple
+        assert_eq!(next_click_count(3, true, 100), 1); // 4th wraps to char
+        assert_eq!(next_click_count(1, false, 100), 1); // different cell restarts
+        assert_eq!(next_click_count(1, true, 500), 1); // too slow restarts
+        assert!(matches!(selection_type_for(1), SelectionType::Simple));
+        assert!(matches!(selection_type_for(2), SelectionType::Semantic));
+        assert!(matches!(selection_type_for(3), SelectionType::Lines));
+    }
+
+    #[test]
+    fn semantic_selection_grabs_the_word() {
+        let (mut term, _r, _a) = proxy_term(20, 2);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"hello world");
+        // A double-click (word) selection anchored inside "hello".
+        term.selection = Some(Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(0), Column(2)),
+            Side::Left,
+        ));
+        assert_eq!(term.selection_to_string().as_deref(), Some("hello"));
     }
 
     // --- escape hardening (§13) ---

@@ -115,9 +115,10 @@ engine is now ours to prove.
 - ✅ **Selection + clipboard (§8.3, first pass):** click-drag **Simple** selection via
   `alacritty_terminal::Selection`, highlighted in the render; **Ctrl-Shift-C** /
   auto-copy-on-release and **Ctrl-Shift-V** / **middle-click** paste via `arboard`;
-  **bracketed paste** (2004) wrapping with embedded-`ESC[201~` stripping (§13). PNG +
-  membership test. ⬜ still: word/line/block granularity, X11 PRIMARY split,
-  multi-line paste confirm.
+  **bracketed paste** (2004) wrapping with embedded-`ESC[201~` stripping (§13);
+  **double-click = word** (Semantic) / **triple-click = line** (Lines) via click-count
+  timing, auto-copied. PNG + membership + click-granularity + word-selection tests.
+  ⬜ still: **block** selection (modifier-drag), X11 PRIMARY split, multi-line paste confirm.
 - ✅ **Scrollback scrolling** (10k-line history): **wheel** (3 lines/notch) and
   **Shift+PageUp/PageDown**; display-offset-aware rendering (negative lines = history);
   typing snaps to the live prompt; disabled on the alt screen. Unit test covers the
