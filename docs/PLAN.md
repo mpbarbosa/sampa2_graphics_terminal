@@ -224,10 +224,10 @@ and show target; a CJK/emoji/compose input test passes; a screen reader sees the
 ### N6 — Conformance, perf, v1 (§14, §17) 🔨
 - 🔨 **esctest:** harness wired ([tools/conformance/](../tools/conformance/README.md)) —
   fetches pinned esctest2, runs headless under Xvfb against the native binary via
-  `sampa -e python3 esctest.py`, scores with `--xterm-checksum 334`. **Baseline: 251
-  passed / 45 known-bug / 272 failed** (gate: don't regress) — up from 45 by fixing two
-  suite-wide desyncs: **color queries** now resolve against the live color table (+202),
-  **DECSTR** soft-reset synthesized (+4). DECRQCRA correct (unit-tested + PTY-probed:
+  `sampa -e python3 esctest.py`, scores with `--xterm-checksum 334`. **Baseline: 256
+  passed / 43 known-bug / 269 failed** (gate: don't regress) — up from 45 by fixing
+  suite-wide desyncs (**color queries** live, +202; **DECSTR** soft-reset, +4) and
+  adding **DECRQSS** status-string replies (+5). DECRQCRA correct (unit-tested + PTY-probed:
   `CUP(3,6)`→`ESC[3;6R`). Remaining gap to the origin's ~305 is genuine xterm feature
   coverage in `alacritty_terminal` (window-ops, selective erase, DECRQSS/DECDSR, extended
   DECRQM) — ranked roadmap in [tools/conformance/](../tools/conformance/README.md).

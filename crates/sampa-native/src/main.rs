@@ -319,6 +319,119 @@ impl DecrqcraScanner {
 /// SGR, and cursor home. Injected into the parser at the point the `CSI ! p` appears.
 const DECSTR_RESET: &[u8] = b"\x1b[?6l\x1b[r\x1b[4l\x1b[?1l\x1b[?25h\x1b[m\x1b[H";
 
+// --- DECRQSS — request selection/setting status string (§17) -----------------
+// alacritty doesn't answer `DCS $ q <Pt> ST`, so we watch the stream for it and
+// reply `DCS 1 $ r <value> <Pt> ST` (or `DCS 0 $ r ST` for unsupported queries).
+
+#[derive(Default, PartialEq)]
+enum DcsState {
+    #[default]
+    Ground,
+    Esc,
+    Dcs,
+    EscInDcs,
+}
+
+/// Accumulates `DCS … ST/BEL` bodies and yields the ones that begin `$q` (DECRQSS),
+/// returning the query name `Pt` (the bytes after `$q`). Bodies are tiny; capped.
+#[derive(Default)]
+struct DcsScanner {
+    state: DcsState,
+    buf: Vec<u8>,
+    over: bool,
+}
+
+impl DcsScanner {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        let out = (!self.over && self.buf.starts_with(b"$q")).then(|| self.buf[2..].to_vec());
+        self.buf.clear();
+        self.over = false;
+        self.state = DcsState::Ground;
+        out
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            match self.state {
+                DcsState::Ground => {
+                    if b == 0x1b {
+                        self.state = DcsState::Esc;
+                    }
+                }
+                DcsState::Esc => match b {
+                    b'P' => {
+                        self.state = DcsState::Dcs;
+                        self.buf.clear();
+                        self.over = false;
+                    }
+                    0x1b => {}
+                    _ => self.state = DcsState::Ground,
+                },
+                DcsState::Dcs => match b {
+                    0x07 => out.extend(self.finish()),
+                    0x1b => self.state = DcsState::EscInDcs,
+                    _ => {
+                        if self.buf.len() < 64 {
+                            self.buf.push(b);
+                        } else {
+                            self.over = true;
+                        }
+                    }
+                },
+                DcsState::EscInDcs => match b {
+                    b'\\' => out.extend(self.finish()),
+                    _ => {
+                        self.buf.clear();
+                        self.state = if b == 0x1b { DcsState::Esc } else { DcsState::Ground };
+                    }
+                },
+            }
+        }
+        out
+    }
+}
+
+/// Reconstruct the current SGR parameters from the pen (cursor template) for DECRQSS.
+fn sgr_from_template<L: EventListener>(term: &Term<L>) -> String {
+    let f = term.grid().cursor.template.flags;
+    let mut s = String::from("0");
+    for (flag, code) in [
+        (Flags::BOLD, "1"),
+        (Flags::DIM, "2"),
+        (Flags::ITALIC, "3"),
+        (Flags::UNDERLINE, "4"),
+        (Flags::INVERSE, "7"),
+        (Flags::HIDDEN, "8"),
+        (Flags::STRIKEOUT, "9"),
+    ] {
+        if f.contains(flag) {
+            s.push(';');
+            s.push_str(code);
+        }
+    }
+    s
+}
+
+/// Build the DECRQSS reply for query `pt`. Handles the fixed/tractable settings;
+/// scroll-region/margins/cursor-style need private engine state and report invalid.
+fn decrqss_reply<L: EventListener>(pt: &[u8], term: &Term<L>) -> Vec<u8> {
+    let body = match pt {
+        b"\"p" => "1$r64;1\"p".to_string(),                 // DECSCL: VT level 4, 7-bit
+        b"\"q" => "1$r1\"q".to_string(),                    // DECSCA (default)
+        b"m" => format!("1$r{}m", sgr_from_template(term)), // SGR
+        b"+q" | b"*}" | b"$}" | b"*x" => {
+            format!("1$r0{}", String::from_utf8_lossy(pt)) // report 0 for these
+        }
+        _ => "0$r".to_string(), // unsupported → invalid
+    };
+    format!("\x1bP{body}\x1b\\").into_bytes()
+}
+
 // --- Inline images (iTerm2 OSC 1337, §6.4) -----------------------------------
 // alacritty has no image support, so we watch the output stream for
 // `OSC 1337 ; File = <args> : <base64> ST`, decode it (with §13 OOM caps), and
@@ -506,6 +619,7 @@ struct TermState {
     term: Term<EventProxy>,
     decrqcra: DecrqcraScanner,
     image_scanner: ImageScanner,
+    dcs: DcsScanner,
 }
 
 #[derive(Debug, Clone)]
@@ -569,6 +683,7 @@ fn main() -> Result<()> {
         ),
         decrqcra: DecrqcraScanner::new(),
         image_scanner: ImageScanner::new(),
+        dcs: DcsScanner::new(),
     }));
     let images = Arc::new(Mutex::new(ImageStore::default()));
 
@@ -660,6 +775,11 @@ fn pump(
                     }
                     g.parser.advance(&mut g.term, &bytes[cursor..]);
                     replies.extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
+
+                    // DECRQSS status-string queries (unhandled by the engine).
+                    for pt in g.dcs.feed(&bytes) {
+                        replies.push(decrqss_reply(&pt, &g.term));
+                    }
 
                     // Inline images (iTerm2 OSC 1337): decode each, anchor at the
                     // cursor, and reserve vertical space so following text flows below.
@@ -2506,6 +2626,24 @@ mod tests {
         assert_eq!((r.top, r.left, r.bottom, r.right), (Some(1), Some(1), Some(1), Some(2)));
         // A normal CSI (cursor move) is not mistaken for either sequence.
         assert!(DecrqcraScanner::new().feed(b"\x1b[1;2H").is_empty());
+    }
+
+    #[test]
+    fn dcs_scanner_and_decrqss_replies() {
+        // DECRQSS `DCS $q m ST` is extracted; other DCS is ignored.
+        let mut sc = DcsScanner::new();
+        assert_eq!(sc.feed(b"\x1bP$qm\x1b\\"), vec![b"m".to_vec()]);
+        assert!(DcsScanner::new().feed(b"\x1bPnot-decrqss\x1b\\").is_empty());
+
+        let (mut term, _r, _a) = proxy_term(10, 2);
+        let mut parser: Processor = Processor::new();
+        // SGR 1 (bold), then the pen reports 0;1; DECSCL is fixed.
+        parser.advance(&mut term, b"\x1b[1m");
+        assert_eq!(decrqss_reply(b"m", &term), b"\x1bP1$r0;1m\x1b\\".to_vec());
+        assert_eq!(decrqss_reply(b"\"p", &term), b"\x1bP1$r64;1\"p\x1b\\".to_vec());
+        assert_eq!(decrqss_reply(b"+q", &term), b"\x1bP1$r0+q\x1b\\".to_vec());
+        // Unsupported query → invalid.
+        assert_eq!(decrqss_reply(b"zz", &term), b"\x1bP0$r\x1b\\".to_vec());
     }
 
     #[test]
