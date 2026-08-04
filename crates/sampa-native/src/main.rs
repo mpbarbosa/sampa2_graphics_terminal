@@ -911,9 +911,17 @@ impl App {
         let uri = match self.state.lock() {
             Ok(g) => {
                 let d = g.term.grid().display_offset() as i32;
-                g.term.grid()[Line(row as i32 - d)][Column(col)]
+                let line = Line(row as i32 - d);
+                let grid = g.term.grid();
+                // OSC-8 hyperlink first; otherwise scan the row for a plain URL.
+                grid[line][Column(col)]
                     .hyperlink()
                     .map(|h| h.uri().to_string())
+                    .or_else(|| {
+                        let text: String =
+                            (0..grid.columns()).map(|c| grid[line][Column(c)].c).collect();
+                        url_at(&text, col)
+                    })
             }
             Err(_) => None,
         };
@@ -1355,6 +1363,29 @@ fn cell_vis(
 fn is_safe_url(uri: &str) -> bool {
     let u = uri.trim();
     u.starts_with("http://") || u.starts_with("https://")
+}
+
+/// Find a plain http/https URL in `row` covering column `col` (for terminals that
+/// don't emit OSC-8). Takes the whitespace-delimited token under the cursor, extracts
+/// the URL within it, and trims trailing punctuation.
+fn url_at(row: &str, col: usize) -> Option<String> {
+    let chars: Vec<char> = row.chars().collect();
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return None;
+    }
+    let (mut start, mut end) = (col, col);
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
+        end += 1;
+    }
+    let token: String = chars[start..=end].iter().collect();
+    let pos = token.find("https://").or_else(|| token.find("http://"))?;
+    let url = token[pos..].trim_end_matches(|c: char| {
+        matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '"' | '\'' | '!' | '?')
+    });
+    is_safe_url(url).then(|| url.to_string())
 }
 
 fn rgb_arr(c: Rgb) -> [u8; 3] {
@@ -2251,6 +2282,18 @@ mod tests {
         assert!(!is_safe_url("file:///etc/passwd"));
         assert!(!is_safe_url("javascript:alert(1)"));
         assert!(!is_safe_url("mailto:a@b.c"));
+    }
+
+    #[test]
+    fn plain_url_detection() {
+        let row = "see https://rust-lang.org/tools for more";
+        let i = row.find("https").unwrap();
+        assert_eq!(url_at(row, i + 3).as_deref(), Some("https://rust-lang.org/tools"));
+        // Leading/trailing punctuation is stripped.
+        assert_eq!(url_at("(https://x.io).", 5).as_deref(), Some("https://x.io"));
+        // Non-URL token / whitespace → None.
+        assert!(url_at("hello world", 2).is_none());
+        assert!(url_at("a https://x.io", 1).is_none());
     }
 
     #[test]
