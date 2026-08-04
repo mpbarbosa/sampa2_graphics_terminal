@@ -234,6 +234,7 @@ struct DecrqcraScanner {
     cur_seen: bool, // a digit was consumed for the parameter being accumulated
     star: bool,     // saw '*' intermediate (DECRQCRA)
     bang: bool,     // saw '!' intermediate (DECSTR)
+    private: bool,  // saw a leading '?' private marker (DEC private modes)
     bad: bool,      // saw a disqualifying intermediate / private marker
 }
 
@@ -251,6 +252,14 @@ enum ScanEvent {
     /// A window/size **report** query (`CSI 11/13/14/15/16/19 t`). The reply is built
     /// from the live grid plus the fixed metrics at drain time.
     WinopReport(u16),
+    /// DEC private mode `?1048` (save/restore cursor) — the engine leaves it unhandled,
+    /// so we translate it to the DECSC/DECRC (`ESC 7` / `ESC 8`) it supports. `save` is
+    /// the SET (`h`) direction; RESET (`l`) restores.
+    SaveRestoreCursor { save: bool },
+    /// DEC device-status report query (`CSI ? Ps [; Pid] n`, DECDSR) — vte only handles
+    /// the non-private DSR, so these go unanswered. Replied to at drain time (DECXCPR
+    /// needs the live cursor; DECCKSR echoes the Pid).
+    Decdsr { ps: u16, pid: Option<u16> },
 }
 
 impl DecrqcraScanner {
@@ -266,6 +275,7 @@ impl DecrqcraScanner {
         self.cur_seen = false;
         self.star = false;
         self.bang = false;
+        self.private = false;
         self.bad = false;
     }
 
@@ -343,6 +353,10 @@ impl DecrqcraScanner {
                     b';' => self.push_param(),
                     0x2a => self.star = true, // '*'
                     0x21 => self.bang = true, // '!'
+                    // A leading '?' is the DEC-private marker; anywhere else it disqualifies.
+                    b'?' if self.params.is_empty() && !self.cur_seen && !self.private => {
+                        self.private = true
+                    }
                     0x40..=0x7e => {
                         self.push_param(); // finalize the trailing parameter
                         if !self.bad {
@@ -352,11 +366,31 @@ impl DecrqcraScanner {
                             } else if b == b'p' && self.bang && !self.star {
                                 // DECSTR: CSI ! p
                                 out.push((i + 1, ScanEvent::Decstr));
-                            } else if b == b't' && !self.star && !self.bang {
+                            } else if b == b't' && !self.star && !self.bang && !self.private {
                                 // XTWINOPS (`CSI … t`): resize / DECSLPP / size reports.
                                 if let Some(ev) = self.winop() {
                                     out.push((i + 1, ev));
                                 }
+                            } else if (b == b'h' || b == b'l')
+                                && self.private
+                                && !self.star
+                                && !self.bang
+                                && self.params.first() == Some(&1048)
+                            {
+                                // DEC private ?1048 (save/restore cursor) → DECSC/DECRC.
+                                out.push((
+                                    i + 1,
+                                    ScanEvent::SaveRestoreCursor { save: b == b'h' },
+                                ));
+                            } else if b == b'n' && self.private && !self.star && !self.bang {
+                                // DECDSR: CSI ? Ps [; Pid] n — device-status report.
+                                out.push((
+                                    i + 1,
+                                    ScanEvent::Decdsr {
+                                        ps: self.params.first().copied().unwrap_or(0),
+                                        pid: self.params.get(1).copied(),
+                                    },
+                                ));
                             }
                         }
                         self.state = DecrqcraState::Ground;
@@ -714,6 +748,29 @@ fn decrqm_perm_reset(bytes: &[u8]) -> Option<Vec<u8>> {
         .then(|| format!("\x1b[{}{};4$y", if dec { "?" } else { "" }, mode).into_bytes())
 }
 
+/// Build the reply to a DECDSR device-status query (`CSI ? Ps [; Pid] n`), or `None`
+/// for a report we don't answer. vte only dispatches the non-private DSR, so these go
+/// unanswered by the engine; the fixed values are the legal "feature absent" reports
+/// (no printer, keyboard = North American, no locator, 0 macro space, …) and are what
+/// esctest accepts. DECXCPR (6) reports the live cursor; the terminal presents as VT
+/// level 2 (DA2 type 0), so it omits the page parameter. DECCKSR (63) echoes the Pid.
+fn decdsr_reply(ps: u16, pid: Option<u16>, cur_row: u16, cur_col: u16) -> Option<Vec<u8>> {
+    let s = match ps {
+        6 => format!("\x1b[?{cur_row};{cur_col}R"), // DECXCPR (no page at VT level 2)
+        15 => "\x1b[?13n".to_string(),              // printer port: no printer
+        25 => "\x1b[?20n".to_string(),              // UDK: unlocked
+        26 => "\x1b[?27;1n".to_string(),            // keyboard: North American (2 params)
+        55 => "\x1b[?50n".to_string(),              // locator status: no locator
+        56 => "\x1b[?57;0n".to_string(),            // locator type: unknown
+        62 => "\x1b[0*{".to_string(),               // macro space: 0 (note: no ? prefix)
+        63 => format!("\x1bP{}!~0000\x1b\\", pid.unwrap_or(0)), // macro checksum: 0
+        75 => "\x1b[?70n".to_string(),              // data integrity: ready, no errors
+        85 => "\x1b[?83n".to_string(),              // sessions: not multi-session
+        _ => return None,
+    };
+    Some(s.into_bytes())
+}
+
 /// Build the reply to an XTWINOPS size/state **report** query (`CSI 11/13/14/15/16/19
 /// t`) from the live grid (`cols`×`rows`) and the fixed pixel metrics. The engine drops
 /// these, so we answer them here (§17). Formats match xterm / esctest's `escutil`:
@@ -905,6 +962,22 @@ fn pump(
                                 let rows = h.map(|h| h / CELL_H_PX).unwrap_or(cur_rows).clamp(1, 1000);
                                 g.term.resize(TermSize::new(cols as usize, rows as usize));
                                 pty_resize = Some((cols, rows));
+                            }
+                            // alacritty ignores ?1048 — apply the equivalent DECSC/DECRC.
+                            ScanEvent::SaveRestoreCursor { save } => {
+                                g.parser.advance(&mut g.term, if save { b"\x1b7" } else { b"\x1b8" });
+                            }
+                            // DECDSR device-status report — answered from fixed values,
+                            // DECXCPR from the live cursor; after earlier queued replies.
+                            ScanEvent::Decdsr { ps, pid } => {
+                                replies
+                                    .extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
+                                let p = g.term.renderable_content().cursor.point;
+                                let (row, col) =
+                                    ((p.line.0 + 1).max(1) as u16, (p.column.0 + 1) as u16);
+                                if let Some(reply) = decdsr_reply(ps, pid, row, col) {
+                                    replies.push(reply);
+                                }
                             }
                             // Size/state report — answered from the live grid + metrics,
                             // after any DA/DSR/color replies queued earlier in the chunk.
@@ -2861,6 +2934,49 @@ mod tests {
         // The `CSI 14;2 t` (shell-window) variant still reports as op 14.
         let out = DecrqcraScanner::new().feed(b"\x1b[14;2t");
         assert!(matches!(out[0].1, ScanEvent::WinopReport(14)));
+    }
+
+    #[test]
+    fn scanner_translates_save_restore_cursor_mode() {
+        // ?1048 set/reset → DECSC/DECRC translation events.
+        let save = DecrqcraScanner::new().feed(b"\x1b[?1048h");
+        assert_eq!(save.len(), 1);
+        assert!(matches!(save[0].1, ScanEvent::SaveRestoreCursor { save: true }));
+        let restore = DecrqcraScanner::new().feed(b"\x1b[?1048l");
+        assert!(matches!(restore[0].1, ScanEvent::SaveRestoreCursor { save: false }));
+        // Other private modes (?1049 alt-screen, ?25 cursor) are left to the engine.
+        assert!(DecrqcraScanner::new().feed(b"\x1b[?1049h").is_empty());
+        assert!(DecrqcraScanner::new().feed(b"\x1b[?25l").is_empty());
+        // A non-private 1048 (`CSI 1048 h`) is not the private mode and is ignored.
+        assert!(DecrqcraScanner::new().feed(b"\x1b[1048h").is_empty());
+    }
+
+    #[test]
+    fn scanner_detects_decdsr_and_replies() {
+        // `CSI ? 6 n` (DECXCPR) is detected as a private DSR carrying its Ps.
+        let out = DecrqcraScanner::new().feed(b"\x1b[?6n");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].1, ScanEvent::Decdsr { ps: 6, pid: None }));
+        // `CSI ? 63 ; 123 n` (DECCKSR) carries the Pid.
+        let out = DecrqcraScanner::new().feed(b"\x1b[?63;123n");
+        assert!(matches!(out[0].1, ScanEvent::Decdsr { ps: 63, pid: Some(123) }));
+        // A non-private DSR (`CSI 6 n`, CPR) is left to the engine.
+        assert!(DecrqcraScanner::new().feed(b"\x1b[6n").is_empty());
+
+        // Reply values: DECXCPR reports the live cursor without a page (VT level 2);
+        // the rest are the fixed legal "feature absent" reports esctest accepts.
+        assert_eq!(decdsr_reply(6, None, 6, 5), Some(b"\x1b[?6;5R".to_vec()));
+        assert_eq!(decdsr_reply(15, None, 1, 1), Some(b"\x1b[?13n".to_vec()));
+        assert_eq!(decdsr_reply(25, None, 1, 1), Some(b"\x1b[?20n".to_vec()));
+        assert_eq!(decdsr_reply(26, None, 1, 1), Some(b"\x1b[?27;1n".to_vec()));
+        assert_eq!(decdsr_reply(55, None, 1, 1), Some(b"\x1b[?50n".to_vec()));
+        assert_eq!(decdsr_reply(56, None, 1, 1), Some(b"\x1b[?57;0n".to_vec()));
+        assert_eq!(decdsr_reply(62, None, 1, 1), Some(b"\x1b[0*{".to_vec()));
+        assert_eq!(decdsr_reply(63, Some(123), 1, 1), Some(b"\x1bP123!~0000\x1b\\".to_vec()));
+        assert_eq!(decdsr_reply(75, None, 1, 1), Some(b"\x1b[?70n".to_vec()));
+        assert_eq!(decdsr_reply(85, None, 1, 1), Some(b"\x1b[?83n".to_vec()));
+        // Unknown Ps → no reply.
+        assert_eq!(decdsr_reply(99, None, 1, 1), None);
     }
 
     #[test]
