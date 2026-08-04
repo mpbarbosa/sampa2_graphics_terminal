@@ -24,12 +24,19 @@ cells counted as space (0x20) — which is exactly what `compute_decrqcra` repli
 Native engine = `alacritty_terminal` 0.26:
 
 ```
-*** 251 tests passed, 45 known bugs, 272 TESTS FAILED ***
+*** 256 tests passed, 43 known bugs, 269 TESTS FAILED ***
 ```
 
 **Release gate:** the pass count must not drop below this baseline.
 
-### Fix log (45 → 49 → 251)
+### Fix log (45 → 49 → 251 → 256)
+
+- **DECRQSS status strings (+5).** `DCS $q <Pt> ST` is unhandled by the engine; a DCS
+  scanner now extracts the query and replies `DCS 1 $r <value> <Pt> ST`: SGR (`m`)
+  reconstructed from the pen (`cursor.template`), DECSCL (`"p`) fixed at `64;1`, and the
+  `+q`/`*}`/`$}`/`*x`/`"q` settings reported at their defaults; unsupported → `0$r`.
+  Scroll-region/margins/cursor-style queries (`r`/`s`/` q`) need private engine state
+  and still report invalid.
 
 - **Color queries resolved against the live table (+202).** OSC 4/10/11 *set* writes to
   alacritty's `colors` table; the query emits `ColorRequest(idx, fmt)`. We used to reply
