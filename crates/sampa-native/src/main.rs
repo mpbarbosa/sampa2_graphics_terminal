@@ -52,6 +52,19 @@ const FONT_SIZE: f32 = 15.0;
 const LINE_HEIGHT: f32 = 18.0;
 const PAD: f32 = 6.0;
 
+// --- XTWINOPS pixel/display metrics (§17 conformance) -------------------------
+// alacritty answers only the char-size winop (CSI 18 t) and drops the pixel/report
+// ones. esctest cross-checks that the pixel, char, and cell reports agree, so we
+// report a fixed cell size and a nominal display size; the parser thread stays
+// window-free. Exact match to the GPU-measured advance isn't tested — only that
+// text-area px == chars × cell px, which these constants keep consistent.
+const CELL_W_PX: u16 = 9; // ~ FONT_SIZE * 0.6
+const CELL_H_PX: u16 = LINE_HEIGHT as u16; // 18
+const DISPLAY_W_PX: u16 = 1920;
+const DISPLAY_H_PX: u16 = 1080;
+const DISPLAY_COLS: u16 = DISPLAY_W_PX / CELL_W_PX; // 213
+const DISPLAY_ROWS: u16 = DISPLAY_H_PX / CELL_H_PX; // 60
+
 // Default theme colors (dark). OSC 10/11 can override at runtime.
 const DEFAULT_FG: [u8; 3] = [0xcd, 0xd6, 0xf4];
 const DEFAULT_BG: [u8; 3] = [0x11, 0x11, 0x1b];
@@ -216,10 +229,12 @@ enum DecrqcraState {
 struct DecrqcraScanner {
     state: DecrqcraState,
     params: Vec<u16>,
+    seen: Vec<bool>, // per-param: had ≥1 digit (empty `;;` vs explicit `0`, for XTWINOPS)
     cur: u32,
-    star: bool, // saw '*' intermediate (DECRQCRA)
-    bang: bool, // saw '!' intermediate (DECSTR)
-    bad: bool,  // saw a disqualifying intermediate / private marker
+    cur_seen: bool, // a digit was consumed for the parameter being accumulated
+    star: bool,     // saw '*' intermediate (DECRQCRA)
+    bang: bool,     // saw '!' intermediate (DECSTR)
+    bad: bool,      // saw a disqualifying intermediate / private marker
 }
 
 /// Something the output-stream scanner extracts that alacritty leaves unhandled and
@@ -227,7 +242,15 @@ struct DecrqcraScanner {
 enum ScanEvent {
     Decrqcra(Decrqcra),
     Decstr,
-    Resize { rows: u16, cols: u16 },
+    /// XTWINOPS resize in **cells** (`CSI 8 ; rows ; cols t`, or DECSLPP `CSI Ps t`).
+    /// `None` keeps that dimension; an explicit `0` resolves to the display maximum.
+    Resize { rows: Option<u16>, cols: Option<u16> },
+    /// XTWINOPS resize in **pixels** (`CSI 4 ; h ; w t`); converted to cells against the
+    /// fixed cell metrics. Same `None` = keep, `0` = maximize convention.
+    ResizePixels { h: Option<u16>, w: Option<u16> },
+    /// A window/size **report** query (`CSI 11/13/14/15/16/19 t`). The reply is built
+    /// from the live grid plus the fixed metrics at drain time.
+    WinopReport(u16),
 }
 
 impl DecrqcraScanner {
@@ -238,10 +261,53 @@ impl DecrqcraScanner {
     fn enter_csi(&mut self) {
         self.state = DecrqcraState::Csi;
         self.params.clear();
+        self.seen.clear();
         self.cur = 0;
+        self.cur_seen = false;
         self.star = false;
         self.bang = false;
         self.bad = false;
+    }
+
+    /// Finalize the parameter currently being accumulated into `params`/`seen`.
+    fn push_param(&mut self) {
+        self.params.push(self.cur.min(0xffff) as u16);
+        self.seen.push(self.cur_seen);
+        self.cur = 0;
+        self.cur_seen = false;
+    }
+
+    /// Build the XTWINOPS event for a completed `CSI … t`, or `None` if it's an op we
+    /// leave to the engine (18/22/23) or don't act on. `params[0]` selects the op.
+    fn winop(&self) -> Option<ScanEvent> {
+        let op = *self.params.first()?;
+        let present = |i: usize| self.seen.get(i).copied().unwrap_or(false);
+        let val = |i: usize| self.params.get(i).copied().unwrap_or(0);
+        // Resolve a resize dimension: omitted → keep (None); explicit 0 → maximize to
+        // the display; otherwise the given value.
+        let dim = |i: usize, max: u16| -> Option<u16> {
+            if !present(i) {
+                None
+            } else if val(i) == 0 {
+                Some(max)
+            } else {
+                Some(val(i))
+            }
+        };
+        match op {
+            4 => Some(ScanEvent::ResizePixels {
+                h: dim(1, DISPLAY_H_PX),
+                w: dim(2, DISPLAY_W_PX),
+            }),
+            8 => Some(ScanEvent::Resize {
+                rows: dim(1, DISPLAY_ROWS),
+                cols: dim(2, DISPLAY_COLS),
+            }),
+            11 | 13 | 14 | 15 | 16 | 19 => Some(ScanEvent::WinopReport(op)),
+            // DECSLPP: `CSI Ps t` with Ps ≥ 24 sets the line count, keeping columns.
+            op if op >= 24 => Some(ScanEvent::Resize { rows: Some(op), cols: None }),
+            _ => None,
+        }
     }
 
     fn request(&self) -> Decrqcra {
@@ -272,33 +338,24 @@ impl DecrqcraScanner {
                 DecrqcraState::Csi => match b {
                     b'0'..=b'9' => {
                         self.cur = self.cur.saturating_mul(10).saturating_add((b - b'0') as u32);
+                        self.cur_seen = true;
                     }
-                    b';' => {
-                        self.params.push(self.cur.min(0xffff) as u16);
-                        self.cur = 0;
-                    }
+                    b';' => self.push_param(),
                     0x2a => self.star = true, // '*'
                     0x21 => self.bang = true, // '!'
                     0x40..=0x7e => {
+                        self.push_param(); // finalize the trailing parameter
                         if !self.bad {
                             if b == b'y' && self.star && !self.bang {
                                 // DECRQCRA: CSI … * y
-                                self.params.push(self.cur.min(0xffff) as u16);
                                 out.push((i + 1, ScanEvent::Decrqcra(self.request())));
                             } else if b == b'p' && self.bang && !self.star {
                                 // DECSTR: CSI ! p
                                 out.push((i + 1, ScanEvent::Decstr));
                             } else if b == b't' && !self.star && !self.bang {
-                                // XTWINOPS resize: CSI 8 ; rows ; cols t
-                                self.params.push(self.cur.min(0xffff) as u16);
-                                if self.params.first() == Some(&8) && self.params.len() >= 3 {
-                                    let d = |i: usize, dflt: u16| {
-                                        self.params.get(i).copied().filter(|&v| v > 0).unwrap_or(dflt)
-                                    };
-                                    out.push((
-                                        i + 1,
-                                        ScanEvent::Resize { rows: d(1, 24), cols: d(2, 80) },
-                                    ));
+                                // XTWINOPS (`CSI … t`): resize / DECSLPP / size reports.
+                                if let Some(ev) = self.winop() {
+                                    out.push((i + 1, ev));
                                 }
                             }
                         }
@@ -614,6 +671,26 @@ fn compute_decrqcra<L: EventListener>(term: &Term<L>, req: &Decrqcra) -> Vec<u8>
     format!("\x1bP{}!~{:04X}\x1b\\", req.pid, sum & 0xffff).into_bytes()
 }
 
+/// Build the reply to an XTWINOPS size/state **report** query (`CSI 11/13/14/15/16/19
+/// t`) from the live grid (`cols`×`rows`) and the fixed pixel metrics. The engine drops
+/// these, so we answer them here (§17). Formats match xterm / esctest's `escutil`:
+///   11 → `CSI 1 t` (not iconified)   13 → `CSI 3 ; x ; y t` (window position)
+///   14 → `CSI 4 ; h ; w t` (text-area px)   15 → `CSI 5 ; h ; w t` (screen px)
+///   16 → `CSI 6 ; h ; w t` (cell px)   19 → `CSI 9 ; rows ; cols t` (screen chars)
+fn winop_report(op: u16, cols: u16, rows: u16) -> Vec<u8> {
+    let (cw, ch) = (CELL_W_PX as u32, CELL_H_PX as u32);
+    let s = match op {
+        11 => "\x1b[1t".to_string(),
+        13 => "\x1b[3;0;0t".to_string(),
+        14 => format!("\x1b[4;{};{}t", rows as u32 * ch, cols as u32 * cw),
+        15 => format!("\x1b[5;{};{}t", DISPLAY_H_PX, DISPLAY_W_PX),
+        16 => format!("\x1b[6;{};{}t", CELL_H_PX, CELL_W_PX),
+        19 => format!("\x1b[9;{};{}t", DISPLAY_ROWS, DISPLAY_COLS),
+        _ => return Vec::new(),
+    };
+    s.into_bytes()
+}
+
 struct TermState {
     parser: Processor,
     term: Term<EventProxy>,
@@ -767,9 +844,33 @@ fn pump(
                             ScanEvent::Decstr => g.parser.advance(&mut g.term, DECSTR_RESET),
                             // alacritty ignores XTWINOPS resize — resize the grid here,
                             // and remember to resize the PTY once we release the lock.
+                            // `None` dimensions keep the current extent; values are
+                            // clamped to a sane range (§13 OOM guard).
                             ScanEvent::Resize { rows, cols } => {
+                                let (cur_cols, cur_rows) =
+                                    (g.term.grid().columns() as u16, g.term.grid().screen_lines() as u16);
+                                let cols = cols.unwrap_or(cur_cols).clamp(1, 1000);
+                                let rows = rows.unwrap_or(cur_rows).clamp(1, 1000);
                                 g.term.resize(TermSize::new(cols as usize, rows as usize));
                                 pty_resize = Some((cols, rows));
+                            }
+                            // Pixel resize → cells against the fixed cell metrics.
+                            ScanEvent::ResizePixels { h, w } => {
+                                let (cur_cols, cur_rows) =
+                                    (g.term.grid().columns() as u16, g.term.grid().screen_lines() as u16);
+                                let cols = w.map(|w| w / CELL_W_PX).unwrap_or(cur_cols).clamp(1, 1000);
+                                let rows = h.map(|h| h / CELL_H_PX).unwrap_or(cur_rows).clamp(1, 1000);
+                                g.term.resize(TermSize::new(cols as usize, rows as usize));
+                                pty_resize = Some((cols, rows));
+                            }
+                            // Size/state report — answered from the live grid + metrics,
+                            // after any DA/DSR/color replies queued earlier in the chunk.
+                            ScanEvent::WinopReport(op) => {
+                                replies
+                                    .extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
+                                let (cols, rows) =
+                                    (g.term.grid().columns() as u16, g.term.grid().screen_lines() as u16);
+                                replies.push(winop_report(op, cols, rows));
                             }
                         }
                     }
@@ -2659,9 +2760,75 @@ mod tests {
     fn scanner_detects_resize() {
         let ev = DecrqcraScanner::new().feed(b"\x1b[8;25;80t");
         assert_eq!(ev.len(), 1);
-        assert!(matches!(ev[0].1, ScanEvent::Resize { rows: 25, cols: 80 }));
-        // A report winop (CSI 18 t) is not a resize.
+        assert!(matches!(
+            ev[0].1,
+            ScanEvent::Resize { rows: Some(25), cols: Some(80) }
+        ));
+        // CSI 18 t (text-area chars) is left to the engine, not re-emitted here.
         assert!(DecrqcraScanner::new().feed(b"\x1b[18t").is_empty());
+    }
+
+    #[test]
+    fn scanner_resize_distinguishes_omitted_zero_and_value() {
+        let ev = |s: &[u8]| {
+            let out = DecrqcraScanner::new().feed(s);
+            assert_eq!(out.len(), 1, "{:?}", std::str::from_utf8(s));
+            match out[0].1 {
+                ScanEvent::Resize { rows, cols } => (rows, cols),
+                _ => panic!("expected Resize"),
+            }
+        };
+        // Explicit value in both dimensions.
+        assert_eq!(ev(b"\x1b[8;10;90t"), (Some(10), Some(90)));
+        // Omitted width (`CSI 8;H t`) keeps columns; omitted height (`CSI 8;;W t`) keeps rows.
+        assert_eq!(ev(b"\x1b[8;10t"), (Some(10), None));
+        assert_eq!(ev(b"\x1b[8;;90t"), (None, Some(90)));
+        // Explicit 0 maximizes to the display, distinct from omitted.
+        assert_eq!(ev(b"\x1b[8;0;90t"), (Some(DISPLAY_ROWS), Some(90)));
+        assert_eq!(ev(b"\x1b[8;10;0t"), (Some(10), Some(DISPLAY_COLS)));
+        // DECSLPP: `CSI Ps t`, Ps ≥ 24 sets the line count and keeps columns.
+        assert_eq!(ev(b"\x1b[30t"), (Some(30), None));
+    }
+
+    #[test]
+    fn scanner_detects_pixel_resize() {
+        let out = DecrqcraScanner::new().feed(b"\x1b[4;200;360t");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            out[0].1,
+            ScanEvent::ResizePixels { h: Some(200), w: Some(360) }
+        ));
+    }
+
+    #[test]
+    fn scanner_detects_winop_reports() {
+        for &op in &[11u16, 13, 14, 15, 16, 19] {
+            let out = DecrqcraScanner::new().feed(format!("\x1b[{op}t").as_bytes());
+            assert_eq!(out.len(), 1, "op {op}");
+            assert!(matches!(out[0].1, ScanEvent::WinopReport(o) if o == op), "op {op}");
+        }
+        // The `CSI 14;2 t` (shell-window) variant still reports as op 14.
+        let out = DecrqcraScanner::new().feed(b"\x1b[14;2t");
+        assert!(matches!(out[0].1, ScanEvent::WinopReport(14)));
+    }
+
+    #[test]
+    fn winop_report_formats_match_xterm() {
+        // Text-area px == chars × cell px, so 14/16/18 stay mutually consistent.
+        assert_eq!(winop_report(11, 80, 24), b"\x1b[1t".to_vec());
+        assert_eq!(winop_report(13, 80, 24), b"\x1b[3;0;0t".to_vec());
+        assert_eq!(
+            winop_report(14, 80, 24),
+            format!("\x1b[4;{};{}t", 24 * CELL_H_PX, 80 * CELL_W_PX).into_bytes()
+        );
+        assert_eq!(
+            winop_report(16, 80, 24),
+            format!("\x1b[6;{};{}t", CELL_H_PX, CELL_W_PX).into_bytes()
+        );
+        assert_eq!(
+            winop_report(19, 80, 24),
+            format!("\x1b[9;{};{}t", DISPLAY_ROWS, DISPLAY_COLS).into_bytes()
+        );
     }
 
     #[test]
