@@ -144,13 +144,16 @@ render without corruption, respond to resize, honor Ctrl-C/Ctrl-Z; clean exit. *
 + SIGINT + SIGWINCH contracts verified headlessly for the installed subset; live GUI
 interactive pass + wider program coverage outstanding.)*
 
-### N2 — Comfort: config-driven renderer (§7.3, §11) ⬜
-- Consume `sampa-config` live-reload: themes (16 ANSI + fg/bg/cursor/selection,
-  truecolor, OSC 4/10/11), fonts + **fontconfig fallback**, line height, cursor
-  shape/blink, **ligatures toggle** (default off), visual/audible bell.
-- **Tabs** on `pty-core`'s session table.
-- **Search overlay** — now owned natively (replaces `addon-search`): incremental
-  match + highlight over scrollback.
+### N2 — Comfort: config-driven renderer (§7.3, §11) 🔨
+- 🔨 Consume `sampa-config` (loaded from the XDG path at startup, else defaults):
+  ✅ **theme** (16 ANSI + fg/bg/selection loaded into the VT color table via OSC so
+  `resolve` returns them), ✅ **font family** (CSS-list primary, `glyphon` generics) +
+  **size** (drives cell metrics), ✅ **scrollback lines** → `TermConfig`. Verified by
+  unit tests (hex/family parse, palette→table) **and a config-aware `--capture`** (navy
+  `#001830` bg + size-20 font applied). ⬜ still: **live reload** (watch + re-apply),
+  **cursor shape/blink**, ligatures toggle, bell, fontconfig fallback chain.
+- ⬜ **Tabs** on `pty-core`'s session table.
+- ⬜ **Search overlay** — native, incremental match + highlight over scrollback.
 
 **Exit:** a config edit hot-reloads theme/font/cursor; a Powerline + truecolor prompt
 renders; tabs run independent shells; search highlights scrollback matches.
