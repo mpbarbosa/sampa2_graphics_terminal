@@ -24,12 +24,21 @@ cells counted as space (0x20) — which is exactly what `compute_decrqcra` repli
 Native engine = `alacritty_terminal` 0.26:
 
 ```
-*** 267 tests passed, 43 known bugs, 258 TESTS FAILED ***
+*** 280 tests passed, 43 known bugs, 245 TESTS FAILED ***
 ```
 
 **Release gate:** the pass count must not drop below this baseline.
 
-### Fix log (45 → 49 → 251 → 256 → 267)
+### Fix log (45 → 49 → 251 → 256 → 267 → 280)
+
+- **DECRQM permanently-reset modes (+13).** alacritty answers DECRQM (`CSI [?]Ps $ p`)
+  for modes outside its enum as "not recognized" (state 0); esctest expects "permanently
+  reset" (state 4) for modes xterm knows but never sets (ANSI GATM/SRTM/VEM/HEM/PUM/FEAM/
+  FETM/MATM/TTM/SATM/TSM/EBM, DEC DECHCCM). We rewrite `0 → 4` on the outgoing reply for
+  exactly those (keyed by the reply's own mode number + ANSI/DEC namespace), which is the
+  correct answer and what xterm gives. `DECRQM` went 8/33 → 21/33; the remaining 11 are
+  *modifiable* modes (KAM/SRM, DECCOLM/DECSCNM/DECNKM/…) that need real set/reset state
+  tracking, not just a report.
 
 - **XTWINOPS size/state reports + pixel/DECSLPP resize (+11).** vte only dispatches the
   char-size winop (`CSI 18 t`); the pixel/report queries the resize tests use as helpers
@@ -73,26 +82,28 @@ DECRQCRA itself is correct — verified two ways:
   is `ESC[3;6R` and the size report is `ESC[8;24;80t` — both correct, even after
   replaying esctest's full 76-command `reset()`.
 
-With the color-query/DECSTR desyncs fixed and the XTWINOPS reports added, the pass count
-reached **267** (origin Path B / xterm.js is ~305). The remaining failures are **genuine
-feature gaps in the `alacritty_terminal` engine** relative to xterm — each a distinct
-piece of work:
+With the color-query/DECSTR desyncs fixed and the XTWINOPS + DECRQM replies added, the
+pass count reached **280** (origin Path B / xterm.js is ~305). The remaining failures are
+**genuine feature gaps in the `alacritty_terminal` engine** relative to xterm — each a
+distinct piece of work:
 
 ```
-24 DECRQM · 17 XtermWinops (WM ops / title read-back) · 15 DECSET · 15 DECSED
-11 DECRQSS · 11 DECDSR · 10 DECSEL · 8 DECCRA · 8 BS · 22 color edge-cases …
+17 XtermWinops (WM ops / title read-back) · 15 DECSET · 15 DECSED · 11 DECRQSS
+11 DECRQM (modifiable modes) · 11 DECDSR · 10 DECSEL · 8 DECCRA · 8 BS
+22 color edge-cases …
 ```
 
 ## Follow-up (to raise the baseline) — roughly by leverage
 
-1. **DECRQM extended modes (24)** — cover modes esctest probes that alacritty reports as
-   "not recognized"; several are legitimate "known bugs".
-2. **DECSET (15)** — private-mode set/reset esctest exercises that the engine drops.
-3. **Selective erase (DECSED/DECSEL, 25)** — DECSCA protected attributes.
+1. **DECSET (15)** — private-mode set/reset esctest exercises that the engine drops.
+2. **Selective erase (DECSED/DECSEL, 25)** — DECSCA protected attributes.
+3. **DECRQM modifiable modes (11)** — modes esctest expects to toggle (KAM/SRM,
+   DECCOLM/DECSCNM/DECNKM/…); needs shadow set/reset state (and ideally real behavior),
+   not just the permanently-reset report already handled.
 4. **DECRQSS (11)** — remaining status-string replies (scroll-region/margins/cursor-style
    need private engine state the query path can't yet see).
 5. **DECDSR (11)** — the device-status reports it expects.
-6. Re-run per group (`--include DECRQM`, …) and move the gate up as each lands.
+6. Re-run per group (`--include DECSET`, …) and move the gate up as each lands.
 
 The 17 `XtermWinops` still failing are out of reach headless: window-manager ops
 (iconify/maximize/fullscreen/move) and title read-back (`20 t`/`21 t`, a title-injection
