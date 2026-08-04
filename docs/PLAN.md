@@ -224,15 +224,16 @@ and show target; a CJK/emoji/compose input test passes; a screen reader sees the
 ### N6 — Conformance, perf, v1 (§14, §17) 🔨
 - 🔨 **esctest:** harness wired ([tools/conformance/](../tools/conformance/README.md)) —
   fetches pinned esctest2, runs headless under Xvfb against the native binary via
-  `sampa -e python3 esctest.py`, scores with `--xterm-checksum 334`. **Baseline: 267
-  passed / 43 known-bug / 258 failed** (gate: don't regress) — up from 45 by fixing
+  `sampa -e python3 esctest.py`, scores with `--xterm-checksum 334`. **Baseline: 280
+  passed / 43 known-bug / 245 failed** (gate: don't regress) — up from 45 by fixing
   suite-wide desyncs (**color queries** live, +202; **DECSTR** soft-reset, +4), adding
-  **DECRQSS** status-string replies (+5), and answering **XTWINOPS size/state reports** +
-  pixel/DECSLPP resize (+11, `XtermWinops` 0/28 → 11/28). DECRQCRA correct (unit-tested +
-  PTY-probed: `CUP(3,6)`→`ESC[3;6R`). Remaining gap to the origin's ~305 is genuine xterm
-  feature coverage in `alacritty_terminal` (extended DECRQM, selective erase, DECDSR, WM
-  ops that need a live window manager) — ranked roadmap in
-  [tools/conformance/](../tools/conformance/README.md).
+  **DECRQSS** status-string replies (+5), answering **XTWINOPS size/state reports** +
+  pixel/DECSLPP resize (+11, `XtermWinops` 0/28 → 11/28), and reporting **DECRQM
+  permanently-reset modes** correctly (+13, `DECRQM` 8/33 → 21/33). DECRQCRA correct
+  (unit-tested + PTY-probed: `CUP(3,6)`→`ESC[3;6R`). Remaining gap to the origin's ~305 is
+  genuine xterm feature coverage in `alacritty_terminal` (DECSET, selective erase,
+  DECRQM modifiable modes, DECDSR, WM ops that need a live window manager) — ranked
+  roadmap in [tools/conformance/](../tools/conformance/README.md).
 - **vttest** manual smoke; **real-app matrix** green (add mc, ssh, weechat, emacs -nw,
   fzf, truecolor, sixel, CJK/emoji).
 - **Perf:** the native ceiling is the payoff — `cat 50MB` throughput, typometer

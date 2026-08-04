@@ -671,6 +671,49 @@ fn compute_decrqcra<L: EventListener>(term: &Term<L>, req: &Decrqcra) -> Vec<u8>
     format!("\x1bP{}!~{:04X}\x1b\\", req.pid, sum & 0xffff).into_bytes()
 }
 
+// --- DECRQM permanently-reset modes (§17 conformance) ------------------------
+// Modes esctest expects a DECRQM "permanently reset" (4) reply for: known to xterm but
+// deliberately unavailable here. alacritty answers them as "not recognized" (0) because
+// its mode enum doesn't list them; 4 is the correct reply for a terminal that knows the
+// mode yet never sets it (what xterm does), so we rewrite 0 → 4 for exactly these. Keyed
+// separately for ANSI (`CSI Ps $ y`) and DEC-private (`CSI ? Ps $ y`) — the numbers
+// overlap across the two namespaces (e.g. ANSI 1 = GATM vs. DEC 1 = DECCKM).
+const DECRQM_PERM_RESET_ANSI: &[u16] = &[
+    1,  // GATM
+    5,  // SRTM
+    7,  // VEM
+    10, // HEM
+    11, // PUM
+    13, // FEAM
+    14, // FETM
+    15, // MATM
+    16, // TTM
+    17, // SATM
+    18, // TSM
+    19, // EBM
+];
+const DECRQM_PERM_RESET_DEC: &[u16] = &[60]; // DECHCCM
+
+/// If `bytes` is an alacritty DECRQM reply (`CSI [?] Ps ; Ps2 $ y`) reporting a
+/// permanently-reset mode as "not recognized" (state 0), return the corrected reply
+/// with state 4. Returns `None` for non-DECRQM replies and modes we don't override, so
+/// they pass through untouched.
+fn decrqm_perm_reset(bytes: &[u8]) -> Option<Vec<u8>> {
+    let inner = bytes.strip_prefix(b"\x1b[")?.strip_suffix(b"$y")?;
+    let (dec, nums) = match inner.strip_prefix(b"?") {
+        Some(rest) => (true, rest),
+        None => (false, inner),
+    };
+    let (mode, state) = std::str::from_utf8(nums).ok()?.split_once(';')?;
+    if state != "0" {
+        return None;
+    }
+    let mode: u16 = mode.parse().ok()?;
+    let list = if dec { DECRQM_PERM_RESET_DEC } else { DECRQM_PERM_RESET_ANSI };
+    list.contains(&mode)
+        .then(|| format!("\x1b[{}{};4$y", if dec { "?" } else { "" }, mode).into_bytes())
+}
+
 /// Build the reply to an XTWINOPS size/state **report** query (`CSI 11/13/14/15/16/19
 /// t`) from the live grid (`cols`×`rows`) and the fixed pixel metrics. The engine drops
 /// these, so we answer them here (§17). Formats match xterm / esctest's `escutil`:
@@ -904,6 +947,14 @@ fn pump(
                 if let Some((cols, rows)) = pty_resize {
                     if let Ok(p) = pty.lock() {
                         let _ = p.resize(cols, rows, 0, 0);
+                    }
+                }
+                // Correct alacritty's DECRQM "not recognized" (0) replies for modes
+                // that are actually permanently reset (4) — done on the outgoing bytes
+                // so the reply's own mode number keys the rewrite (§17 conformance).
+                for r in replies.iter_mut() {
+                    if let Some(fixed) = decrqm_perm_reset(r) {
+                        *r = fixed;
                     }
                 }
                 if !replies.is_empty() {
@@ -2810,6 +2861,23 @@ mod tests {
         // The `CSI 14;2 t` (shell-window) variant still reports as op 14.
         let out = DecrqcraScanner::new().feed(b"\x1b[14;2t");
         assert!(matches!(out[0].1, ScanEvent::WinopReport(14)));
+    }
+
+    #[test]
+    fn decrqm_permanently_reset_modes_rewrite_zero_to_four() {
+        // ANSI GATM (1) and DEC DECHCCM (?60): 0 (not recognized) → 4 (perm reset).
+        assert_eq!(decrqm_perm_reset(b"\x1b[1;0$y"), Some(b"\x1b[1;4$y".to_vec()));
+        assert_eq!(decrqm_perm_reset(b"\x1b[?60;0$y"), Some(b"\x1b[?60;4$y".to_vec()));
+        // A non-zero state (already answered) is left as-is.
+        assert_eq!(decrqm_perm_reset(b"\x1b[1;2$y"), None);
+        // Modes not in the list pass through: ANSI IRM (4, engine-supported), DEC
+        // cursor-keys (?1, distinct namespace from ANSI GATM), modifiable SRM (12).
+        assert_eq!(decrqm_perm_reset(b"\x1b[4;1$y"), None);
+        assert_eq!(decrqm_perm_reset(b"\x1b[?1;0$y"), None);
+        assert_eq!(decrqm_perm_reset(b"\x1b[12;0$y"), None);
+        // Non-DECRQM replies (DA, CPR) are untouched.
+        assert_eq!(decrqm_perm_reset(b"\x1b[?62;1;6c"), None);
+        assert_eq!(decrqm_perm_reset(b"\x1b[3;6R"), None);
     }
 
     #[test]
