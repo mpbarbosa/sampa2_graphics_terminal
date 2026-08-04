@@ -24,12 +24,24 @@ cells counted as space (0x20) — which is exactly what `compute_decrqcra` repli
 Native engine = `alacritty_terminal` 0.26:
 
 ```
-*** 256 tests passed, 43 known bugs, 269 TESTS FAILED ***
+*** 267 tests passed, 43 known bugs, 258 TESTS FAILED ***
 ```
 
 **Release gate:** the pass count must not drop below this baseline.
 
-### Fix log (45 → 49 → 251 → 256)
+### Fix log (45 → 49 → 251 → 256 → 267)
+
+- **XTWINOPS size/state reports + pixel/DECSLPP resize (+11).** vte only dispatches the
+  char-size winop (`CSI 18 t`); the pixel/report queries the resize tests use as helpers
+  (`GetDisplaySize` → `CSI 19 t`, `GetWindowSizePixels` → `14 t`, `GetScreenSizePixels`
+  → `15 t`, `GetCharSizePixels` → `16 t`, window state/position → `11 t`/`13 t`) all
+  timed out, so every `XtermWinops` test failed at its first probe. A scanner now answers
+  those reports from the live grid + fixed cell/display metrics (self-consistent:
+  text-area px == chars × cell px), resizes on `CSI 4 t` (pixels) and `CSI Ps t` DECSLPP
+  in addition to `CSI 8 t`, and distinguishes an **omitted** dimension (keep) from an
+  explicit **0** (maximize to the display). `XtermWinops` went 0/28 → 11/28; the
+  remaining 17 need a real window manager (iconify/maximize/fullscreen/move) or title
+  read-back (`20 t`/`21 t`, a title-injection vector left disabled per §13).
 
 - **DECRQSS status strings (+5).** `DCS $q <Pt> ST` is unhandled by the engine; a DCS
   scanner now extracts the query and replies `DCS 1 $r <value> <Pt> ST`: SGR (`m`)
@@ -61,29 +73,27 @@ DECRQCRA itself is correct — verified two ways:
   is `ESC[3;6R` and the size report is `ESC[8;24;80t` — both correct, even after
   replaying esctest's full 76-command `reset()`.
 
-With the color-query and DECSTR desyncs fixed, the pass count reached **251** (origin
-Path B / xterm.js is ~305). The remaining ~272 are **genuine feature gaps in the
-`alacritty_terminal` engine** relative to xterm — each a distinct piece of work:
+With the color-query/DECSTR desyncs fixed and the XTWINOPS reports added, the pass count
+reached **267** (origin Path B / xterm.js is ~305). The remaining failures are **genuine
+feature gaps in the `alacritty_terminal` engine** relative to xterm — each a distinct
+piece of work:
 
 ```
-28 XtermWinops · 24 DECRQM · 15 DECSET · 15 DECSED · 11 DECRQSS · 11 DECDSR
-10 DECSEL · 8 DECCRA · 8 BS · 22 color edge-cases (special/dynamic/change) …
+24 DECRQM · 17 XtermWinops (WM ops / title read-back) · 15 DECSET · 15 DECSED
+11 DECRQSS · 11 DECDSR · 10 DECSEL · 8 DECCRA · 8 BS · 22 color edge-cases …
 ```
-
-### Correctness notes (no esctest delta)
-
-- **`CSI 8;h;w t` (XTWINOPS resize) is now honored** — the scanner detects it and resizes
-  the grid + PTY (the engine ignored it). +0 on esctest (the rest of XtermWinops probes
-  iconify/maximize/position/state, which need real window manipulation and aren't
-  feasible headless), but it's a real feature for apps that resize via escape.
 
 ## Follow-up (to raise the baseline) — roughly by leverage
 
-1. **XtermWinops reports (partial)** — the position/size/state reports it queries
-   (`CSI 11/13/14/19 t`); the manipulation ops (iconify/maximize) can't pass headless.
-2. **DECRQM extended modes (24)** — cover modes esctest probes that alacritty reports as
+1. **DECRQM extended modes (24)** — cover modes esctest probes that alacritty reports as
    "not recognized"; several are legitimate "known bugs".
+2. **DECSET (15)** — private-mode set/reset esctest exercises that the engine drops.
 3. **Selective erase (DECSED/DECSEL, 25)** — DECSCA protected attributes.
-4. **DECRQSS (11)** — status-string replies (`DCS 1 $ r … ST`) for SGR/DECSTBM/etc.
+4. **DECRQSS (11)** — remaining status-string replies (scroll-region/margins/cursor-style
+   need private engine state the query path can't yet see).
 5. **DECDSR (11)** — the device-status reports it expects.
-6. Re-run per group (`--include XtermWinops`, …) and move the gate up as each lands.
+6. Re-run per group (`--include DECRQM`, …) and move the gate up as each lands.
+
+The 17 `XtermWinops` still failing are out of reach headless: window-manager ops
+(iconify/maximize/fullscreen/move) and title read-back (`20 t`/`21 t`, a title-injection
+vector kept disabled per §13).
