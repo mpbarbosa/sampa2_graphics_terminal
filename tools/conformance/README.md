@@ -24,12 +24,24 @@ cells counted as space (0x20) — which is exactly what `compute_decrqcra` repli
 Native engine = `alacritty_terminal` 0.26:
 
 ```
-*** 280 tests passed, 43 known bugs, 245 TESTS FAILED ***
+*** 295 tests passed, 43 known bugs, 230 TESTS FAILED ***
 ```
 
 **Release gate:** the pass count must not drop below this baseline.
 
-### Fix log (45 → 49 → 251 → 256 → 267 → 280)
+### Fix log (45 → 49 → 251 → 256 → 267 → 280 → 295)
+
+- **DECDSR device-status reports (+11).** vte dispatches only the non-private DSR
+  (`CSI Ps n`), so every DEC-private query (`CSI ? Ps n`) went unanswered and timed out.
+  A scanner now replies to all 11: DECXCPR (`?6n`) reports the live cursor (no page — the
+  terminal presents as VT level 2 via DA2 type 0), DECCKSR (`?63n`) echoes the Pid with a
+  zero macro checksum, and the rest are the fixed legal "feature absent" reports (no
+  printer, keyboard = North American, no locator, 0 macro space, data-integrity OK,
+  not multi-session). `DECDSR` went 0/11 → 11/11.
+- **DECSET `?1048` save/restore cursor (+4).** alacritty leaves `?1048` unhandled
+  (vte only maps `?1049`); the scanner translates `?1048h`/`l` to the DECSC/DECRC
+  (`ESC 7`/`ESC 8`) it does support, recovering the tite-inhibit SaveRestoreCursor tests
+  that don't also depend on left-right margins. `DECSET` went 13/31 → 17/31.
 
 - **DECRQM permanently-reset modes (+13).** alacritty answers DECRQM (`CSI [?]Ps $ p`)
   for modes outside its enum as "not recognized" (state 0); esctest expects "permanently
@@ -82,29 +94,32 @@ DECRQCRA itself is correct — verified two ways:
   is `ESC[3;6R` and the size report is `ESC[8;24;80t` — both correct, even after
   replaying esctest's full 76-command `reset()`.
 
-With the color-query/DECSTR desyncs fixed and the XTWINOPS + DECRQM replies added, the
-pass count reached **280** (origin Path B / xterm.js is ~305). The remaining failures are
-**genuine feature gaps in the `alacritty_terminal` engine** relative to xterm — each a
+With the color-query/DECSTR desyncs fixed and the XTWINOPS/DECRQM/DECDSR replies added,
+the pass count reached **295** (origin Path B / xterm.js is ~305). The remaining failures
+are **genuine feature gaps in the `alacritty_terminal` engine** relative to xterm — each a
 distinct piece of work:
 
 ```
-17 XtermWinops (WM ops / title read-back) · 15 DECSET · 15 DECSED · 11 DECRQSS
-11 DECRQM (modifiable modes) · 11 DECDSR · 10 DECSEL · 8 DECCRA · 8 BS
+17 XtermWinops (WM ops / title read-back) · 17 DECSET (margins / 132-col / rev-wrap)
+15 DECSED · 11 DECRQSS · 11 DECRQM (modifiable modes) · 10 DECSEL · 8 DECCRA · 8 BS
 22 color edge-cases …
 ```
 
 ## Follow-up (to raise the baseline) — roughly by leverage
 
-1. **DECSET (15)** — private-mode set/reset esctest exercises that the engine drops.
-2. **Selective erase (DECSED/DECSEL, 25)** — DECSCA protected attributes.
+1. **Selective erase (DECSED/DECSEL, 25)** — DECSCA protected attributes.
+2. **DECRQSS (11)** — remaining status-string replies (scroll-region/margins/cursor-style
+   need private engine state the query path can't yet see).
 3. **DECRQM modifiable modes (11)** — modes esctest expects to toggle (KAM/SRM,
    DECCOLM/DECSCNM/DECNKM/…); needs shadow set/reset state (and ideally real behavior),
    not just the permanently-reset report already handled.
-4. **DECRQSS (11)** — remaining status-string replies (scroll-region/margins/cursor-style
-   need private engine state the query path can't yet see).
-5. **DECDSR (11)** — the device-status reports it expects.
-6. Re-run per group (`--include DECSET`, …) and move the gate up as each lands.
+4. **Left-right margins (DECLRMM/DECSLRM)** — a real engine feature alacritty lacks;
+   unlocks the bulk of the remaining `DECSET` failures (plus DECOM-in-margins and the
+   margin-dependent SaveRestoreCursor cases). Large; needs per-row left/right clipping.
+5. Re-run per group (`--include DECSED`, …) and move the gate up as each lands.
 
-The 17 `XtermWinops` still failing are out of reach headless: window-manager ops
-(iconify/maximize/fullscreen/move) and title read-back (`20 t`/`21 t`, a title-injection
-vector kept disabled per §13).
+Two groups are out of reach without deeper engine work: the 17 `XtermWinops` need a real
+window manager (iconify/maximize/fullscreen/move) or title read-back (`20 t`/`21 t`, a
+title-injection vector kept disabled per §13); the remaining `DECSET` failures need
+left-right margins, 132-column mode (DECCOLM), reverse-wraparound, and `?47` alt-buffer
+semantics — all real VT behavior in the engine, not reply-layer fixes.
