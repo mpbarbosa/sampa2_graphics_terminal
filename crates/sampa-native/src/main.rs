@@ -3214,14 +3214,19 @@ impl Renderer {
         }
         // Rows 1..: command names with matched characters emphasized (spec §6).
         for (ri, m) in p.rows.iter().enumerate() {
-            let hits: std::collections::BTreeSet<usize> = m.hits.iter().copied().collect();
             // Coalesce consecutive chars of the same hit/non-hit state into spans.
             let mut spans: Vec<(String, bool)> = Vec::new();
+            // `m.hits` is already sorted and deduplicated; walk it with an index.
+            let mut hit_idx = 0;
+            let hits = &m.hits;
             for (ci, ch) in m.name.chars().enumerate() {
-                let h = hits.contains(&ci);
+                let is_hit = hit_idx < hits.len() && hits[hit_idx] == ci;
+                if is_hit {
+                    hit_idx += 1;
+                }
                 match spans.last_mut() {
-                    Some((s, sh)) if *sh == h => s.push(ch),
-                    _ => spans.push((ch.to_string(), h)),
+                    Some((s, sh)) if *sh == is_hit => s.push(ch),
+                    _ => spans.push((ch.to_string(), is_hit)),
                 }
             }
             let buf = &mut self.palette_buffers[ri + 1];
