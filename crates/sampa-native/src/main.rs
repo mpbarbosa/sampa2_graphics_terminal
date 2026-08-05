@@ -1888,7 +1888,7 @@ impl App {
             Key::Named(NamedKey::Enter) => self.search_step(!shift), // Shift+Enter = previous
             Key::Named(NamedKey::ArrowDown) => self.search_step(true),
             Key::Named(NamedKey::ArrowUp) => self.search_step(false),
-            Key::Named(NamedKey::Backspace) => {
+            Key::Named(NamedKey::Backspace) if !self.search_query.is_empty() => {
                 self.search_query.pop();
                 self.search_recompute();
             }
