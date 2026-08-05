@@ -52,6 +52,8 @@ use winit::window::{Window, WindowId};
 const FONT_SIZE: f32 = 15.0;
 const LINE_HEIGHT: f32 = 18.0;
 const PAD: f32 = 6.0;
+/// Height of the visual tab bar, shown only when more than one tab is open.
+const TAB_BAR_H: f32 = 26.0;
 
 // --- XTWINOPS pixel/display metrics (§17 conformance) -------------------------
 // alacritty answers only the char-size winop (CSI 18 t) and drops the pixel/report
@@ -1023,6 +1025,8 @@ fn main() -> Result<()> {
         dumped: false,
         mouse_col: 0,
         mouse_row: 0,
+        mouse_px: 0.0,
+        mouse_py: 0.0,
         left_down: false,
         last_click: None,
         click_count: 0,
@@ -1246,6 +1250,8 @@ struct App {
     // mouse / selection
     mouse_col: usize,
     mouse_row: usize,
+    mouse_px: f64, // raw pixel X/Y, for tab-bar hit-testing
+    mouse_py: f64,
     left_down: bool,
     last_click: Option<(std::time::Instant, usize, usize)>,
     click_count: u8,
@@ -1421,6 +1427,42 @@ fn active_after_close(active: usize, closed: usize, remaining: usize) -> usize {
     }
 }
 
+/// Top of the terminal grid in pixels: below the tab bar when it's visible
+/// (more than one tab), otherwise the normal top padding.
+fn top_offset(ntabs: usize) -> f32 {
+    if ntabs > 1 {
+        TAB_BAR_H
+    } else {
+        PAD
+    }
+}
+
+/// Tab index under a tab-bar click at pixel `px` (window width `w`, `ntabs` ≥ 1),
+/// with tabs laid out as equal-width segments across the full width.
+fn tab_at_px(px: f64, w: f32, ntabs: usize) -> usize {
+    let tabw = (w / ntabs as f32).max(1.0) as f64;
+    ((px / tabw).floor() as usize).min(ntabs - 1)
+}
+
+/// Linear blend of two sRGB byte colors, `t` in [0,1] toward `b`.
+fn blend(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    let f = t.clamp(0.0, 1.0);
+    let m = |x: u8, y: u8| (x as f32 * (1.0 - f) + y as f32 * f).round() as u8;
+    [m(a[0], b[0]), m(a[1], b[1]), m(a[2], b[2])]
+}
+
+/// A compact tab-bar label: `<n>: <title>`, blank titles shown as "shell",
+/// long titles truncated with an ellipsis.
+fn tab_label(title: &str, i: usize) -> String {
+    let t = title.trim();
+    let t = if t.is_empty() { "shell" } else { t };
+    let mut short: String = t.chars().take(18).collect();
+    if t.chars().count() > 18 {
+        short.push('…');
+    }
+    format!("{}: {}", i + 1, short)
+}
+
 impl App {
     fn cell_metrics(&self) -> (f32, f32) {
         self.gfx
@@ -1431,9 +1473,10 @@ impl App {
 
     fn cell_at(&self, x: f64, y: f64) -> (usize, usize, Side) {
         let (cw, lh) = self.cell_metrics();
+        let top = top_offset(self.sessions.len());
         let fx = (x as f32 - PAD) / cw;
         let col = (fx.max(0.0).floor() as usize).min(self.cols.saturating_sub(1) as usize);
-        let row = (((y as f32 - PAD) / lh).max(0.0).floor() as usize)
+        let row = (((y as f32 - top) / lh).max(0.0).floor() as usize)
             .min(self.rows.saturating_sub(1) as usize);
         let side = if fx - fx.floor() > 0.5 { Side::Right } else { Side::Left };
         (col, row, side)
@@ -1467,6 +1510,8 @@ impl App {
     }
 
     fn on_cursor_moved(&mut self, x: f64, y: f64) {
+        self.mouse_px = x;
+        self.mouse_py = y;
         let (col, row, side) = self.cell_at(x, y);
         let moved = col != self.mouse_col || row != self.mouse_row;
         self.mouse_col = col;
@@ -1536,6 +1581,20 @@ impl App {
             MouseButton::Right => 2,
             _ => return,
         };
+        // A click in the visual tab bar switches tabs (never reaches the grid).
+        if button == MouseButton::Left
+            && pressed
+            && self.sessions.len() > 1
+            && self.mouse_py < TAB_BAR_H as f64
+        {
+            let w = self
+                .window
+                .as_ref()
+                .map(|win| win.inner_size().width as f32)
+                .unwrap_or(1.0);
+            self.switch_to(tab_at_px(self.mouse_px, w, self.sessions.len()));
+            return;
+        }
         // Ctrl+click opens a hyperlink under the cursor (explicit action, §13).
         if button == MouseButton::Left && pressed && self.modifiers.control_key() {
             let (col, row) = (self.mouse_col, self.mouse_row);
@@ -1622,8 +1681,9 @@ impl App {
 
     fn resize(&mut self, w: u32, h: u32) {
         let (cell_w, line_h) = self.cell_metrics();
+        let top = top_offset(self.sessions.len());
         let cols = (((w as f32 - 2.0 * PAD) / cell_w).floor() as u16).max(1);
-        let rows = (((h as f32 - 2.0 * PAD) / line_h).floor() as u16).max(1);
+        let rows = (((h as f32 - top - PAD) / line_h).floor() as u16).max(1);
         if let Some(gfx) = &mut self.gfx {
             gfx.resize(w, h);
         }
@@ -1682,6 +1742,15 @@ impl App {
         self.request_redraw();
     }
 
+    /// Recompute the grid for the current window size — used when the tab bar
+    /// appears/disappears (1↔2 tabs) and the usable height changes.
+    fn reflow(&mut self) {
+        if let Some(w) = &self.window {
+            let sz = w.inner_size();
+            self.resize(sz.width, sz.height);
+        }
+    }
+
     /// Open a new tab running `$SHELL` at the current grid size, and switch to it.
     fn new_tab(&mut self) {
         let cfg = load_config();
@@ -1690,7 +1759,11 @@ impl App {
             Ok(session) => {
                 self.next_id += 1;
                 self.sessions.push(session);
+                let showed_bar = self.sessions.len() == 2;
                 self.switch_to(self.sessions.len() - 1);
+                if showed_bar {
+                    self.reflow(); // bar just appeared → grid lost a row
+                }
             }
             Err(e) => eprintln!("new tab: {e}"),
         }
@@ -1708,7 +1781,11 @@ impl App {
         if self.sessions.is_empty() {
             return true;
         }
+        let hid_bar = self.sessions.len() == 1;
         self.switch_to(active_after_close(self.active, idx, self.sessions.len()));
+        if hid_bar {
+            self.reflow(); // bar just disappeared → grid regained a row
+        }
         false
     }
 
@@ -1810,8 +1887,10 @@ impl App {
                 eprintln!("---END GRID DUMP---");
             }
         }
+        let tabs: Vec<String> = self.sessions.iter().map(|s| s.title.clone()).collect();
+        let active = self.active;
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap);
+            gfx.render(&snap, &tabs, active);
         }
     }
 
@@ -2287,6 +2366,7 @@ struct Renderer {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     buffer: Buffer,
+    tab_buffers: Vec<Buffer>, // one per tab-bar label, grown lazily
     quad_pipeline: wgpu::RenderPipeline,
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
@@ -2480,6 +2560,7 @@ impl Renderer {
             atlas,
             text_renderer,
             buffer,
+            tab_buffers: Vec::new(),
             quad_pipeline,
             quad_uniform,
             quad_bind_group,
@@ -2496,7 +2577,7 @@ impl Renderer {
 
     /// Upload any newly-added images to GPU textures and drop textures for evicted
     /// images. Returns the per-image draw rects (in pixels) for the current frame.
-    fn sync_images(&mut self, offset: i32, w: u32, h: u32) -> Vec<(u64, [f32; 4])> {
+    fn sync_images(&mut self, offset: i32, top: f32, w: u32, h: u32) -> Vec<(u64, [f32; 4])> {
         let mut rects = Vec::new();
         let Ok(mut store) = self.images.lock() else {
             return rects;
@@ -2556,7 +2637,7 @@ impl Renderer {
             }
             // Place at (col, absolute anchor + display_offset), natural pixel size.
             let x = PAD + img.col as f32 * self.cell_w;
-            let y = PAD + (img.anchor + offset) as f32 * self.line_h;
+            let y = top + (img.anchor + offset) as f32 * self.line_h;
             if x < w as f32 && y < h as f32 && y + img.height as f32 > 0.0 {
                 rects.push((img.id, [x, y, img.width as f32, img.height as f32]));
             }
@@ -2579,6 +2660,8 @@ impl Renderer {
         self.line_h = (font_size * 1.2).ceil();
         self.cell_w = measure_cell_w(&mut self.font_system, font_size, self.line_h, &self.font_family);
         self.buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        // Tab-label buffers carry the old line height — drop so they're rebuilt.
+        self.tab_buffers.clear();
     }
 
     /// Point the renderer at a different tab's image layer (on tab switch); drop the
@@ -2607,16 +2690,76 @@ impl Renderer {
 
     /// Draw `snap` into `view` (size `w`×`h`). Submits its own command buffer; does
     /// not present or read back — the caller owns the target's lifecycle.
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32) {
+    /// Tab-bar background/segment quads (no-op with ≤1 tab): a dim strip, the active
+    /// segment filled with the terminal bg + a cursor-colored accent, thin separators.
+    fn tab_bar_quads(&self, tabs: &[String], active: usize, w: u32, out: &mut Vec<QuadInstance>) {
+        if tabs.len() <= 1 {
+            return;
+        }
+        let bar_bg = blend(self.theme.bg, self.theme.fg, 0.10);
+        let sep = blend(self.theme.bg, self.theme.fg, 0.28);
+        out.push(QuadInstance { rect: [0.0, 0.0, w as f32, TAB_BAR_H], color: self.color4(bar_bg) });
+        let tabw = w as f32 / tabs.len() as f32;
+        for i in 0..tabs.len() {
+            let x = i as f32 * tabw;
+            if i == active {
+                out.push(QuadInstance {
+                    rect: [x, 0.0, tabw, TAB_BAR_H],
+                    color: self.color4(self.theme.bg),
+                });
+                out.push(QuadInstance {
+                    rect: [x, TAB_BAR_H - 2.0, tabw, 2.0],
+                    color: self.color4(self.theme.cursor),
+                });
+            }
+            if i > 0 {
+                out.push(QuadInstance {
+                    rect: [x, 4.0, 1.0, TAB_BAR_H - 8.0],
+                    color: self.color4(sep),
+                });
+            }
+        }
+    }
+
+    /// Shape each tab's label into its own reusable buffer (grown lazily). No-op when
+    /// the bar is hidden. Active label uses the theme fg; inactive labels fade toward bg.
+    fn shape_tab_labels(&mut self, tabs: &[String], active: usize, w: u32) {
+        if tabs.len() <= 1 {
+            return;
+        }
+        while self.tab_buffers.len() < tabs.len() {
+            let b = Buffer::new(&mut self.font_system, Metrics::new(13.0, self.line_h));
+            self.tab_buffers.push(b);
+        }
+        let tabw = w as f32 / tabs.len() as f32;
+        let inactive = blend(self.theme.fg, self.theme.bg, 0.45);
+        for (i, title) in tabs.iter().enumerate() {
+            let label = tab_label(title, i);
+            let c = if i == active { self.theme.fg } else { inactive };
+            let attrs = Attrs::new()
+                .family(family_of(&self.font_family))
+                .color(Color::rgb(c[0], c[1], c[2]));
+            let buf = &mut self.tab_buffers[i];
+            buf.set_size(Some((tabw - 16.0).max(1.0)), Some(TAB_BAR_H));
+            buf.set_rich_text([(label.as_str(), attrs)], &Attrs::new(), Shaping::Advanced, None);
+            buf.shape_until_scroll(&mut self.font_system, false);
+        }
+    }
+
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize) {
+        // The grid starts below the tab bar when it's shown (more than one tab).
+        let top = top_offset(tabs.len());
         // Background/cursor quads (drawn under the text) and decoration quads
         // (underline/strikethrough, drawn over it).
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
         let mut deco_quads: Vec<QuadInstance> = Vec::new();
+        // Tab-bar segment quads render first, under everything.
+        self.tab_bar_quads(tabs, active, w, &mut bg_quads);
         for r in 0..snap.rows {
             for c in 0..snap.cols {
                 let cell = snap.cell(r, c);
                 let x = PAD + c as f32 * self.cell_w;
-                let y = PAD + r as f32 * self.line_h;
+                let y = top + r as f32 * self.line_h;
                 if cell.bg != self.theme.bg {
                     bg_quads.push(QuadInstance {
                         rect: [x, y, self.cell_w + 0.5, self.line_h],
@@ -2639,7 +2782,7 @@ impl Renderer {
         }
         // Bar/underline cursor (block inverts its cell in build_snapshot).
         if let Some((r, c)) = snap.cursor {
-            let (x, y) = (PAD + c as f32 * self.cell_w, PAD + r as f32 * self.line_h);
+            let (x, y) = (PAD + c as f32 * self.cell_w, top + r as f32 * self.line_h);
             let rect = match self.cursor_style {
                 CursorStyle::Bar => Some([x, y, 2.0, self.line_h]),
                 CursorStyle::Underline => Some([x, y + self.line_h - 2.0, self.cell_w, 2.0]),
@@ -2666,7 +2809,7 @@ impl Renderer {
         }
 
         self.buffer
-            .set_size(Some(w as f32 - 2.0 * PAD), Some(h as f32 - 2.0 * PAD));
+            .set_size(Some(w as f32 - 2.0 * PAD), Some(h as f32 - top - PAD));
         self.buffer.set_rich_text(
             spans.iter().map(|(s, fg, bold, italic)| {
                 let mut a = Attrs::new()
@@ -2685,25 +2828,50 @@ impl Renderer {
             None,
         );
         self.buffer.shape_until_scroll(&mut self.font_system, false);
+        // Shape the tab-bar labels (no-op when the bar is hidden) before borrowing
+        // the buffers to build text areas.
+        self.shape_tab_labels(tabs, active, w);
 
         self.viewport
             .update(&self.queue, Resolution { width: w, height: h });
-        let text_area = TextArea {
+        let mut text_areas: Vec<TextArea> = Vec::with_capacity(1 + tabs.len());
+        text_areas.push(TextArea {
             buffer: &self.buffer,
             left: PAD,
-            top: PAD,
+            top,
             scale: 1.0,
-            bounds: TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 },
+            bounds: TextBounds { left: 0, top: top as i32, right: w as i32, bottom: h as i32 },
             default_color: Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]),
             custom_glyphs: &[],
-        };
+        });
+        if tabs.len() > 1 {
+            let tabw = w as f32 / tabs.len() as f32;
+            let label_top = ((TAB_BAR_H - self.line_h) / 2.0).max(0.0);
+            for (i, buf) in self.tab_buffers.iter().enumerate().take(tabs.len()) {
+                let seg = i as f32 * tabw;
+                text_areas.push(TextArea {
+                    buffer: buf,
+                    left: seg + 10.0,
+                    top: label_top,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: seg as i32,
+                        top: 0,
+                        right: (seg + tabw) as i32 - 4,
+                        bottom: TAB_BAR_H as i32,
+                    },
+                    default_color: Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]),
+                    custom_glyphs: &[],
+                });
+            }
+        }
         if let Err(e) = self.text_renderer.prepare(
             &self.device,
             &self.queue,
             &mut self.font_system,
             &mut self.atlas,
             &self.viewport,
-            [text_area],
+            text_areas,
             &mut self.swash_cache,
         ) {
             eprintln!("glyphon prepare: {e:?}");
@@ -2716,7 +2884,7 @@ impl Renderer {
             bytemuck::bytes_of(&ScreenUniform { size: [w as f32, h as f32], _pad: [0.0, 0.0] }),
         );
         // Upload/evict image textures and build a one-rect vertex buffer per image.
-        let image_rects = self.sync_images(snap.offset, w, h);
+        let image_rects = self.sync_images(snap.offset, top, w, h);
         let image_bufs: Vec<(u64, wgpu::Buffer)> = image_rects
             .iter()
             .map(|(id, rect)| {
@@ -2853,7 +3021,7 @@ impl Gfx {
         self.surface.configure(&self.r.device, &self.config);
     }
 
-    fn render(&mut self, snap: &Snapshot) {
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -2861,7 +3029,8 @@ impl Gfx {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.r.paint(snap, &view, self.config.width, self.config.height);
+        self.r
+            .paint(snap, &view, self.config.width, self.config.height, tabs, active);
         self.r.queue.present(frame);
     }
 }
@@ -2932,8 +3101,16 @@ fn capture(path: &str) -> Result<()> {
         cfg.cursor.style,
     );
 
+    // Optional visual check of the tab bar: SAMPA_CAPTURE_TABS="zsh,vim,htop".
+    let demo_tabs: Vec<String> = std::env::var("SAMPA_CAPTURE_TABS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_default();
+    let top = top_offset(demo_tabs.len());
+
     let w = (PAD * 2.0 + cols as f32 * r.cell_w).ceil() as u32;
-    let h = (PAD * 2.0 + rows as f32 * r.line_h).ceil() as u32;
+    let h = (top + PAD + rows as f32 * r.line_h).ceil() as u32;
 
     let tex = r.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("capture"),
@@ -2946,7 +3123,7 @@ fn capture(path: &str) -> Result<()> {
         view_formats: &[],
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    r.paint(&snap, &view, w, h);
+    r.paint(&snap, &view, w, h, &demo_tabs, 1.min(demo_tabs.len().saturating_sub(1)));
 
     let bpr = (w * 4).div_ceil(256) * 256; // 256-byte row alignment
     let readback = r.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3056,6 +3233,25 @@ mod tests {
         let curs = cell_vis(&term.grid()[Line(0)][Column(0)], colors, true, false, SELECTION_BG);
         assert_eq!(curs.fg, plain.bg);
         assert_eq!(curs.bg, plain.fg);
+    }
+
+    #[test]
+    fn tab_bar_geometry() {
+        // Bar hidden with ≤1 tab (top is the normal padding), shown with >1.
+        assert_eq!(top_offset(1), PAD);
+        assert_eq!(top_offset(3), TAB_BAR_H);
+        // Equal-width segments; clicks map to the segment under the pixel, clamped.
+        assert_eq!(tab_at_px(10.0, 300.0, 3), 0); // segment 0 = [0,100)
+        assert_eq!(tab_at_px(150.0, 300.0, 3), 1); // segment 1 = [100,200)
+        assert_eq!(tab_at_px(299.0, 300.0, 3), 2); // segment 2 = [200,300)
+        assert_eq!(tab_at_px(1000.0, 300.0, 3), 2); // past the end → last tab
+    }
+
+    #[test]
+    fn tab_label_formats() {
+        assert_eq!(tab_label("zsh", 0), "1: zsh");
+        assert_eq!(tab_label("", 1), "2: shell"); // blank → "shell"
+        assert_eq!(tab_label("a-very-long-tab-title-here", 0), "1: a-very-long-tab-ti…");
     }
 
     #[test]
