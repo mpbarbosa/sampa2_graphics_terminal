@@ -157,7 +157,12 @@ interactive pass + wider program coverage outstanding.)*
   thin quad in the config cursor color) + **blink** (~530ms tick, resets on keypress,
   honors the config toggle). ⬜ still: ligatures toggle, bell, fontconfig fallback;
   scrollback change still needs a restart (fresh `Term`).
-- ⬜ **Tabs** on `pty-core`'s session table.
+- 🔨 **Tabs** — multi-session: each tab owns its VT state/PTY/image-layer/pump; `App`
+  keeps active-session pointers (re-pointed on switch). **Ctrl+Shift+T** new,
+  **Ctrl+Shift+W** close (reaps the shell; quits on the last), **Ctrl+Tab** /
+  **Ctrl+Shift+Tab** cycle; window title shows the active tab + `[i/n]`; resize applies
+  to every tab. Close-index math unit-tested; boot + render verified. ⬜ still: a
+  **visual tab bar** (click-to-switch; keyboard + title only for now), splits.
 - ⬜ **Search overlay** — native, incremental match + highlight over scrollback.
 
 **Exit:** a config edit hot-reloads theme/font/cursor; a Powerline + truecolor prompt
