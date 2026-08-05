@@ -885,6 +885,7 @@ struct TermState {
 enum UserEvent {
     Redraw,
     Exit(String),
+    ConfigReload,
 }
 
 fn main() -> Result<()> {
@@ -979,6 +980,26 @@ fn main() -> Result<()> {
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+
+    // Watch the config file (mtime poll) and wake the loop on change → live reload.
+    if let Some(path) = sampa_config::default_config_path() {
+        let watch_proxy = proxy.clone();
+        thread::spawn(move || {
+            let mtime = || std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let mut last = mtime();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let cur = mtime();
+                if cur != last {
+                    last = cur;
+                    if watch_proxy.send_event(UserEvent::ConfigReload).is_err() {
+                        break; // event loop gone
+                    }
+                }
+            }
+        });
+    }
+
     thread::spawn({
         let (state, pty, images) = (Arc::clone(&state), Arc::clone(&pty), Arc::clone(&images));
         move || pump(rx, state, proxy, reply_rx, pty, images)
@@ -1215,6 +1236,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
                 event_loop.exit();
             }
+            UserEvent::ConfigReload => self.reload_config(),
         }
     }
 
@@ -1553,6 +1575,38 @@ impl App {
         if changed {
             self.request_redraw();
         }
+    }
+
+    /// Live config reload: re-read the file and re-apply theme + font (colors, family,
+    /// size). Scrollback size stays as at launch (needs a fresh Term).
+    fn reload_config(&mut self) {
+        let cfg = load_config();
+        self.theme = Theme {
+            fg: parse_hex(&cfg.colors.foreground).unwrap_or(DEFAULT_FG),
+            bg: parse_hex(&cfg.colors.background).unwrap_or(DEFAULT_BG),
+            selection: parse_hex(&cfg.colors.selection).unwrap_or(SELECTION_BG),
+        };
+        self.font_size = cfg.font.size.clamp(6.0, 72.0);
+        self.font_family = primary_family(&cfg.font.family);
+        if std::env::var_os("SAMPA_DEBUG").is_some() {
+            eprintln!(
+                "config reloaded: size={} family={:?} bg={:?}",
+                self.font_size, self.font_family, self.theme.bg
+            );
+        }
+        // Re-load the palette into the VT color table.
+        if let Ok(mut g) = self.state.lock() {
+            let g = &mut *g;
+            g.parser.advance(&mut g.term, &color_setup(&cfg.colors));
+        }
+        if let Some(gfx) = &mut self.gfx {
+            gfx.r.apply_config(self.theme, self.font_size, self.font_family.clone());
+        }
+        // New cell metrics → recompute grid geometry and resize the term/PTY.
+        if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
+            self.resize(size.width.max(1), size.height.max(1));
+        }
+        self.request_redraw();
     }
 
     fn render_now(&mut self) {
@@ -2004,6 +2058,25 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> { return textureSample(tex, samp, in.
 /// Target-agnostic render core: owns the device/queue, glyphon pipeline, and the
 /// solid-quad pipeline. `paint` draws a `Snapshot` into any texture view (a window
 /// surface frame, or an offscreen texture for `--capture`).
+/// Measure a monospace cell's advance for the given font (shape 20 'M's, average).
+fn measure_cell_w(fs: &mut FontSystem, size: f32, line_h: f32, family: &str) -> f32 {
+    let mut probe = Buffer::new(fs, Metrics::new(size, line_h));
+    probe.set_size(Some(4096.0), Some(line_h));
+    probe.set_text(
+        "MMMMMMMMMMMMMMMMMMMM",
+        &Attrs::new().family(family_of(family)),
+        Shaping::Advanced,
+        None,
+    );
+    probe.shape_until_scroll(fs, false);
+    probe
+        .layout_runs()
+        .next()
+        .map(|r| r.line_w / 20.0)
+        .filter(|w| *w > 0.1)
+        .unwrap_or(size * 0.6)
+}
+
 struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -2050,23 +2123,7 @@ impl Renderer {
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
         // Measure the monospace advance so the quad grid lines up with the glyphs.
-        let cell_w = {
-            let mut probe = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
-            probe.set_size(Some(4096.0), Some(line_h));
-            probe.set_text(
-                "MMMMMMMMMMMMMMMMMMMM",
-                &Attrs::new().family(family_of(&font_family)),
-                Shaping::Advanced,
-                None,
-            );
-            probe.shape_until_scroll(&mut font_system, false);
-            probe
-                .layout_runs()
-                .next()
-                .map(|r| r.line_w / 20.0)
-                .filter(|w| *w > 0.1)
-                .unwrap_or(FONT_SIZE * 0.6)
-        };
+        let cell_w = measure_cell_w(&mut font_system, font_size, line_h, &font_family);
         let buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2304,6 +2361,16 @@ impl Renderer {
             }
         }
         rects
+    }
+
+    /// Re-apply theme + font at runtime (live config reload). Re-measures the cell
+    /// advance and rebuilds the text buffer for the new metrics.
+    fn apply_config(&mut self, theme: Theme, font_size: f32, font_family: String) {
+        self.theme = theme;
+        self.font_family = font_family;
+        self.line_h = (font_size * 1.2).ceil();
+        self.cell_w = measure_cell_w(&mut self.font_system, font_size, self.line_h, &self.font_family);
+        self.buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
     }
 
     fn chan(&self, v: u8) -> f32 {
