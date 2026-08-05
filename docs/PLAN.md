@@ -153,7 +153,9 @@ interactive pass + wider program coverage outstanding.)*
   `#001830` bg + size-20 font applied). ✅ **live reload** — an mtime-poll watcher wakes
   the loop on a config edit (`UserEvent::ConfigReload`) and re-applies theme + font
   (re-measures the cell advance, rebuilds the text buffer, resizes term/PTY) without a
-  restart. ⬜ still: **cursor shape/blink**, ligatures toggle, bell, fontconfig fallback;
+  restart. ✅ **cursor shape** (block inverts the cell; **bar**/**underline** drawn as a
+  thin quad in the config cursor color) + **blink** (~530ms tick, resets on keypress,
+  honors the config toggle). ⬜ still: ligatures toggle, bell, fontconfig fallback;
   scrollback change still needs a restart (fresh `Term`).
 - ⬜ **Tabs** on `pty-core`'s session table.
 - ⬜ **Search overlay** — native, incremental match + highlight over scrollback.
