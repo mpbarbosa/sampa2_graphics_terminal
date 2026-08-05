@@ -157,12 +157,15 @@ interactive pass + wider program coverage outstanding.)*
   thin quad in the config cursor color) + **blink** (~530ms tick, resets on keypress,
   honors the config toggle). ⬜ still: ligatures toggle, bell, fontconfig fallback;
   scrollback change still needs a restart (fresh `Term`).
-- 🔨 **Tabs** — multi-session: each tab owns its VT state/PTY/image-layer/pump; `App`
+- ✅ **Tabs** — multi-session: each tab owns its VT state/PTY/image-layer/pump; `App`
   keeps active-session pointers (re-pointed on switch). **Ctrl+Shift+T** new,
   **Ctrl+Shift+W** close (reaps the shell; quits on the last), **Ctrl+Tab** /
   **Ctrl+Shift+Tab** cycle; window title shows the active tab + `[i/n]`; resize applies
-  to every tab. Close-index math unit-tested; boot + render verified. ⬜ still: a
-  **visual tab bar** (click-to-switch; keyboard + title only for now), splits.
+  to every tab. A **visual tab bar** shows when >1 tab open: equal-width segments,
+  active one highlighted (bg-filled + accent underline) with dimmed inactive labels,
+  **click-to-switch**; the grid offsets below it (and reflows on the 1↔2 boundary).
+  Geometry/label/close-index math unit-tested; bar rendered + verified via `--capture`.
+  ⬜ still: **splits**, tab reordering/drag, a “＋” new-tab affordance.
 - ⬜ **Search overlay** — native, incremental match + highlight over scrollback.
 
 **Exit:** a config edit hot-reloads theme/font/cursor; a Powerline + truecolor prompt
