@@ -78,6 +78,88 @@ const ANSI16: [[u8; 3]; 16] = [
     [0x72, 0x9f, 0xcf], [0xad, 0x7f, 0xa8], [0x34, 0xe2, 0xe2], [0xee, 0xee, 0xec],
 ];
 
+/// Render-time theme colors from config (the palette itself is loaded into the VT
+/// color table so `resolve` reads it; these are the render defaults).
+#[derive(Clone, Copy)]
+struct Theme {
+    fg: [u8; 3],
+    bg: [u8; 3],
+    selection: [u8; 3],
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme { fg: DEFAULT_FG, bg: DEFAULT_BG, selection: SELECTION_BG }
+    }
+}
+
+/// Parse `#rrggbb` into RGB.
+fn parse_hex(s: &str) -> Option<[u8; 3]> {
+    let h = s.trim().strip_prefix('#').filter(|h| h.len() == 6)?;
+    let n = u32::from_str_radix(h, 16).ok()?;
+    Some([(n >> 16) as u8, (n >> 8) as u8, n as u8])
+}
+
+/// Build the OSC sequences that load config colors into the VT color table: OSC 4 for
+/// the 16 ANSI slots, OSC 10/11/12 for fg/bg/cursor. Fed to the parser at startup so
+/// `resolve` returns the themed colors (it consults the table first).
+fn color_setup(c: &sampa_config::Colors) -> Vec<u8> {
+    let mut out = Vec::new();
+    let x2 = |v: u8| format!("{v:02x}{v:02x}");
+    let mut osc = |prefix: String, hex: &str| {
+        if let Some([r, g, b]) = parse_hex(hex) {
+            out.extend_from_slice(
+                format!("\x1b]{prefix}rgb:{}/{}/{}\x1b\\", x2(r), x2(g), x2(b)).as_bytes(),
+            );
+        }
+    };
+    let ansi = [
+        &c.black, &c.red, &c.green, &c.yellow, &c.blue, &c.magenta, &c.cyan, &c.white,
+        &c.bright_black, &c.bright_red, &c.bright_green, &c.bright_yellow, &c.bright_blue,
+        &c.bright_magenta, &c.bright_cyan, &c.bright_white,
+    ];
+    for (i, hex) in ansi.iter().enumerate() {
+        osc(format!("4;{i};"), hex);
+    }
+    osc("10;".into(), &c.foreground);
+    osc("11;".into(), &c.background);
+    osc("12;".into(), &c.cursor);
+    out
+}
+
+/// The primary family from a CSS-style fallback list (first entry, quotes stripped).
+fn primary_family(list: &str) -> String {
+    list.split(',')
+        .next()
+        .unwrap_or("monospace")
+        .trim()
+        .trim_matches(['"', '\''])
+        .to_string()
+}
+
+/// Resolve a family name to a `glyphon::Family`, honoring the CSS generics.
+fn family_of(name: &str) -> Family<'_> {
+    match name.to_ascii_lowercase().as_str() {
+        "monospace" | "ui-monospace" | "" => Family::Monospace,
+        "sans-serif" => Family::SansSerif,
+        "serif" => Family::Serif,
+        _ => Family::Name(name),
+    }
+}
+
+/// Load config from the default XDG path if present, else built-in defaults (§11).
+fn load_config() -> sampa_config::Config {
+    if let Some(path) = sampa_config::default_config_path() {
+        if path.exists() {
+            match sampa_config::Config::load(&path) {
+                Ok(c) => return c,
+                Err(e) => eprintln!("config: {e}; using defaults"),
+            }
+        }
+    }
+    sampa_config::Config::from_toml("").expect("built-in default config parses")
+}
+
 /// A single displayable cell after VT-state + attribute resolution.
 #[derive(Clone)]
 struct CellVis {
@@ -848,16 +930,34 @@ fn main() -> Result<()> {
         _ => (std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()), vec![]),
     };
 
+    // Load config (default path if present, else built-in defaults) — drives fonts,
+    // colors, and scrollback (§11).
+    let cfg = load_config();
+    let theme = Theme {
+        fg: parse_hex(&cfg.colors.foreground).unwrap_or(DEFAULT_FG),
+        bg: parse_hex(&cfg.colors.background).unwrap_or(DEFAULT_BG),
+        selection: parse_hex(&cfg.colors.selection).unwrap_or(SELECTION_BG),
+    };
+    let font_size = cfg.font.size.clamp(6.0, 72.0);
+    let font_family = primary_family(&cfg.font.family);
+
     let (cols, rows) = (80u16, 24u16);
     let (app_tx, app_rx) = channel();
     let (reply_tx, reply_rx) = channel::<Reply>();
+    let mut parser = Processor::new();
+    let mut term = Term::new(
+        alacritty_terminal::term::Config {
+            scrolling_history: cfg.scrollback.lines as usize,
+            ..TermConfig::default()
+        },
+        &TermSize::new(cols as usize, rows as usize),
+        EventProxy { reply_tx, app_tx },
+    );
+    // Load the color palette into the VT color table so `resolve` returns themed colors.
+    parser.advance(&mut term, &color_setup(&cfg.colors));
     let state = Arc::new(Mutex::new(TermState {
-        parser: Processor::new(),
-        term: Term::new(
-            TermConfig::default(),
-            &TermSize::new(cols as usize, rows as usize),
-            EventProxy { reply_tx, app_tx },
-        ),
+        parser,
+        term,
         decrqcra: DecrqcraScanner::new(),
         image_scanner: ImageScanner::new(),
         dcs: DcsScanner::new(),
@@ -904,6 +1004,9 @@ fn main() -> Result<()> {
         osc52_allow: std::env::var("SAMPA_OSC52").map(|v| v == "allow").unwrap_or(false),
         title: win_title,
         images,
+        theme,
+        font_size,
+        font_family,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -1069,6 +1172,9 @@ struct App {
     osc52_allow: bool,
     title: String,
     images: Arc<Mutex<ImageStore>>,
+    theme: Theme,
+    font_size: f32,
+    font_family: String,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -1078,7 +1184,13 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attrs = Window::default_attributes().with_title(&self.title);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let gfx = pollster::block_on(Gfx::new(Arc::clone(&window), Arc::clone(&self.images)));
+        let gfx = pollster::block_on(Gfx::new(
+            Arc::clone(&window),
+            Arc::clone(&self.images),
+            self.theme,
+            self.font_size,
+            self.font_family.clone(),
+        ));
         self.window = Some(window);
         self.gfx = Some(gfx);
         if let Ok(cmd) = std::env::var("SAMPA_AUTORUN") {
@@ -1445,7 +1557,7 @@ impl App {
 
     fn render_now(&mut self) {
         let snap = match self.state.lock() {
-            Ok(g) => build_snapshot(&g.term),
+            Ok(g) => build_snapshot(&g.term, &self.theme),
             Err(_) => return,
         };
         if !self.dumped && std::env::var_os("SAMPA_DUMP_GRID").is_some() {
@@ -1630,7 +1742,7 @@ fn mouse_report(
 }
 
 /// Extract the visible grid + attributes + cursor into a `Snapshot`.
-fn build_snapshot<L: EventListener>(term: &Term<L>) -> Snapshot {
+fn build_snapshot<L: EventListener>(term: &Term<L>, theme: &Theme) -> Snapshot {
     let content = term.renderable_content();
     let colors = content.colors;
     let cursor = content.cursor;
@@ -1657,6 +1769,7 @@ fn build_snapshot<L: EventListener>(term: &Term<L>) -> Snapshot {
                 colors,
                 cursor_abs == Some((abs, c)),
                 selected,
+                theme.selection,
             ));
         }
     }
@@ -1702,6 +1815,7 @@ fn cell_vis(
     colors: &Colors,
     is_cursor: bool,
     selected: bool,
+    selection_bg: [u8; 3],
 ) -> CellVis {
     let flags = cell.flags;
     let bold = flags.contains(Flags::BOLD);
@@ -1721,7 +1835,7 @@ fn cell_vis(
         fg = bg;
     }
     if selected {
-        bg = SELECTION_BG;
+        bg = selection_bg;
     }
     let underline = flags.intersects(
         Flags::UNDERLINE
@@ -1911,6 +2025,8 @@ struct Renderer {
     sampler: wgpu::Sampler,
     image_textures: HashMap<u64, (wgpu::Texture, wgpu::BindGroup)>,
     images: Arc<Mutex<ImageStore>>,
+    theme: Theme,
+    font_family: String,
 }
 
 impl Renderer {
@@ -1919,8 +2035,12 @@ impl Renderer {
         queue: wgpu::Queue,
         format: wgpu::TextureFormat,
         images: Arc<Mutex<ImageStore>>,
+        theme: Theme,
+        font_size: f32,
+        font_family: String,
     ) -> Self {
         let srgb = format.is_srgb();
+        let line_h = (font_size * 1.2).ceil();
         let mut font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
@@ -1931,11 +2051,11 @@ impl Renderer {
 
         // Measure the monospace advance so the quad grid lines up with the glyphs.
         let cell_w = {
-            let mut probe = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-            probe.set_size(Some(4096.0), Some(LINE_HEIGHT));
+            let mut probe = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+            probe.set_size(Some(4096.0), Some(line_h));
             probe.set_text(
                 "MMMMMMMMMMMMMMMMMMMM",
-                &Attrs::new().family(Family::Monospace),
+                &Attrs::new().family(family_of(&font_family)),
                 Shaping::Advanced,
                 None,
             );
@@ -1947,7 +2067,7 @@ impl Renderer {
                 .filter(|w| *w > 0.1)
                 .unwrap_or(FONT_SIZE * 0.6)
         };
-        let buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quad"),
@@ -2096,7 +2216,7 @@ impl Renderer {
             queue,
             srgb,
             cell_w,
-            line_h: LINE_HEIGHT,
+            line_h,
             font_system,
             swash_cache,
             viewport,
@@ -2111,6 +2231,8 @@ impl Renderer {
             sampler,
             image_textures: HashMap::new(),
             images,
+            theme,
+            font_family,
         }
     }
 
@@ -2213,7 +2335,7 @@ impl Renderer {
                 let cell = snap.cell(r, c);
                 let x = PAD + c as f32 * self.cell_w;
                 let y = PAD + r as f32 * self.line_h;
-                if cell.bg != DEFAULT_BG {
+                if cell.bg != self.theme.bg {
                     bg_quads.push(QuadInstance {
                         rect: [x, y, self.cell_w + 0.5, self.line_h],
                         color: self.color4(cell.bg),
@@ -2235,7 +2357,7 @@ impl Renderer {
         }
 
         // Foreground text as per-cell colored rich-text spans.
-        let base = Attrs::new().family(Family::Monospace);
+        let base = Attrs::new().family(family_of(&self.font_family));
         let mut spans: Vec<(String, [u8; 3], bool, bool)> = Vec::new();
         for r in 0..snap.rows {
             for c in 0..snap.cols {
@@ -2254,7 +2376,7 @@ impl Renderer {
         self.buffer.set_rich_text(
             spans.iter().map(|(s, fg, bold, italic)| {
                 let mut a = Attrs::new()
-                    .family(Family::Monospace)
+                    .family(family_of(&self.font_family))
                     .color(Color::rgb(fg[0], fg[1], fg[2]));
                 if *bold {
                     a = a.weight(Weight::BOLD);
@@ -2278,7 +2400,7 @@ impl Renderer {
             top: PAD,
             scale: 1.0,
             bounds: TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 },
-            default_color: Color::rgb(DEFAULT_FG[0], DEFAULT_FG[1], DEFAULT_FG[2]),
+            default_color: Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]),
             custom_glyphs: &[],
         };
         if let Err(e) = self.text_renderer.prepare(
@@ -2324,7 +2446,7 @@ impl Renderer {
         let bg_buf = mk_buf(&self.device, &bg_quads);
         let deco_buf = mk_buf(&self.device, &deco_quads);
 
-        let bg = self.color4(DEFAULT_BG);
+        let bg = self.color4(self.theme.bg);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -2392,7 +2514,13 @@ struct Gfx {
 }
 
 impl Gfx {
-    async fn new(window: Arc<Window>, images: Arc<Mutex<ImageStore>>) -> Self {
+    async fn new(
+        window: Arc<Window>,
+        images: Arc<Mutex<ImageStore>>,
+        theme: Theme,
+        font_size: f32,
+        font_family: String,
+    ) -> Self {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
         let instance = wgpu::Instance::default();
@@ -2415,7 +2543,11 @@ impl Gfx {
             .expect("surface default config");
         let format = config.format;
         surface.configure(&device, &config);
-        Gfx { surface, config, r: Renderer::new(device, queue, format, images) }
+        Gfx {
+            surface,
+            config,
+            r: Renderer::new(device, queue, format, images, theme, font_size, font_family),
+        }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -2442,9 +2574,17 @@ impl Gfx {
 fn capture(path: &str) -> Result<()> {
     const DEMO: &[u8] = b"\x1b[31mRED \x1b[32mGREEN \x1b[33mYELLOW \x1b[34mBLUE \x1b[35mMAGENTA \x1b[36mCYAN\x1b[0m\r\n\x1b[1;91mBOLD-BRIGHT-RED\x1b[0m  \x1b[7mINVERSE\x1b[0m  \x1b[2mDIM\x1b[0m\r\n\x1b[38;2;255;140;0mTRUECOLOR-ORANGE\x1b[0m  \x1b[44;97m white-on-blue \x1b[0m\r\n\x1b[4mUNDERLINE\x1b[0m  \x1b[9mSTRIKETHROUGH\x1b[0m  \x1b]8;;https://example.com\x1b\\OSC8-LINK\x1b]8;;\x1b\\\r\nSEAM_OK color demo\r\n";
     let (cols, rows) = (64usize, 8usize);
+    // Config-aware so the capture reflects the active theme/font (CI screenshot).
+    let cfg = load_config();
+    let theme = Theme {
+        fg: parse_hex(&cfg.colors.foreground).unwrap_or(DEFAULT_FG),
+        bg: parse_hex(&cfg.colors.background).unwrap_or(DEFAULT_BG),
+        selection: parse_hex(&cfg.colors.selection).unwrap_or(SELECTION_BG),
+    };
 
     let mut parser: Processor = Processor::new();
     let mut term = Term::new(TermConfig::default(), &TermSize::new(cols, rows), VoidListener);
+    parser.advance(&mut term, &color_setup(&cfg.colors));
     parser.advance(&mut term, DEMO);
     // Demonstrate the selection highlight: select "RED GREEN YELLOW" on row 0.
     let mut sel = Selection::new(
@@ -2454,7 +2594,7 @@ fn capture(path: &str) -> Result<()> {
     );
     sel.update(Point::new(Line(0), Column(15)), Side::Right);
     term.selection = Some(sel);
-    let snap = build_snapshot(&term);
+    let snap = build_snapshot(&term, &theme);
 
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -2488,7 +2628,15 @@ fn capture(path: &str) -> Result<()> {
             .unwrap()
             .add(6, 2, DecodedImage { width: iw, height: ih, rgba });
     }
-    let mut r = Renderer::new(device, queue, format, images);
+    let mut r = Renderer::new(
+        device,
+        queue,
+        format,
+        images,
+        theme,
+        cfg.font.size.clamp(6.0, 72.0),
+        primary_family(&cfg.font.family),
+    );
 
     let w = (PAD * 2.0 + cols as f32 * r.cell_w).ceil() as u32;
     let h = (PAD * 2.0 + rows as f32 * r.line_h).ceil() as u32;
@@ -2601,7 +2749,7 @@ mod tests {
     #[test]
     fn inverse_swaps_fg_and_bg() {
         let (term,) = drive(b"\x1b[7mX", 10);
-        let cell = cell_vis(&term.grid()[Line(0)][Column(0)], term.renderable_content().colors, false, false);
+        let cell = cell_vis(&term.grid()[Line(0)][Column(0)], term.renderable_content().colors, false, false, SELECTION_BG);
         assert_eq!(cell.fg, DEFAULT_BG, "inverse fg should be default bg");
         assert_eq!(cell.bg, DEFAULT_FG, "inverse bg should be default fg");
     }
@@ -2610,8 +2758,8 @@ mod tests {
     fn cursor_cell_is_inverted() {
         let (term,) = drive(b"X", 10);
         let colors = term.renderable_content().colors;
-        let plain = cell_vis(&term.grid()[Line(0)][Column(0)], colors, false, false);
-        let curs = cell_vis(&term.grid()[Line(0)][Column(0)], colors, true, false);
+        let plain = cell_vis(&term.grid()[Line(0)][Column(0)], colors, false, false, SELECTION_BG);
+        let curs = cell_vis(&term.grid()[Line(0)][Column(0)], colors, true, false, SELECTION_BG);
         assert_eq!(curs.fg, plain.bg);
         assert_eq!(curs.bg, plain.fg);
     }
@@ -2623,7 +2771,7 @@ mod tests {
         // OSC 8 ; ; https://example.com  <X>  OSC 8 ; ;  (close)
         parser.advance(&mut term, b"\x1b]8;;https://example.com\x1b\\X\x1b]8;;\x1b\\");
         let colors = term.renderable_content().colors;
-        let cell = cell_vis(&term.grid()[Line(0)][Column(0)], colors, false, false);
+        let cell = cell_vis(&term.grid()[Line(0)][Column(0)], colors, false, false, SELECTION_BG);
         assert!(cell.hyperlink, "cell should carry an OSC-8 hyperlink");
     }
 
@@ -2660,6 +2808,36 @@ mod tests {
     }
 
     #[test]
+    fn config_hex_and_family_helpers() {
+        assert_eq!(parse_hex("#ff8800"), Some([0xff, 0x88, 0x00]));
+        assert_eq!(parse_hex("  #000102 "), Some([0, 1, 2]));
+        assert!(parse_hex("ff8800").is_none()); // missing '#'
+        assert!(parse_hex("#abc").is_none()); // wrong length
+        assert_eq!(primary_family("MesloLGS NF, Hack, monospace"), "MesloLGS NF");
+        assert_eq!(primary_family("\"JetBrains Mono\", monospace"), "JetBrains Mono");
+    }
+
+    #[test]
+    fn config_colors_load_into_the_vt_table() {
+        let mut cfg = sampa_config::Config::from_toml("").unwrap();
+        cfg.colors.black = "#123456".into();
+        cfg.colors.foreground = "#abcdef".into();
+        let (mut term, _r, _a) = proxy_term(4, 2);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, &color_setup(&cfg.colors));
+        let colors = term.renderable_content().colors;
+        // resolve() now returns the config values (it consults the table first).
+        assert_eq!(
+            resolve(AnsiColor::Named(NamedColor::Black), colors, DEFAULT_FG, false),
+            [0x12, 0x34, 0x56]
+        );
+        assert_eq!(
+            resolve(AnsiColor::Named(NamedColor::Foreground), colors, DEFAULT_FG, false),
+            [0xab, 0xcd, 0xef]
+        );
+    }
+
+    #[test]
     fn safe_url_scheme_gate() {
         assert!(is_safe_url("https://example.com"));
         assert!(is_safe_url("http://x"));
@@ -2684,8 +2862,8 @@ mod tests {
     fn sgr_underline_and_strike_flags() {
         let (term,) = drive(b"\x1b[4mU\x1b[0m\x1b[9mS", 10);
         let colors = term.renderable_content().colors;
-        let u = cell_vis(&term.grid()[Line(0)][Column(0)], colors, false, false);
-        let s = cell_vis(&term.grid()[Line(0)][Column(1)], colors, false, false);
+        let u = cell_vis(&term.grid()[Line(0)][Column(0)], colors, false, false, SELECTION_BG);
+        let s = cell_vis(&term.grid()[Line(0)][Column(1)], colors, false, false, SELECTION_BG);
         assert!(u.underline && !u.strike, "cell 0 should be underlined only");
         assert!(s.strike && !s.underline, "cell 1 should be struck only");
     }
@@ -2773,11 +2951,11 @@ mod tests {
         for i in 0..8 {
             parser.advance(&mut term, format!("L{i}\r\n").as_bytes());
         }
-        let bottom = build_snapshot(&term).to_text();
+        let bottom = build_snapshot(&term, &Theme::default()).to_text();
         assert!(bottom.contains("L7"), "bottom view: {bottom:?}");
         // Scroll up into history; the bottom line should no longer be the newest.
         term.scroll_display(Scroll::Delta(3));
-        let scrolled = build_snapshot(&term).to_text();
+        let scrolled = build_snapshot(&term, &Theme::default()).to_text();
         assert_ne!(bottom, scrolled, "view should change after scrolling up");
         assert!(scrolled.contains("L4"), "scrolled view: {scrolled:?}");
     }
@@ -3147,7 +3325,7 @@ mod tests {
                 }
             }
             let _ = pty.kill();
-            build_snapshot(&term).to_text()
+            build_snapshot(&term, &Theme::default()).to_text()
         }
 
         // (name, cmd, args, input, wait_ms, any-of expected markers)
