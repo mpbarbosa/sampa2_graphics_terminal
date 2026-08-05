@@ -68,6 +68,9 @@ const PALETTE_VISIBLE: usize = 10;
 const PALETTE_MAX: usize = 60;
 /// Man panel: the most body lines shown at once (fewer if the window is short).
 const MAN_VISIBLE: usize = 18;
+/// Preview panel: max body lines shown, and the debounce before a settled line runs.
+const PREVIEW_VISIBLE: usize = 12;
+const PREVIEW_DEBOUNCE_MS: u64 = 550;
 
 // --- XTWINOPS pixel/display metrics (§17 conformance) -------------------------
 // alacritty answers only the char-size winop (CSI 18 t) and drops the pixel/report
@@ -234,9 +237,9 @@ struct PaletteView<'a> {
     selected: usize,
 }
 
-/// What the renderer needs to draw the man panel: a header line and the visible body
-/// (already sliced to the scroll window, lines joined by `\n`).
-struct ManView<'a> {
+/// A bottom overlay panel (man page or command preview): a header line and the visible
+/// body (already sliced to what fits, lines joined by `\n`).
+struct PanelView<'a> {
     title: &'a str,
     body: &'a str,
 }
@@ -933,6 +936,8 @@ enum UserEvent {
     CursorBlink,
     /// A background `man` render finished (`None` = no page / invalid command).
     ManReady { cmd: String, lines: Option<Vec<String>> },
+    /// A debounced command preview finished; `gen` guards against stale results.
+    PreviewReady { gen: u64, line: String, ran: bool, text: String },
 }
 
 /// One terminal tab: its VT state, PTY, image layer, and per-tab UI-event channel.
@@ -1086,6 +1091,11 @@ fn main() -> Result<()> {
         man_scroll: 0,
         man_loading: false,
         input_line: String::new(),
+        preview_on: false,
+        preview_text: String::new(),
+        preview_ran: false,
+        preview_line: String::new(),
+        preview_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -1330,6 +1340,13 @@ struct App {
     man_loading: bool,
     /// Best-effort current command line, accumulated from keystrokes (reset on Enter).
     input_line: String,
+    // command preview (safe auto-run, gated by sampa-preview)
+    preview_on: bool,
+    preview_text: String,
+    preview_ran: bool,
+    preview_line: String, // the command the current preview_text is for
+    /// Debounce/supersede token: only the newest scheduled preview runs + is accepted.
+    preview_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -1374,6 +1391,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::ConfigReload => self.reload_config(),
             UserEvent::ManReady { cmd, lines } => self.man_ready(cmd, lines),
+            UserEvent::PreviewReady { gen, line, ran, text } => self.preview_ready(gen, line, ran, text),
             UserEvent::CursorBlink => {
                 if self.blink {
                     self.cursor_on = !self.cursor_on;
@@ -1498,6 +1516,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.man_open();
                                 return;
                             }
+                            "e" => {
+                                self.preview_toggle();
+                                return;
+                            }
                             _ => {}
                         }
                     }
@@ -1517,6 +1539,7 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 if !bytes.is_empty() {
                     self.track_input(&event.logical_key, event.text.as_deref());
+                    self.schedule_preview(); // debounced safe auto-run (no-op if off)
                     self.pty_write(&bytes);
                     self.scroll(Scroll::Bottom); // typing snaps to the live prompt
                     self.cursor_on = true; // show the cursor on activity
@@ -2360,6 +2383,88 @@ impl App {
         self.request_redraw();
     }
 
+    /// Toggle the live command-preview panel; enabling it previews the current line.
+    fn preview_toggle(&mut self) {
+        self.preview_on = !self.preview_on;
+        if self.preview_on {
+            self.preview_text.clear();
+            self.preview_line.clear();
+            self.schedule_preview();
+        }
+        self.request_redraw();
+    }
+
+    /// The session shell's current working directory (via `/proc/<pid>/cwd`), so a
+    /// preview's `ls`/`cat` reflect what the user sees.
+    fn session_cwd(&self) -> Option<String> {
+        let pid = self.pty.lock().ok()?.pid()?;
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()?
+            .to_str()
+            .map(str::to_string)
+    }
+
+    /// Schedule a debounced preview of the current line. After the debounce, only the
+    /// newest request (matching `preview_gen`) runs `run_preview` off-thread; the gate
+    /// in `sampa-preview` refuses anything that could write. No-op when the panel is off.
+    fn schedule_preview(&mut self) {
+        if !self.preview_on {
+            return;
+        }
+        let line = self.input_line.trim().to_string();
+        // An empty line (e.g. right after Enter) clears the panel — don't run anything.
+        if line.is_empty() {
+            self.preview_text.clear();
+            self.preview_line.clear();
+            self.preview_ran = false;
+            self.request_redraw();
+            return;
+        }
+        let gen = self
+            .preview_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let gen_arc = std::sync::Arc::clone(&self.preview_gen);
+        let proxy = self.proxy.clone();
+        let cwd = self.session_cwd();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(PREVIEW_DEBOUNCE_MS));
+            // Superseded by newer input → don't even run the (possibly costly) command.
+            if gen_arc.load(std::sync::atomic::Ordering::SeqCst) != gen {
+                return;
+            }
+            let (ran, text) = match sampa_preview::run_preview(&line, cwd.as_deref()) {
+                sampa_preview::Preview::Ran(out) => (true, out),
+                sampa_preview::Preview::NotRun(reason) => (false, reason),
+            };
+            let _ = proxy.send_event(UserEvent::PreviewReady { gen, line, ran, text });
+        });
+    }
+
+    /// Accept a completed preview if it's still the newest and the panel is open.
+    fn preview_ready(&mut self, gen: u64, line: String, ran: bool, text: String) {
+        if !self.preview_on
+            || gen != self.preview_gen.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return; // stale or panel closed
+        }
+        self.preview_line = line;
+        self.preview_ran = ran;
+        self.preview_text = text;
+        self.request_redraw();
+    }
+
+    /// The preview panel's header text (command + verdict).
+    fn preview_status(&self) -> String {
+        if self.preview_line.is_empty() {
+            "preview — type a read-only command".to_string()
+        } else if self.preview_ran {
+            format!("preview ✓ {}", self.preview_line)
+        } else {
+            format!("preview ✗ {} — {}", self.preview_line, self.preview_text)
+        }
+    }
+
     /// Apply VT-raised side effects on the main thread (§13): route query replies to
     /// the PTY, sanitize + set the window title, and gate OSC-52 clipboard writes.
     fn drain_app_events(&mut self) {
@@ -2475,20 +2580,24 @@ impl App {
             rows: &pal_rows,
             selected: pal_sel,
         });
-        // Man panel: slice the visible window of lines and build the header text.
-        let man_title;
-        let man_body;
-        let man = if self.man_on {
-            let (_, lh) = self.cell_metrics();
-            let win_h = self.window.as_ref().map(|w| w.inner_size().height as f32).unwrap_or(0.0);
-            let top = top_offset(self.sessions.len());
-            let avail = (win_h - top - (lh + 6.0) - 6.0).max(lh);
-            let visible = ((avail / lh).floor() as usize).clamp(1, MAN_VISIBLE);
+        // Bottom panel: the man page (modal) or, if not, the live command preview.
+        // Both slice their body to the lines that fit the window.
+        let panel_title;
+        let panel_body;
+        let (_, lh) = self.cell_metrics();
+        let win_h = self.window.as_ref().map(|w| w.inner_size().height as f32).unwrap_or(0.0);
+        let ptop = top_offset(self.sessions.len());
+        let fit = |max: usize| {
+            let avail = (win_h - ptop - (lh + 6.0) - 6.0).max(lh);
+            ((avail / lh).floor() as usize).clamp(1, max)
+        };
+        let panel = if self.man_on {
+            let visible = fit(MAN_VISIBLE);
             let total = self.man_lines.len();
             let start = self.man_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
-            man_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
-            man_title = if self.man_loading {
+            panel_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
+            panel_title = if self.man_loading {
                 format!("man {} — loading…", self.man_cmd)
             } else {
                 format!(
@@ -2497,12 +2606,23 @@ impl App {
                     if total > 0 { format!("{}–{}/{}", start + 1, end, total) } else { "0/0".into() }
                 )
             };
-            Some(ManView { title: &man_title, body: &man_body })
+            Some(PanelView { title: &panel_title, body: &panel_body })
+        } else if self.preview_on {
+            let visible = fit(PREVIEW_VISIBLE);
+            // The body is the command output (only when it actually ran); a rejection's
+            // reason lives in the header instead.
+            let src = if self.preview_ran { self.preview_text.as_str() } else { "" };
+            let lines: Vec<&str> = src.lines().collect();
+            let shown = lines.len().min(visible);
+            panel_body = lines[..shown].join("\n");
+            let more = if lines.len() > shown { format!("  (+{} lines)", lines.len() - shown) } else { String::new() };
+            panel_title = format!("{}{}   ·  Ctrl+Shift+E hides", self.preview_status(), more);
+            Some(PanelView { title: &panel_title, body: &panel_body })
         } else {
             None
         };
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), man.as_ref());
+            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref());
         }
     }
 
@@ -2981,8 +3101,8 @@ struct Renderer {
     tab_buffers: Vec<Buffer>,     // one per tab-bar label, grown lazily
     search_buffer: Buffer,        // the search-bar text
     palette_buffers: Vec<Buffer>, // [0] = query line, [1..] = result rows
-    man_title_buffer: Buffer,     // man panel header
-    man_buffer: Buffer,           // man panel body (multi-line)
+    panel_title_buffer: Buffer, // bottom-panel header (man/preview)
+    panel_body_buffer: Buffer,  // bottom-panel body (multi-line)
     quad_pipeline: wgpu::RenderPipeline,
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
@@ -3022,8 +3142,8 @@ impl Renderer {
         let cell_w = measure_cell_w(&mut font_system, font_size, line_h, &font_family);
         let buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let search_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
-        let man_title_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
-        let man_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+        let panel_title_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+        let panel_body_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quad"),
@@ -3182,8 +3302,8 @@ impl Renderer {
             tab_buffers: Vec::new(),
             search_buffer,
             palette_buffers: Vec::new(),
-            man_title_buffer,
-            man_buffer,
+            panel_title_buffer,
+            panel_body_buffer,
             quad_pipeline,
             quad_uniform,
             quad_bind_group,
@@ -3284,8 +3404,8 @@ impl Renderer {
         self.cell_w = measure_cell_w(&mut self.font_system, font_size, self.line_h, &self.font_family);
         self.buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.search_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
-        self.man_title_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
-        self.man_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.panel_title_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.panel_body_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         // Overlay row buffers carry the old line height — drop so they're rebuilt.
         self.tab_buffers.clear();
         self.palette_buffers.clear();
@@ -3432,20 +3552,21 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, man: Option<&ManView>) {
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
-        // search bar and the man panel each overlay a strip/panel at the bottom.
+        // search bar and the bottom panel (man page / command preview) each overlay a
+        // strip/panel at the bottom.
         let top = top_offset(tabs.len());
-        let man_header_h = self.line_h + 6.0;
-        let man_top = man
-            .map(|mv| {
-                let n = mv.body.lines().count().max(1) as f32;
-                (h as f32 - (man_header_h + n * self.line_h + 6.0)).max(top)
+        let panel_header_h = self.line_h + 6.0;
+        let panel_top = panel
+            .map(|pv| {
+                let n = pv.body.lines().count().max(1) as f32;
+                (h as f32 - (panel_header_h + n * self.line_h + 6.0)).max(top)
             })
             .unwrap_or(h as f32);
         let grid_bottom = {
             let sb = if search.is_some() { (h as f32 - SEARCH_H).max(0.0) } else { h as f32 };
-            sb.min(man_top)
+            sb.min(panel_top)
         };
         // The command palette drops down as a full-width panel below the tab bar.
         let pal_rowh = self.line_h + 6.0;
@@ -3537,16 +3658,16 @@ impl Renderer {
             }
             bg_quads.push(QuadInstance { rect: [0.0, pal_bottom - 1.0, wf, 1.0], color: rule });
         }
-        // Man panel: an opaque bottom panel with a header strip + top rule.
-        if man.is_some() {
-            let panel = self.color4(blend(self.theme.bg, self.theme.fg, 0.07));
+        // Bottom panel (man/preview): an opaque panel with a header strip + top rule.
+        if panel.is_some() {
+            let body_bg = self.color4(blend(self.theme.bg, self.theme.fg, 0.07));
             let header = self.color4(blend(self.theme.bg, self.theme.fg, 0.16));
             let rule = self.color4(blend(self.theme.bg, self.theme.fg, 0.34));
             let wf = w as f32;
-            bg_quads.push(QuadInstance { rect: [0.0, man_top, wf, h as f32 - man_top], color: panel });
-            bg_quads.push(QuadInstance { rect: [0.0, man_top, wf, man_header_h], color: header });
-            bg_quads.push(QuadInstance { rect: [0.0, man_top, wf, 1.0], color: rule });
-            bg_quads.push(QuadInstance { rect: [0.0, man_top + man_header_h, wf, 1.0], color: rule });
+            bg_quads.push(QuadInstance { rect: [0.0, panel_top, wf, h as f32 - panel_top], color: body_bg });
+            bg_quads.push(QuadInstance { rect: [0.0, panel_top, wf, panel_header_h], color: header });
+            bg_quads.push(QuadInstance { rect: [0.0, panel_top, wf, 1.0], color: rule });
+            bg_quads.push(QuadInstance { rect: [0.0, panel_top + panel_header_h, wf, 1.0], color: rule });
         }
 
         // Foreground text as per-cell colored rich-text spans.
@@ -3598,28 +3719,28 @@ impl Renderer {
             self.search_buffer.set_rich_text([(text, attrs)], &Attrs::new(), Shaping::Advanced, None);
             self.search_buffer.shape_until_scroll(&mut self.font_system, false);
         }
-        if let Some(mv) = man {
+        if let Some(pv) = panel {
             let fam = family_of(&self.font_family);
             let fg = self.theme.fg;
             let hi = self.theme.cursor;
             let width = (w as f32 - 2.0 * PAD).max(1.0);
-            let body_h = (h as f32 - man_top - man_header_h).max(self.line_h);
-            self.man_title_buffer.set_size(Some(width), Some(man_header_h));
-            self.man_title_buffer.set_rich_text(
-                [(mv.title, Attrs::new().family(fam).color(Color::rgb(hi[0], hi[1], hi[2])))],
+            let body_h = (h as f32 - panel_top - panel_header_h).max(self.line_h);
+            self.panel_title_buffer.set_size(Some(width), Some(panel_header_h));
+            self.panel_title_buffer.set_rich_text(
+                [(pv.title, Attrs::new().family(fam).color(Color::rgb(hi[0], hi[1], hi[2])))],
                 &Attrs::new(),
                 Shaping::Advanced,
                 None,
             );
-            self.man_title_buffer.shape_until_scroll(&mut self.font_system, false);
-            self.man_buffer.set_size(Some(width), Some(body_h));
-            self.man_buffer.set_rich_text(
-                [(mv.body, Attrs::new().family(fam).color(Color::rgb(fg[0], fg[1], fg[2])))],
+            self.panel_title_buffer.shape_until_scroll(&mut self.font_system, false);
+            self.panel_body_buffer.set_size(Some(width), Some(body_h));
+            self.panel_body_buffer.set_rich_text(
+                [(pv.body, Attrs::new().family(fam).color(Color::rgb(fg[0], fg[1], fg[2])))],
                 &Attrs::new(),
                 Shaping::Advanced,
                 None,
             );
-            self.man_buffer.shape_until_scroll(&mut self.font_system, false);
+            self.panel_body_buffer.shape_until_scroll(&mut self.font_system, false);
         }
 
         self.viewport
@@ -3646,21 +3767,21 @@ impl Renderer {
                 custom_glyphs: &[],
             });
         }
-        if man.is_some() {
+        if panel.is_some() {
             let fg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
-            let title_top = man_top + ((man_header_h - self.line_h) / 2.0).max(0.0);
+            let title_top = panel_top + ((panel_header_h - self.line_h) / 2.0).max(0.0);
             text_areas.push(TextArea {
-                buffer: &self.man_title_buffer,
+                buffer: &self.panel_title_buffer,
                 left: PAD,
                 top: title_top,
                 scale: 1.0,
-                bounds: TextBounds { left: 0, top: man_top as i32, right: w as i32, bottom: (man_top + man_header_h) as i32 },
+                bounds: TextBounds { left: 0, top: panel_top as i32, right: w as i32, bottom: (panel_top + panel_header_h) as i32 },
                 default_color: fg,
                 custom_glyphs: &[],
             });
-            let body_top = man_top + man_header_h + 2.0;
+            let body_top = panel_top + panel_header_h + 2.0;
             text_areas.push(TextArea {
-                buffer: &self.man_buffer,
+                buffer: &self.panel_body_buffer,
                 left: PAD,
                 top: body_top,
                 scale: 1.0,
@@ -3874,7 +3995,7 @@ impl Gfx {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, man: Option<&ManView>) {
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -3891,7 +4012,7 @@ impl Gfx {
             active,
             search,
             palette,
-            man,
+            panel,
         );
         self.r.queue.present(frame);
     }
@@ -3982,8 +4103,11 @@ fn capture(path: &str) -> Result<()> {
     } else {
         (r.line_h + 6.0) * demo_pal.len() as f32 + 12.0
     };
-    // Optional man-panel demo: SAMPA_CAPTURE_MAN="cmd|line1|line2|..." (| separates lines).
-    let demo_man: Vec<String> = std::env::var("SAMPA_CAPTURE_MAN")
+    // Optional bottom-panel demo: SAMPA_CAPTURE_MAN / SAMPA_CAPTURE_PREVIEW =
+    // "cmd|line1|line2|..." (| separates lines); PREVIEW uses the preview header style.
+    let is_preview = std::env::var("SAMPA_CAPTURE_PREVIEW").is_ok();
+    let demo_man: Vec<String> = std::env::var("SAMPA_CAPTURE_PREVIEW")
+        .or_else(|_| std::env::var("SAMPA_CAPTURE_MAN"))
         .ok()
         .filter(|s| !s.is_empty())
         .map(|s| s.split('|').map(str::to_string).collect())
@@ -4025,9 +4149,13 @@ fn capture(path: &str) -> Result<()> {
     let demo_manview = if demo_man.is_empty() {
         None
     } else {
-        man_title = format!("man {}   1–{}/{}   ·  ↑/↓ PgUp/PgDn · Esc", demo_man[0], demo_man.len() - 1, demo_man.len() - 1);
+        man_title = if is_preview {
+            format!("preview ✓ {}   ·  Ctrl+Shift+E hides", demo_man[0])
+        } else {
+            format!("man {}   1–{}/{}   ·  ↑/↓ PgUp/PgDn · Esc", demo_man[0], demo_man.len() - 1, demo_man.len() - 1)
+        };
         man_body = demo_man[1..].join("\n");
-        Some(ManView { title: &man_title, body: &man_body })
+        Some(PanelView { title: &man_title, body: &man_body })
     };
     r.paint(
         &snap,
@@ -4218,6 +4346,40 @@ mod tests {
         assert!(empty.iter().all(|m| m.hits.is_empty()));
         // Case-insensitive.
         assert_eq!(filter_commands(&all, "GREP", PALETTE_MAX)[0].name, "grep");
+    }
+
+    // §17 exit criterion: a command previewed by the native build never mutates the
+    // filesystem. Exercises the exact call `schedule_preview` makes (`run_preview` with
+    // the session cwd), proving the authoritative gate is preserved through our wiring.
+    #[test]
+    fn preview_never_mutates_the_filesystem() {
+        use sampa_preview::Preview;
+        let dir = std::env::temp_dir().join(format!("sampa-native-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("do-not-delete.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        let cwd = dir.to_str();
+
+        for line in [
+            "rm do-not-delete.txt",
+            "rm -rf .",
+            "mv do-not-delete.txt gone",
+            "echo x > do-not-delete.txt",
+            ": > do-not-delete.txt",
+            "find . -delete",
+            "ls && rm do-not-delete.txt",
+        ] {
+            let r = sampa_preview::run_preview(line, cwd);
+            assert!(matches!(r, Preview::NotRun(_)), "{line:?} should be refused, got {r:?}");
+            assert!(victim.exists(), "{line:?} deleted the file!");
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious", "{line:?} changed the file!");
+        }
+        // A read-only command does run, in the session cwd.
+        match sampa_preview::run_preview("cat do-not-delete.txt", cwd) {
+            Preview::Ran(out) => assert!(out.contains("precious"), "cat output: {out:?}"),
+            other => panic!("cat should run, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
