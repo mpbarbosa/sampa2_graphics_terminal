@@ -204,7 +204,7 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
   characters are highlighted** (bold + accent) from the reported hit indices. ↑/↓ move
   the selection (scrolled to stay visible), the bar shows the query + caret, `Esc`
   closes. **Enter inserts `"<cmd> "`** at the prompt (never auto-runs). Grid text is
-  clipped below the panel and images/decorations/cursor suppressed under it so nothing
+  clipped below the panel and images/decorations/cursor are suppressed under it so nothing
   shows through. `score_token`/`score_command`/`filter_commands`/`palette_window`
   unit-tested (incl. spec acceptance cases); rendered + verified via `--capture`.
   ⬜ still: run-immediately affordance, recent/frecency ordering.
