@@ -195,14 +195,19 @@ runs the host shell; AppImage runs with no install; WM_CLASS verified via `xprop
 Services already exist; only the UI is new. Draw panels/overlays in the wgpu scene.
 
 - ✅ **Palette** (`sampa-palette`): `Ctrl+Shift+P` opens a full-width dropdown below
-  the tab bar; `list_executables($PATH)` enumerated once on open, **fuzzy-filtered** as
-  you type (subsequence scorer: start-anchored + contiguous runs rank higher, shorter
-  names win ties). ↑/↓ move the selection (windowed/scrolled to keep it visible), the
-  bar shows the query + caret, `Esc` closes. **Enter inserts `"<cmd> "`** at the prompt
-  (never auto-runs — the user reviews/adds args). Grid text is clipped below the panel
-  and images/decorations/cursor are suppressed under it so nothing shows through.
-  `fuzzy_score`/`filter_commands`/`palette_window` unit-tested; rendered + verified via
-  `--capture`. ⬜ still: run-immediately affordance, recent/frecency ordering.
+  the tab bar; `list_executables($PATH)` enumerated once on open. The matcher implements
+  the [command-palette search spec](spec-command-palette-search.md): whitespace-split
+  **AND tokens**, tiered **exact > substring > subsequence** scoring (prefix/word-boundary
+  bonuses, gap-penalized subsequence), best-first (stable ties), capped at `PALETTE_MAX`
+  = 60 — so the grep family (`grep`, `grepdiff`, `git-grep`, `egrep`…) ranks above any
+  scattered match, `git grep` → `git-grep`, `doc comp` → `docker-compose`. **Matched
+  characters are highlighted** (bold + accent) from the reported hit indices. ↑/↓ move
+  the selection (scrolled to stay visible), the bar shows the query + caret, `Esc`
+  closes. **Enter inserts `"<cmd> "`** at the prompt (never auto-runs). Grid text is
+  clipped below the panel and images/decorations/cursor are suppressed under it so nothing
+  shows through. `score_token`/`score_command`/`filter_commands`/`palette_window`
+  unit-tested (incl. spec acceptance cases); rendered + verified via `--capture`.
+  ⬜ still: run-immediately affordance, recent/frecency ordering.
 - **Man panel** (`sampa-man`): command detected from typed keystrokes +
   `sampa-shellint` OSC-133 prompt boundaries (robust, not grid-scraping);
   **collapses** for keywords/no-man.
