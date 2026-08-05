@@ -63,9 +63,9 @@ const SEARCH_MATCH_BG: [u8; 3] = [0x66, 0x5c, 0x1e];
 const SEARCH_CURRENT_BG: [u8; 3] = [0xe0, 0xa0, 0x22];
 /// Cap on matches tracked per search, to bound work on huge scrollback.
 const SEARCH_MAX_MATCHES: usize = 2000;
-/// Command palette: rows shown at once, and the cap on filtered results kept.
+/// Command palette: rows shown at once, and the cap on ranked results kept (spec §5).
 const PALETTE_VISIBLE: usize = 10;
-const PALETTE_LIST_MAX: usize = 200;
+const PALETTE_MAX: usize = 60;
 
 // --- XTWINOPS pixel/display metrics (§17 conformance) -------------------------
 // alacritty answers only the char-size winop (CSI 18 t) and drops the pixel/report
@@ -228,7 +228,7 @@ impl Snapshot {
 /// currently-visible rows, and which of those rows is selected.
 struct PaletteView<'a> {
     query: &'a str,
-    rows: &'a [String],
+    rows: &'a [PaletteMatch],
     selected: usize,
 }
 
@@ -1303,7 +1303,7 @@ struct App {
     palette_on: bool,
     palette_query: String,
     palette_all: Vec<String>,
-    palette_filtered: Vec<String>,
+    palette_filtered: Vec<PaletteMatch>,
     palette_idx: usize,
 }
 
@@ -1539,46 +1539,112 @@ fn find_matches<L: EventListener>(term: &Term<L>, query: &str, max: usize) -> Ve
         .collect()
 }
 
-/// Case-insensitive subsequence fuzzy score of `needle` against `hay`, or `None` if
-/// `needle` isn't a subsequence. Rewards a match at the start, consecutive matches,
-/// and shorter candidates. An empty needle matches everything with a neutral score.
-fn fuzzy_score(needle: &str, hay: &str) -> Option<i32> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    let n: Vec<char> = needle.chars().flat_map(|c| c.to_lowercase()).collect();
-    let h: Vec<char> = hay.chars().flat_map(|c| c.to_lowercase()).collect();
-    let mut ni = 0;
-    let mut score = 0i32;
-    let mut prev: Option<usize> = None;
-    for (hi, &hc) in h.iter().enumerate() {
-        if ni < n.len() && hc == n[ni] {
-            score += 10;
-            if hi == 0 {
-                score += 15; // anchored at the very start
-            }
-            if prev == Some(hi.wrapping_sub(1)) {
-                score += 20; // contiguous run
-            }
-            prev = Some(hi);
-            ni += 1;
-        }
-    }
-    (ni == n.len()).then(|| score - h.len() as i32)
+/// A ranked palette result: the command name and the char indices to emphasize
+/// (`docs/spec-command-palette-search.md` §6).
+#[derive(Clone, Debug, PartialEq)]
+struct PaletteMatch {
+    name: String,
+    hits: Vec<usize>,
 }
 
-/// Fuzzy-filter `all` by `query`, best score first (ties broken alphabetically),
-/// capped at `max`. An empty query returns the head of the list unchanged.
-fn filter_commands(all: &[String], query: &str, max: usize) -> Vec<String> {
-    if query.is_empty() {
-        return all.iter().take(max).cloned().collect();
+/// Word-boundary characters (spec §4): a token starting right after one of these scores
+/// as a boundary hit (so `grep` ranks well in `git-grep`, `ast-grep`).
+fn is_word_boundary(c: char) -> bool {
+    matches!(c, '-' | '_' | '.' | '/' | '@' | '+')
+}
+
+/// First index at which `needle` occurs contiguously in `hay`.
+fn find_subslice(hay: &[char], needle: &[char]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
     }
-    let mut scored: Vec<(i32, &String)> = all
-        .iter()
-        .filter_map(|c| fuzzy_score(query, c).map(|s| (s, c)))
+    (0..=hay.len() - needle.len()).find(|&i| hay[i..i + needle.len()] == *needle)
+}
+
+/// Score one whitespace-free token (already ASCII-lowercased) against a command's
+/// lowercased chars (spec §4): first matching tier wins — exact > substring >
+/// subsequence — so any substring match always beats any subsequence-only match.
+/// Returns `(score, hit_indices)` or `None` if the token doesn't match at all.
+fn score_token(cmd: &[char], t: &[char]) -> Option<(i32, Vec<usize>)> {
+    if t.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    // Tier 1: exact.
+    if cmd == t {
+        return Some((1000, (0..t.len()).collect()));
+    }
+    // Tier 2: substring at first index `s`.
+    if let Some(s) = find_subslice(cmd, t) {
+        let mut score = 200 - (s.min(100) as i32);
+        if s == 0 {
+            score += 100; // prefix
+        } else if is_word_boundary(cmd[s - 1]) {
+            score += 60; // word boundary
+        }
+        return Some((score, (s..s + t.len()).collect()));
+    }
+    // Tier 3: subsequence (greedy, first-fit) with gap penalty + contiguity/prefix bonus.
+    let mut score = 0i32;
+    let mut hits = Vec::with_capacity(t.len());
+    let mut cursor = 0usize;
+    let mut prev: Option<usize> = None;
+    for &tc in t {
+        let idx = (cursor..cmd.len()).find(|&j| cmd[j] == tc)?;
+        score -= (idx - cursor) as i32; // chars skipped
+        if prev == Some(idx.wrapping_sub(1)) {
+            score += 5; // adjacent to previous match
+        }
+        if idx == 0 {
+            score += 10; // prefix
+        }
+        prev = Some(idx);
+        cursor = idx + 1;
+        hits.push(idx);
+    }
+    Some((score, hits))
+}
+
+/// Score a command against all query tokens (spec §3/§5): every token must match
+/// (logical AND); the score is the sum of token scores minus a mild length penalty,
+/// and the hit set is the union of per-token hits. `None` if any token fails.
+fn score_command(cmd: &str, tokens: &[Vec<char>]) -> Option<(f64, Vec<usize>)> {
+    let lower: Vec<char> = cmd.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let mut total = 0i32;
+    let mut hits: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for t in tokens {
+        let (s, idxs) = score_token(&lower, t)?;
+        total += s;
+        hits.extend(idxs);
+    }
+    Some((total as f64 - lower.len() as f64 * 0.1, hits.into_iter().collect()))
+}
+
+/// Rank `all` against `query` per the palette-search spec: whitespace-split into tokens
+/// (AND), tiered scoring, best-first (stable so ties keep input order), capped at `max`.
+/// An empty query returns the head of the list with no hits (the full command list).
+fn filter_commands(all: &[String], query: &str, max: usize) -> Vec<PaletteMatch> {
+    let tokens: Vec<Vec<char>> = query
+        .split_whitespace()
+        .map(|t| t.chars().map(|c| c.to_ascii_lowercase()).collect())
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-    scored.into_iter().take(max).map(|(_, c)| c.clone()).collect()
+    if tokens.is_empty() {
+        return all
+            .iter()
+            .take(max)
+            .map(|c| PaletteMatch { name: c.clone(), hits: Vec::new() })
+            .collect();
+    }
+    let mut scored: Vec<(f64, &String, Vec<usize>)> = all
+        .iter()
+        .filter_map(|c| score_command(c, &tokens).map(|(s, h)| (s, c, h)))
+        .collect();
+    // Stable sort by score desc; equal scores retain input order (spec §5.2).
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+        .into_iter()
+        .take(max)
+        .map(|(_, c, h)| PaletteMatch { name: c.clone(), hits: h })
+        .collect()
 }
 
 /// Start index of the visible window so `idx` stays on screen (centered when possible).
@@ -2115,7 +2181,7 @@ impl App {
 
     /// Re-run the fuzzy filter for the current query and reset the selection to the top.
     fn palette_refilter(&mut self) {
-        self.palette_filtered = filter_commands(&self.palette_all, &self.palette_query, PALETTE_LIST_MAX);
+        self.palette_filtered = filter_commands(&self.palette_all, &self.palette_query, PALETTE_MAX);
         self.palette_idx = 0;
         self.request_redraw();
     }
@@ -2137,8 +2203,8 @@ impl App {
     /// Insert the selected command (plus a trailing space) at the prompt, then close.
     /// Deliberately does not append a newline — the user reviews/adds args and runs it.
     fn palette_run(&mut self) {
-        if let Some(cmd) = self.palette_filtered.get(self.palette_idx) {
-            let bytes = format!("{cmd} ").into_bytes();
+        if let Some(m) = self.palette_filtered.get(self.palette_idx) {
+            let bytes = format!("{} ", m.name).into_bytes();
             self.pty_write(&bytes);
             self.scroll(Scroll::Bottom);
         }
@@ -2248,7 +2314,7 @@ impl App {
         let active = self.active;
         let search = self.search_on.then(|| self.search_bar_text());
         // Window the filtered command list around the selection for the dropdown.
-        let (pal_rows, pal_sel): (Vec<String>, usize) = if self.palette_on {
+        let (pal_rows, pal_sel): (Vec<PaletteMatch>, usize) = if self.palette_on {
             let start = palette_window(self.palette_idx, self.palette_filtered.len(), PALETTE_VISIBLE);
             let rows = self.palette_filtered.iter().skip(start).take(PALETTE_VISIBLE).cloned().collect();
             (rows, self.palette_idx - start)
@@ -3133,18 +3199,46 @@ impl Renderer {
             let b = Buffer::new(&mut self.font_system, Metrics::new(fs, self.line_h));
             self.palette_buffers.push(b);
         }
+        let fam = family_of(&self.font_family);
         let fg = self.theme.fg;
+        let hit = self.theme.cursor; // matched chars emphasized in the accent color
         let width = (w as f32 - 2.0 * PAD - 16.0).max(1.0);
-        // Row 0: the query line with a caret; rows 1.. : command names.
-        let query = format!("> {}\u{2582}", p.query);
-        for i in 0..need {
-            let text = if i == 0 { query.as_str() } else { p.rows[i - 1].as_str() };
-            let attrs = Attrs::new()
-                .family(family_of(&self.font_family))
-                .color(Color::rgb(fg[0], fg[1], fg[2]));
-            let buf = &mut self.palette_buffers[i];
+        // Row 0: the query line with a caret.
+        {
+            let attrs = Attrs::new().family(fam).color(Color::rgb(fg[0], fg[1], fg[2]));
+            let query = format!("> {}\u{2582}", p.query);
+            let buf = &mut self.palette_buffers[0];
             buf.set_size(Some(width), Some(rowh));
-            buf.set_rich_text([(text, attrs)], &Attrs::new(), Shaping::Advanced, None);
+            buf.set_rich_text([(query.as_str(), attrs)], &Attrs::new(), Shaping::Advanced, None);
+            buf.shape_until_scroll(&mut self.font_system, false);
+        }
+        // Rows 1..: command names with matched characters emphasized (spec §6).
+        for (ri, m) in p.rows.iter().enumerate() {
+            let hits: std::collections::BTreeSet<usize> = m.hits.iter().copied().collect();
+            // Coalesce consecutive chars of the same hit/non-hit state into spans.
+            let mut spans: Vec<(String, bool)> = Vec::new();
+            for (ci, ch) in m.name.chars().enumerate() {
+                let h = hits.contains(&ci);
+                match spans.last_mut() {
+                    Some((s, sh)) if *sh == h => s.push(ch),
+                    _ => spans.push((ch.to_string(), h)),
+                }
+            }
+            let buf = &mut self.palette_buffers[ri + 1];
+            buf.set_size(Some(width), Some(rowh));
+            buf.set_rich_text(
+                spans.iter().map(|(s, h)| {
+                    let c = if *h { hit } else { fg };
+                    let mut a = Attrs::new().family(fam).color(Color::rgb(c[0], c[1], c[2]));
+                    if *h {
+                        a = a.weight(Weight::BOLD);
+                    }
+                    (s.as_str(), a)
+                }),
+                &Attrs::new(),
+                Shaping::Advanced,
+                None,
+            );
             buf.shape_until_scroll(&mut self.font_system, false);
         }
     }
@@ -3647,9 +3741,15 @@ fn capture(path: &str) -> Result<()> {
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
     let demo_search = std::env::var("SAMPA_CAPTURE_SEARCH").ok().filter(|s| !s.is_empty());
+    // Rank the demo rows against the demo query so highlighting shows in the capture.
+    let demo_matches: Vec<PaletteMatch> = if demo_pal.len() > 1 {
+        filter_commands(&demo_pal[1..], &demo_pal[0], PALETTE_MAX)
+    } else {
+        Vec::new()
+    };
     let demo_palette = (!demo_pal.is_empty()).then(|| PaletteView {
         query: &demo_pal[0],
-        rows: &demo_pal[1..],
+        rows: &demo_matches,
         selected: 0,
     });
     r.paint(
@@ -3773,32 +3873,73 @@ mod tests {
         assert_eq!(curs.bg, plain.fg);
     }
 
-    #[test]
-    fn fuzzy_scoring_and_ranking() {
-        // Non-subsequence → no match; subsequence → Some.
-        assert!(fuzzy_score("xyz", "grep").is_none());
-        assert!(fuzzy_score("gp", "grep").is_some());
-        assert!(fuzzy_score("", "anything").is_some()); // empty needle matches
-        // Case-insensitive.
-        assert!(fuzzy_score("GREP", "grep").is_some());
-        // A contiguous, start-anchored match outranks a scattered one.
-        let contiguous = fuzzy_score("gre", "grep").unwrap();
-        let scattered = fuzzy_score("gre", "gxrxe").unwrap();
-        assert!(contiguous > scattered, "{contiguous} vs {scattered}");
+    fn tok(s: &str) -> Vec<char> {
+        s.chars().map(|c| c.to_ascii_lowercase()).collect()
     }
 
     #[test]
-    fn filter_ranks_and_caps() {
-        let all: Vec<String> = ["grep", "egrep", "pgrep", "ls", "cat"]
+    fn score_token_tiers_are_ordered() {
+        let grep = tok("grep");
+        // Exact beats prefix-substring beats boundary-substring beats plain substring.
+        let exact = score_token(&tok("grep"), &grep).unwrap().0;
+        let prefix = score_token(&tok("grepdiff"), &grep).unwrap().0;
+        let boundary = score_token(&tok("git-grep"), &grep).unwrap().0;
+        let plain = score_token(&tok("egrep"), &grep).unwrap().0;
+        assert_eq!(exact, 1000);
+        assert!(exact > prefix && prefix > boundary && boundary > plain, "{exact} {prefix} {boundary} {plain}");
+        // Any substring match must beat any subsequence-only match (spec §4).
+        let subseq = score_token(&tok("gxrxexp"), &grep).unwrap().0;
+        assert!(plain > subseq, "substring {plain} must beat subsequence {subseq}");
+        // Non-match excludes.
+        assert!(score_token(&tok("ls"), &grep).is_none());
+    }
+
+    #[test]
+    fn score_token_reports_hit_indices() {
+        // Substring hit = the contiguous run.
+        assert_eq!(score_token(&tok("egrep"), &tok("grep")).unwrap().1, vec![1, 2, 3, 4]);
+        // Subsequence hit = the individual matched indices.
+        assert_eq!(score_token(&tok("g_r_e_p"), &tok("grep")).unwrap().1, vec![0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn filter_ranks_grep_family_and_caps() {
+        let all: Vec<String> = [
+            "grep", "grepdiff", "git-grep", "egrep", "fgrep", "zgrep", "pgrep",
+            "ls", "cat", "gv2ray-proxy-helper",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = filter_commands(&all, "grep", PALETTE_MAX);
+        let names: Vec<&str> = out.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names[0], "grep", "exact match first: {names:?}");
+        assert_eq!(names[1], "grepdiff", "prefix next: {names:?}");
+        assert_eq!(names[2], "git-grep", "word-boundary next: {names:?}");
+        // Substrings (egrep/fgrep/…) rank above the scattered subsequence match.
+        let subseq_pos = names.iter().position(|n| *n == "gv2ray-proxy-helper").unwrap();
+        let egrep_pos = names.iter().position(|n| *n == "egrep").unwrap();
+        assert!(egrep_pos < subseq_pos, "substrings before subsequence: {names:?}");
+        // Non-matches excluded.
+        assert!(!names.contains(&"ls") && !names.contains(&"cat"));
+    }
+
+    #[test]
+    fn filter_multi_token_is_and() {
+        let all: Vec<String> = ["git-grep", "grep", "docker-compose", "docker", "git"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let out = filter_commands(&all, "grep", 10);
-        assert_eq!(out[0], "grep", "exact/start match ranks first: {out:?}");
-        assert!(out.contains(&"egrep".to_string()) && out.contains(&"pgrep".to_string()));
-        assert!(!out.contains(&"ls".to_string()));
-        // Empty query returns the head unchanged, capped at max.
-        assert_eq!(filter_commands(&all, "", 2), vec!["grep", "egrep"]);
+        // Both tokens must match; hits are the union.
+        let out = filter_commands(&all, "git grep", PALETTE_MAX);
+        assert_eq!(out.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["git-grep"]);
+        assert_eq!(filter_commands(&all, "doc comp", PALETTE_MAX)[0].name, "docker-compose");
+        // Empty query lists all with no hits.
+        let empty = filter_commands(&all, "", PALETTE_MAX);
+        assert_eq!(empty.len(), all.len());
+        assert!(empty.iter().all(|m| m.hits.is_empty()));
+        // Case-insensitive.
+        assert_eq!(filter_commands(&all, "GREP", PALETTE_MAX)[0].name, "grep");
     }
 
     #[test]
