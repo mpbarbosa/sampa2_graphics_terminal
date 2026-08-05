@@ -208,9 +208,15 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
   shows through. `score_token`/`score_command`/`filter_commands`/`palette_window`
   unit-tested (incl. spec acceptance cases); rendered + verified via `--capture`.
   ⬜ still: run-immediately affordance, recent/frecency ordering.
-- **Man panel** (`sampa-man`): command detected from typed keystrokes +
-  `sampa-shellint` OSC-133 prompt boundaries (robust, not grid-scraping);
-  **collapses** for keywords/no-man.
+- ✅ **Man panel** (`sampa-man`): `Ctrl+Shift+M` opens a bottom panel with the man page
+  for the **first token of the current command line** (tracked from typed keystrokes,
+  `sudo`/`command`/`\` stripped; reset on Enter). `man -P cat <cmd>` runs on a
+  **background thread** (never blocks the UI) and its sanitized output streams back via
+  `UserEvent::ManReady`; ↑/↓ · PgUp/PgDn · Home scroll, `Esc` closes, "No man page"
+  when absent. The panel clips the grid above it and scissors images out. `first_command_token`
+  unit-tested; rendered + verified via `--capture` (`sampa-man`'s own sanitize/validate
+  tests carry over). ⬜ still: OSC-133 prompt-boundary reset (opt-in shell hooks),
+  auto-show on debounce, in-panel search.
 - **Preview panel** (`sampa-preview`): the authoritative gate is untouched; debounce
   ~550 ms, **clear on Enter**. Re-assert the filesystem-verified `rm`-is-refused test.
 - OSC 7/133 already handled by `sampa-shellint`; ship the opt-in zsh/bash hooks.

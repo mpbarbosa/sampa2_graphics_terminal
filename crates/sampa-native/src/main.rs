@@ -66,6 +66,8 @@ const SEARCH_MAX_MATCHES: usize = 2000;
 /// Command palette: rows shown at once, and the cap on ranked results kept (spec §5).
 const PALETTE_VISIBLE: usize = 10;
 const PALETTE_MAX: usize = 60;
+/// Man panel: the most body lines shown at once (fewer if the window is short).
+const MAN_VISIBLE: usize = 18;
 
 // --- XTWINOPS pixel/display metrics (§17 conformance) -------------------------
 // alacritty answers only the char-size winop (CSI 18 t) and drops the pixel/report
@@ -230,6 +232,13 @@ struct PaletteView<'a> {
     query: &'a str,
     rows: &'a [PaletteMatch],
     selected: usize,
+}
+
+/// What the renderer needs to draw the man panel: a header line and the visible body
+/// (already sliced to the scroll window, lines joined by `\n`).
+struct ManView<'a> {
+    title: &'a str,
+    body: &'a str,
 }
 
 /// Side effects the VT engine raises during parsing, forwarded from the parser
@@ -922,6 +931,8 @@ enum UserEvent {
     SessionExit { id: u64, detail: String },
     ConfigReload,
     CursorBlink,
+    /// A background `man` render finished (`None` = no page / invalid command).
+    ManReady { cmd: String, lines: Option<Vec<String>> },
 }
 
 /// One terminal tab: its VT state, PTY, image layer, and per-tab UI-event channel.
@@ -1069,6 +1080,12 @@ fn main() -> Result<()> {
         palette_all: Vec::new(),
         palette_filtered: Vec::new(),
         palette_idx: 0,
+        man_on: false,
+        man_cmd: String::new(),
+        man_lines: Vec::new(),
+        man_scroll: 0,
+        man_loading: false,
+        input_line: String::new(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -1305,6 +1322,14 @@ struct App {
     palette_all: Vec<String>,
     palette_filtered: Vec<PaletteMatch>,
     palette_idx: usize,
+    // man panel
+    man_on: bool,
+    man_cmd: String,
+    man_lines: Vec<String>,
+    man_scroll: usize,
+    man_loading: bool,
+    /// Best-effort current command line, accumulated from keystrokes (reset on Enter).
+    input_line: String,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -1348,6 +1373,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::ConfigReload => self.reload_config(),
+            UserEvent::ManReady { cmd, lines } => self.man_ready(cmd, lines),
             UserEvent::CursorBlink => {
                 if self.blink {
                     self.cursor_on = !self.cursor_on;
@@ -1375,6 +1401,18 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => self.render_now(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let m = self.modifiers;
+                // The man panel captures navigation/close keys while open.
+                if self.man_on {
+                    if m.control_key()
+                        && m.shift_key()
+                        && matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("m"))
+                    {
+                        self.man_close();
+                    } else {
+                        self.man_key(&event.logical_key);
+                    }
+                    return;
+                }
                 // The command palette captures all input while open (Ctrl+Shift+P closes it).
                 if self.palette_on {
                     if m.control_key()
@@ -1456,6 +1494,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.palette_open();
                                 return;
                             }
+                            "m" => {
+                                self.man_open();
+                                return;
+                            }
                             _ => {}
                         }
                     }
@@ -1474,6 +1516,7 @@ impl ApplicationHandler<UserEvent> for App {
                     app_cursor,
                 );
                 if !bytes.is_empty() {
+                    self.track_input(&event.logical_key, event.text.as_deref());
                     self.pty_write(&bytes);
                     self.scroll(Scroll::Bottom); // typing snaps to the live prompt
                     self.cursor_on = true; // show the cursor on activity
@@ -1645,6 +1688,19 @@ fn filter_commands(all: &[String], query: &str, max: usize) -> Vec<PaletteMatch>
         .take(max)
         .map(|(_, c, h)| PaletteMatch { name: c.clone(), hits: h })
         .collect()
+}
+
+/// The command whose man page to show for an input line: the first whitespace token,
+/// with a leading `\` stripped (`\ls`→`ls`) and a leading `sudo`/`command` skipped
+/// (`sudo grep …`→`grep`).
+fn first_command_token(line: &str) -> &str {
+    let mut it = line.split_whitespace();
+    let first = it.next().unwrap_or("");
+    let first = first.strip_prefix('\\').unwrap_or(first);
+    match first {
+        "" | "sudo" | "command" => it.next().unwrap_or(""),
+        t => t,
+    }
 }
 
 /// Start index of the visible window so `idx` stays on screen (centered when possible).
@@ -2211,6 +2267,99 @@ impl App {
         self.palette_close();
     }
 
+    /// Track the current command line from keystrokes sent to the shell (best-effort:
+    /// printable text appends, Backspace pops, Enter/^C/^U reset). Feeds the man panel.
+    fn track_input(&mut self, key: &Key, text: Option<&str>) {
+        match key {
+            Key::Named(NamedKey::Enter) => self.input_line.clear(),
+            Key::Named(NamedKey::Backspace) => {
+                self.input_line.pop();
+            }
+            _ => {
+                if let Some(t) = text {
+                    for c in t.chars() {
+                        match c {
+                            '\r' | '\n' | '\u{3}' | '\u{15}' => self.input_line.clear(), // Enter/^C/^U
+                            c if !c.is_control() => self.input_line.push(c),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open the man panel for the first token of the current command line, rendering
+    /// `man <cmd>` on a background thread (it spawns a process and can block).
+    fn man_open(&mut self) {
+        let cmd = first_command_token(&self.input_line).to_string();
+        self.man_on = true;
+        self.man_scroll = 0;
+        self.man_cmd = cmd.clone();
+        if cmd.is_empty() {
+            self.man_loading = false;
+            self.man_lines = vec!["Type a command, then press Ctrl+Shift+M for its man page.".into()];
+        } else {
+            self.man_loading = true;
+            self.man_lines.clear();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let lines = sampa_man::render(&cmd)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.lines().map(str::to_string).collect());
+                let _ = proxy.send_event(UserEvent::ManReady { cmd, lines });
+            });
+        }
+        self.request_redraw();
+    }
+
+    fn man_close(&mut self) {
+        self.man_on = false;
+        self.request_redraw();
+    }
+
+    /// Fill the panel when a background `man` render completes (ignored if the panel was
+    /// closed or a newer command was requested in the meantime).
+    fn man_ready(&mut self, cmd: String, lines: Option<Vec<String>>) {
+        if !self.man_on || cmd != self.man_cmd {
+            return;
+        }
+        self.man_loading = false;
+        self.man_scroll = 0;
+        self.man_lines =
+            lines.unwrap_or_else(|| vec![format!("No man page for '{cmd}'.")]);
+        self.request_redraw();
+    }
+
+    /// Scroll keys while the man panel owns input (Esc handled by the caller).
+    fn man_key(&mut self, key: &Key) {
+        let page = MAN_VISIBLE.saturating_sub(1).max(1);
+        match key {
+            Key::Named(NamedKey::Escape) => self.man_close(),
+            Key::Named(NamedKey::ArrowDown) => self.man_scroll_by(1, true),
+            Key::Named(NamedKey::ArrowUp) => self.man_scroll_by(1, false),
+            Key::Named(NamedKey::PageDown) => self.man_scroll_by(page, true),
+            Key::Named(NamedKey::PageUp) => self.man_scroll_by(page, false),
+            Key::Named(NamedKey::Home) => {
+                self.man_scroll = 0;
+                self.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
+    fn man_scroll_by(&mut self, delta: usize, down: bool) {
+        // Keep at least one line visible; the render clamps the window to what fits.
+        let max = self.man_lines.len().saturating_sub(1);
+        self.man_scroll = if down {
+            (self.man_scroll + delta).min(max)
+        } else {
+            self.man_scroll.saturating_sub(delta)
+        };
+        self.request_redraw();
+    }
+
     /// Apply VT-raised side effects on the main thread (§13): route query replies to
     /// the PTY, sanitize + set the window title, and gate OSC-52 clipboard writes.
     fn drain_app_events(&mut self) {
@@ -2326,8 +2475,34 @@ impl App {
             rows: &pal_rows,
             selected: pal_sel,
         });
+        // Man panel: slice the visible window of lines and build the header text.
+        let man_title;
+        let man_body;
+        let man = if self.man_on {
+            let (_, lh) = self.cell_metrics();
+            let win_h = self.window.as_ref().map(|w| w.inner_size().height as f32).unwrap_or(0.0);
+            let top = top_offset(self.sessions.len());
+            let avail = (win_h - top - (lh + 6.0) - 6.0).max(lh);
+            let visible = ((avail / lh).floor() as usize).clamp(1, MAN_VISIBLE);
+            let total = self.man_lines.len();
+            let start = self.man_scroll.min(total.saturating_sub(1));
+            let end = (start + visible).min(total);
+            man_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
+            man_title = if self.man_loading {
+                format!("man {} — loading…", self.man_cmd)
+            } else {
+                format!(
+                    "man {}   {}   ·  ↑/↓ PgUp/PgDn · Esc",
+                    self.man_cmd,
+                    if total > 0 { format!("{}–{}/{}", start + 1, end, total) } else { "0/0".into() }
+                )
+            };
+            Some(ManView { title: &man_title, body: &man_body })
+        } else {
+            None
+        };
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref());
+            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), man.as_ref());
         }
     }
 
@@ -2806,6 +2981,8 @@ struct Renderer {
     tab_buffers: Vec<Buffer>,     // one per tab-bar label, grown lazily
     search_buffer: Buffer,        // the search-bar text
     palette_buffers: Vec<Buffer>, // [0] = query line, [1..] = result rows
+    man_title_buffer: Buffer,     // man panel header
+    man_buffer: Buffer,           // man panel body (multi-line)
     quad_pipeline: wgpu::RenderPipeline,
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
@@ -2845,6 +3022,8 @@ impl Renderer {
         let cell_w = measure_cell_w(&mut font_system, font_size, line_h, &font_family);
         let buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let search_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+        let man_title_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+        let man_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quad"),
@@ -3003,6 +3182,8 @@ impl Renderer {
             tab_buffers: Vec::new(),
             search_buffer,
             palette_buffers: Vec::new(),
+            man_title_buffer,
+            man_buffer,
             quad_pipeline,
             quad_uniform,
             quad_bind_group,
@@ -3103,6 +3284,8 @@ impl Renderer {
         self.cell_w = measure_cell_w(&mut self.font_system, font_size, self.line_h, &self.font_family);
         self.buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.search_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.man_title_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.man_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         // Overlay row buffers carry the old line height — drop so they're rebuilt.
         self.tab_buffers.clear();
         self.palette_buffers.clear();
@@ -3249,11 +3432,21 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>) {
-        // The grid starts below the tab bar when it's shown (more than one tab), and
-        // the search bar overlays a strip at the bottom while open.
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, man: Option<&ManView>) {
+        // The grid starts below the tab bar when it's shown (more than one tab); the
+        // search bar and the man panel each overlay a strip/panel at the bottom.
         let top = top_offset(tabs.len());
-        let grid_bottom = if search.is_some() { (h as f32 - SEARCH_H).max(0.0) } else { h as f32 };
+        let man_header_h = self.line_h + 6.0;
+        let man_top = man
+            .map(|mv| {
+                let n = mv.body.lines().count().max(1) as f32;
+                (h as f32 - (man_header_h + n * self.line_h + 6.0)).max(top)
+            })
+            .unwrap_or(h as f32);
+        let grid_bottom = {
+            let sb = if search.is_some() { (h as f32 - SEARCH_H).max(0.0) } else { h as f32 };
+            sb.min(man_top)
+        };
         // The command palette drops down as a full-width panel below the tab bar.
         let pal_rowh = self.line_h + 6.0;
         let pal_top = top + 2.0;
@@ -3344,6 +3537,17 @@ impl Renderer {
             }
             bg_quads.push(QuadInstance { rect: [0.0, pal_bottom - 1.0, wf, 1.0], color: rule });
         }
+        // Man panel: an opaque bottom panel with a header strip + top rule.
+        if man.is_some() {
+            let panel = self.color4(blend(self.theme.bg, self.theme.fg, 0.07));
+            let header = self.color4(blend(self.theme.bg, self.theme.fg, 0.16));
+            let rule = self.color4(blend(self.theme.bg, self.theme.fg, 0.34));
+            let wf = w as f32;
+            bg_quads.push(QuadInstance { rect: [0.0, man_top, wf, h as f32 - man_top], color: panel });
+            bg_quads.push(QuadInstance { rect: [0.0, man_top, wf, man_header_h], color: header });
+            bg_quads.push(QuadInstance { rect: [0.0, man_top, wf, 1.0], color: rule });
+            bg_quads.push(QuadInstance { rect: [0.0, man_top + man_header_h, wf, 1.0], color: rule });
+        }
 
         // Foreground text as per-cell colored rich-text spans.
         let base = Attrs::new().family(family_of(&self.font_family));
@@ -3394,6 +3598,29 @@ impl Renderer {
             self.search_buffer.set_rich_text([(text, attrs)], &Attrs::new(), Shaping::Advanced, None);
             self.search_buffer.shape_until_scroll(&mut self.font_system, false);
         }
+        if let Some(mv) = man {
+            let fam = family_of(&self.font_family);
+            let fg = self.theme.fg;
+            let hi = self.theme.cursor;
+            let width = (w as f32 - 2.0 * PAD).max(1.0);
+            let body_h = (h as f32 - man_top - man_header_h).max(self.line_h);
+            self.man_title_buffer.set_size(Some(width), Some(man_header_h));
+            self.man_title_buffer.set_rich_text(
+                [(mv.title, Attrs::new().family(fam).color(Color::rgb(hi[0], hi[1], hi[2])))],
+                &Attrs::new(),
+                Shaping::Advanced,
+                None,
+            );
+            self.man_title_buffer.shape_until_scroll(&mut self.font_system, false);
+            self.man_buffer.set_size(Some(width), Some(body_h));
+            self.man_buffer.set_rich_text(
+                [(mv.body, Attrs::new().family(fam).color(Color::rgb(fg[0], fg[1], fg[2])))],
+                &Attrs::new(),
+                Shaping::Advanced,
+                None,
+            );
+            self.man_buffer.shape_until_scroll(&mut self.font_system, false);
+        }
 
         self.viewport
             .update(&self.queue, Resolution { width: w, height: h });
@@ -3416,6 +3643,29 @@ impl Renderer {
                 scale: 1.0,
                 bounds: TextBounds { left: 0, top: grid_bottom as i32, right: w as i32, bottom: h as i32 },
                 default_color: Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]),
+                custom_glyphs: &[],
+            });
+        }
+        if man.is_some() {
+            let fg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
+            let title_top = man_top + ((man_header_h - self.line_h) / 2.0).max(0.0);
+            text_areas.push(TextArea {
+                buffer: &self.man_title_buffer,
+                left: PAD,
+                top: title_top,
+                scale: 1.0,
+                bounds: TextBounds { left: 0, top: man_top as i32, right: w as i32, bottom: (man_top + man_header_h) as i32 },
+                default_color: fg,
+                custom_glyphs: &[],
+            });
+            let body_top = man_top + man_header_h + 2.0;
+            text_areas.push(TextArea {
+                buffer: &self.man_buffer,
+                left: PAD,
+                top: body_top,
+                scale: 1.0,
+                bounds: TextBounds { left: 0, top: body_top as i32, right: w as i32, bottom: h as i32 },
+                default_color: fg,
                 custom_glyphs: &[],
             });
         }
@@ -3623,7 +3873,8 @@ impl Gfx {
         self.surface.configure(&self.r.device, &self.config);
     }
 
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>) {
+    #[allow(clippy::too_many_arguments)]
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, man: Option<&ManView>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -3640,6 +3891,7 @@ impl Gfx {
             active,
             search,
             palette,
+            man,
         );
         self.r.queue.present(frame);
     }
@@ -3730,9 +3982,20 @@ fn capture(path: &str) -> Result<()> {
     } else {
         (r.line_h + 6.0) * demo_pal.len() as f32 + 12.0
     };
+    // Optional man-panel demo: SAMPA_CAPTURE_MAN="cmd|line1|line2|..." (| separates lines).
+    let demo_man: Vec<String> = std::env::var("SAMPA_CAPTURE_MAN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split('|').map(str::to_string).collect())
+        .unwrap_or_default();
+    let man_extra = if demo_man.is_empty() {
+        0.0
+    } else {
+        (r.line_h + 6.0) + (demo_man.len().saturating_sub(1)) as f32 * r.line_h + 12.0
+    };
 
     let w = (PAD * 2.0 + cols as f32 * r.cell_w).ceil() as u32;
-    let h = (top + PAD + rows as f32 * r.line_h + pal_extra).ceil() as u32;
+    let h = (top + PAD + rows as f32 * r.line_h + pal_extra + man_extra).ceil() as u32;
 
     let tex = r.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("capture"),
@@ -3757,6 +4020,15 @@ fn capture(path: &str) -> Result<()> {
         rows: &demo_matches,
         selected: 0,
     });
+    let man_title;
+    let man_body;
+    let demo_manview = if demo_man.is_empty() {
+        None
+    } else {
+        man_title = format!("man {}   1–{}/{}   ·  ↑/↓ PgUp/PgDn · Esc", demo_man[0], demo_man.len() - 1, demo_man.len() - 1);
+        man_body = demo_man[1..].join("\n");
+        Some(ManView { title: &man_title, body: &man_body })
+    };
     r.paint(
         &snap,
         &view,
@@ -3766,6 +4038,7 @@ fn capture(path: &str) -> Result<()> {
         1.min(demo_tabs.len().saturating_sub(1)),
         demo_search.as_deref(),
         demo_palette.as_ref(),
+        demo_manview.as_ref(),
     );
 
     let bpr = (w * 4).div_ceil(256) * 256; // 256-byte row alignment
@@ -3945,6 +4218,17 @@ mod tests {
         assert!(empty.iter().all(|m| m.hits.is_empty()));
         // Case-insensitive.
         assert_eq!(filter_commands(&all, "GREP", PALETTE_MAX)[0].name, "grep");
+    }
+
+    #[test]
+    fn man_command_token() {
+        assert_eq!(first_command_token("grep -rn foo"), "grep");
+        assert_eq!(first_command_token("  ls  "), "ls");
+        assert_eq!(first_command_token("sudo apt update"), "apt"); // skip sudo
+        assert_eq!(first_command_token("command ls"), "ls");
+        assert_eq!(first_command_token("\\ls -a"), "ls"); // skip a leading backslash escape
+        assert_eq!(first_command_token(""), "");
+        assert_eq!(first_command_token("sudo"), ""); // sudo with nothing after
     }
 
     #[test]
