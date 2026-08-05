@@ -191,7 +191,7 @@ renders; tabs run independent shells; search highlights scrollback matches.
 **Exit:** a clean-VM `.deb` install launches, registers as a terminal alternative,
 runs the host shell; AppImage runs with no install; WM_CLASS verified via `xprop`.
 
-### N4 — Signature features, natively drawn (§10) 🔨
+### N4 — Signature features, natively drawn (§10) ✅  *(palette · man · preview all shipped)*
 Services already exist; only the UI is new. Draw panels/overlays in the wgpu scene.
 
 - ✅ **Palette** (`sampa-palette`): `Ctrl+Shift+P` opens a full-width dropdown below
@@ -217,8 +217,17 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
   unit-tested; rendered + verified via `--capture` (`sampa-man`'s own sanitize/validate
   tests carry over). ⬜ still: OSC-133 prompt-boundary reset (opt-in shell hooks),
   auto-show on debounce, in-panel search.
-- **Preview panel** (`sampa-preview`): the authoritative gate is untouched; debounce
-  ~550 ms, **clear on Enter**. Re-assert the filesystem-verified `rm`-is-refused test.
+- ✅ **Preview panel** (`sampa-preview`): `Ctrl+Shift+E` toggles a live bottom panel that
+  **safely auto-runs** the current command as you type. Keystrokes debounce **550 ms**;
+  only the settled line runs (a `preview_gen` token supersedes stale requests), off the
+  UI thread. `sampa_preview::run_preview` is the **authoritative, untouched gate** —
+  it refuses anything that can write/chain/redirect/substitute and runs the survivor in
+  a throwaway zsh (cwd = the session's `/proc/<pid>/cwd`, stdin closed, 2 s timeout, 64 KB
+  cap). Output shows in the panel; a rejection shows its reason in the header; an empty
+  line (**after Enter**) clears it. **Re-asserted filesystem-verified**: a native
+  integration test drives the exact `run_preview` call on `rm`/`mv`/redirect/`find -delete`/
+  `&&`-chains and proves the victim file is byte-for-byte untouched while `cat` runs.
+  ⬜ still: scroll, OSC-133 prompt-boundary reset for exact command capture.
 - OSC 7/133 already handled by `sampa-shellint`; ship the opt-in zsh/bash hooks.
 
 **Exit (§17):** palette inserts (not runs); man opens/closes correctly; preview
