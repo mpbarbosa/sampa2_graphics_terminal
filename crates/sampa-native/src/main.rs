@@ -40,6 +40,7 @@ use glyphon::{
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 use pty_core::pty::{spawn, PtyEvent, PtyHandle, SpawnConfig};
+use sampa_config::CursorStyle;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -85,11 +86,22 @@ struct Theme {
     fg: [u8; 3],
     bg: [u8; 3],
     selection: [u8; 3],
+    cursor: [u8; 3],
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme { fg: DEFAULT_FG, bg: DEFAULT_BG, selection: SELECTION_BG }
+        Theme { fg: DEFAULT_FG, bg: DEFAULT_BG, selection: SELECTION_BG, cursor: DEFAULT_FG }
+    }
+}
+
+/// Build the render Theme from config colors.
+fn theme_from(c: &sampa_config::Colors) -> Theme {
+    Theme {
+        fg: parse_hex(&c.foreground).unwrap_or(DEFAULT_FG),
+        bg: parse_hex(&c.background).unwrap_or(DEFAULT_BG),
+        selection: parse_hex(&c.selection).unwrap_or(SELECTION_BG),
+        cursor: parse_hex(&c.cursor).unwrap_or(DEFAULT_FG),
     }
 }
 
@@ -179,6 +191,7 @@ struct Snapshot {
     rows: usize,
     offset: i32, // display_offset: image at absolute line L shows at row L + offset
     cells: Vec<CellVis>, // row-major, len == cols * rows
+    cursor: Option<(usize, usize)>, // (row, col) for bar/underline cursors (block inverts the cell)
 }
 
 impl Snapshot {
@@ -886,6 +899,7 @@ enum UserEvent {
     Redraw,
     Exit(String),
     ConfigReload,
+    CursorBlink,
 }
 
 fn main() -> Result<()> {
@@ -934,13 +948,11 @@ fn main() -> Result<()> {
     // Load config (default path if present, else built-in defaults) — drives fonts,
     // colors, and scrollback (§11).
     let cfg = load_config();
-    let theme = Theme {
-        fg: parse_hex(&cfg.colors.foreground).unwrap_or(DEFAULT_FG),
-        bg: parse_hex(&cfg.colors.background).unwrap_or(DEFAULT_BG),
-        selection: parse_hex(&cfg.colors.selection).unwrap_or(SELECTION_BG),
-    };
+    let theme = theme_from(&cfg.colors);
     let font_size = cfg.font.size.clamp(6.0, 72.0);
     let font_family = primary_family(&cfg.font.family);
+    let cursor_style = cfg.cursor.style;
+    let blink = cfg.cursor.blink;
 
     let (cols, rows) = (80u16, 24u16);
     let (app_tx, app_rx) = channel();
@@ -1000,6 +1012,17 @@ fn main() -> Result<()> {
         });
     }
 
+    // Cursor blink tick (~530ms). Always runs; App ignores it when blink is off.
+    {
+        let blink_proxy = proxy.clone();
+        thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(530));
+            if blink_proxy.send_event(UserEvent::CursorBlink).is_err() {
+                break;
+            }
+        });
+    }
+
     thread::spawn({
         let (state, pty, images) = (Arc::clone(&state), Arc::clone(&pty), Arc::clone(&images));
         move || pump(rx, state, proxy, reply_rx, pty, images)
@@ -1028,6 +1051,9 @@ fn main() -> Result<()> {
         theme,
         font_size,
         font_family,
+        cursor_style,
+        cursor_on: true,
+        blink,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -1196,6 +1222,9 @@ struct App {
     theme: Theme,
     font_size: f32,
     font_family: String,
+    cursor_style: CursorStyle,
+    cursor_on: bool,
+    blink: bool,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -1211,6 +1240,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.theme,
             self.font_size,
             self.font_family.clone(),
+            self.cursor_style,
         ));
         self.window = Some(window);
         self.gfx = Some(gfx);
@@ -1237,6 +1267,12 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
             }
             UserEvent::ConfigReload => self.reload_config(),
+            UserEvent::CursorBlink => {
+                if self.blink {
+                    self.cursor_on = !self.cursor_on;
+                    self.request_redraw();
+                }
+            }
         }
     }
 
@@ -1300,6 +1336,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if !bytes.is_empty() {
                     self.pty_write(&bytes);
                     self.scroll(Scroll::Bottom); // typing snaps to the live prompt
+                    self.cursor_on = true; // show the cursor on activity
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position.x, position.y),
@@ -1581,13 +1618,14 @@ impl App {
     /// size). Scrollback size stays as at launch (needs a fresh Term).
     fn reload_config(&mut self) {
         let cfg = load_config();
-        self.theme = Theme {
-            fg: parse_hex(&cfg.colors.foreground).unwrap_or(DEFAULT_FG),
-            bg: parse_hex(&cfg.colors.background).unwrap_or(DEFAULT_BG),
-            selection: parse_hex(&cfg.colors.selection).unwrap_or(SELECTION_BG),
-        };
+        self.theme = theme_from(&cfg.colors);
         self.font_size = cfg.font.size.clamp(6.0, 72.0);
         self.font_family = primary_family(&cfg.font.family);
+        self.cursor_style = cfg.cursor.style;
+        self.blink = cfg.cursor.blink;
+        if !self.blink {
+            self.cursor_on = true;
+        }
         if std::env::var_os("SAMPA_DEBUG").is_some() {
             eprintln!(
                 "config reloaded: size={} family={:?} bg={:?}",
@@ -1600,7 +1638,12 @@ impl App {
             g.parser.advance(&mut g.term, &color_setup(&cfg.colors));
         }
         if let Some(gfx) = &mut self.gfx {
-            gfx.r.apply_config(self.theme, self.font_size, self.font_family.clone());
+            gfx.r.apply_config(
+                self.theme,
+                self.font_size,
+                self.font_family.clone(),
+                self.cursor_style,
+            );
         }
         // New cell metrics → recompute grid geometry and resize the term/PTY.
         if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
@@ -1611,7 +1654,7 @@ impl App {
 
     fn render_now(&mut self) {
         let snap = match self.state.lock() {
-            Ok(g) => build_snapshot(&g.term, &self.theme),
+            Ok(g) => build_snapshot(&g.term, &self.theme, self.cursor_style, self.cursor_on),
             Err(_) => return,
         };
         if !self.dumped && std::env::var_os("SAMPA_DUMP_GRID").is_some() {
@@ -1795,8 +1838,15 @@ fn mouse_report(
     }
 }
 
-/// Extract the visible grid + attributes + cursor into a `Snapshot`.
-fn build_snapshot<L: EventListener>(term: &Term<L>, theme: &Theme) -> Snapshot {
+/// Extract the visible grid + attributes + cursor into a `Snapshot`. A **block** cursor
+/// inverts its cell here; **bar/underline** cursors are recorded in `cursor` for the
+/// renderer to draw a thin quad (and `cursor_on` lets blink hide it).
+fn build_snapshot<L: EventListener>(
+    term: &Term<L>,
+    theme: &Theme,
+    cursor_style: CursorStyle,
+    cursor_on: bool,
+) -> Snapshot {
     let content = term.renderable_content();
     let colors = content.colors;
     let cursor = content.cursor;
@@ -1808,26 +1858,32 @@ fn build_snapshot<L: EventListener>(term: &Term<L>, theme: &Theme) -> Snapshot {
     // Absolute-line coordinates: 0.. is the active screen, negatives are scrollback.
     // Display row r shows absolute line `r - display_offset`.
     let offset = grid.display_offset() as i32;
-    let cursor_abs = (!matches!(cursor.shape, CursorShape::Hidden))
-        .then_some((cursor.point.line.0, cursor.point.column.0));
+    let visible = cursor_on && !matches!(cursor.shape, CursorShape::Hidden);
+    let cursor_abs = visible.then_some((cursor.point.line.0, cursor.point.column.0));
+    let block = matches!(cursor_style, CursorStyle::Block);
 
     let mut cells = Vec::with_capacity(rows * cols);
+    let mut cursor_cell = None;
     for r in 0..rows {
         let abs = r as i32 - offset;
         for c in 0..cols {
+            let is_cursor = cursor_abs == Some((abs, c));
+            if is_cursor && !block {
+                cursor_cell = Some((r, c)); // bar/underline: drawn by the renderer
+            }
             let selected = selection
                 .as_ref()
                 .is_some_and(|range| in_selection(range, abs, c));
             cells.push(cell_vis(
                 &grid[Line(abs)][Column(c)],
                 colors,
-                cursor_abs == Some((abs, c)),
+                is_cursor && block, // only the block cursor inverts the cell
                 selected,
                 theme.selection,
             ));
         }
     }
-    Snapshot { cols, rows, offset, cells }
+    Snapshot { cols, rows, offset, cells, cursor: cursor_cell }
 }
 
 /// Whether grid cell (line, col) falls inside a selection range.
@@ -2100,6 +2156,7 @@ struct Renderer {
     images: Arc<Mutex<ImageStore>>,
     theme: Theme,
     font_family: String,
+    cursor_style: CursorStyle,
 }
 
 impl Renderer {
@@ -2111,6 +2168,7 @@ impl Renderer {
         theme: Theme,
         font_size: f32,
         font_family: String,
+        cursor_style: CursorStyle,
     ) -> Self {
         let srgb = format.is_srgb();
         let line_h = (font_size * 1.2).ceil();
@@ -2290,6 +2348,7 @@ impl Renderer {
             images,
             theme,
             font_family,
+            cursor_style,
         }
     }
 
@@ -2365,9 +2424,16 @@ impl Renderer {
 
     /// Re-apply theme + font at runtime (live config reload). Re-measures the cell
     /// advance and rebuilds the text buffer for the new metrics.
-    fn apply_config(&mut self, theme: Theme, font_size: f32, font_family: String) {
+    fn apply_config(
+        &mut self,
+        theme: Theme,
+        font_size: f32,
+        font_family: String,
+        cursor_style: CursorStyle,
+    ) {
         self.theme = theme;
         self.font_family = font_family;
+        self.cursor_style = cursor_style;
         self.line_h = (font_size * 1.2).ceil();
         self.cell_w = measure_cell_w(&mut self.font_system, font_size, self.line_h, &self.font_family);
         self.buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
@@ -2420,6 +2486,18 @@ impl Renderer {
                         color: self.color4(cell.fg),
                     });
                 }
+            }
+        }
+        // Bar/underline cursor (block inverts its cell in build_snapshot).
+        if let Some((r, c)) = snap.cursor {
+            let (x, y) = (PAD + c as f32 * self.cell_w, PAD + r as f32 * self.line_h);
+            let rect = match self.cursor_style {
+                CursorStyle::Bar => Some([x, y, 2.0, self.line_h]),
+                CursorStyle::Underline => Some([x, y + self.line_h - 2.0, self.cell_w, 2.0]),
+                CursorStyle::Block => None,
+            };
+            if let Some(rect) = rect {
+                deco_quads.push(QuadInstance { rect, color: self.color4(self.theme.cursor) });
             }
         }
 
@@ -2587,6 +2665,7 @@ impl Gfx {
         theme: Theme,
         font_size: f32,
         font_family: String,
+        cursor_style: CursorStyle,
     ) -> Self {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
@@ -2613,7 +2692,9 @@ impl Gfx {
         Gfx {
             surface,
             config,
-            r: Renderer::new(device, queue, format, images, theme, font_size, font_family),
+            r: Renderer::new(
+                device, queue, format, images, theme, font_size, font_family, cursor_style,
+            ),
         }
     }
 
@@ -2643,11 +2724,7 @@ fn capture(path: &str) -> Result<()> {
     let (cols, rows) = (64usize, 8usize);
     // Config-aware so the capture reflects the active theme/font (CI screenshot).
     let cfg = load_config();
-    let theme = Theme {
-        fg: parse_hex(&cfg.colors.foreground).unwrap_or(DEFAULT_FG),
-        bg: parse_hex(&cfg.colors.background).unwrap_or(DEFAULT_BG),
-        selection: parse_hex(&cfg.colors.selection).unwrap_or(SELECTION_BG),
-    };
+    let theme = theme_from(&cfg.colors);
 
     let mut parser: Processor = Processor::new();
     let mut term = Term::new(TermConfig::default(), &TermSize::new(cols, rows), VoidListener);
@@ -2661,7 +2738,7 @@ fn capture(path: &str) -> Result<()> {
     );
     sel.update(Point::new(Line(0), Column(15)), Side::Right);
     term.selection = Some(sel);
-    let snap = build_snapshot(&term, &theme);
+    let snap = build_snapshot(&term, &theme, cfg.cursor.style, true);
 
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -2703,6 +2780,7 @@ fn capture(path: &str) -> Result<()> {
         theme,
         cfg.font.size.clamp(6.0, 72.0),
         primary_family(&cfg.font.family),
+        cfg.cursor.style,
     );
 
     let w = (PAD * 2.0 + cols as f32 * r.cell_w).ceil() as u32;
@@ -2829,6 +2907,21 @@ mod tests {
         let curs = cell_vis(&term.grid()[Line(0)][Column(0)], colors, true, false, SELECTION_BG);
         assert_eq!(curs.fg, plain.bg);
         assert_eq!(curs.bg, plain.fg);
+    }
+
+    #[test]
+    fn cursor_style_and_blink_in_snapshot() {
+        let (mut term, _r, _a) = proxy_term(10, 2);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"X");
+        // Block draws by inverting the cell (not recorded); bar/underline are recorded.
+        let block = build_snapshot(&term, &Theme::default(), CursorStyle::Block, true);
+        assert!(block.cursor.is_none());
+        let bar = build_snapshot(&term, &Theme::default(), CursorStyle::Bar, true);
+        assert!(bar.cursor.is_some());
+        // blink off (cursor_on=false) hides the cursor entirely.
+        let off = build_snapshot(&term, &Theme::default(), CursorStyle::Underline, false);
+        assert!(off.cursor.is_none());
     }
 
     #[test]
@@ -3018,11 +3111,11 @@ mod tests {
         for i in 0..8 {
             parser.advance(&mut term, format!("L{i}\r\n").as_bytes());
         }
-        let bottom = build_snapshot(&term, &Theme::default()).to_text();
+        let bottom = build_snapshot(&term, &Theme::default(), CursorStyle::Block, true).to_text();
         assert!(bottom.contains("L7"), "bottom view: {bottom:?}");
         // Scroll up into history; the bottom line should no longer be the newest.
         term.scroll_display(Scroll::Delta(3));
-        let scrolled = build_snapshot(&term, &Theme::default()).to_text();
+        let scrolled = build_snapshot(&term, &Theme::default(), CursorStyle::Block, true).to_text();
         assert_ne!(bottom, scrolled, "view should change after scrolling up");
         assert!(scrolled.contains("L4"), "scrolled view: {scrolled:?}");
     }
@@ -3392,7 +3485,7 @@ mod tests {
                 }
             }
             let _ = pty.kill();
-            build_snapshot(&term, &Theme::default()).to_text()
+            build_snapshot(&term, &Theme::default(), CursorStyle::Block, true).to_text()
         }
 
         // (name, cmd, args, input, wait_ms, any-of expected markers)
