@@ -897,9 +897,21 @@ struct TermState {
 #[derive(Debug, Clone)]
 enum UserEvent {
     Redraw,
-    Exit(String),
+    SessionExit { id: u64, detail: String },
     ConfigReload,
     CursorBlink,
+}
+
+/// One terminal tab: its VT state, PTY, image layer, and per-tab UI-event channel.
+/// `App` keeps Arc-clones of the active session's `state`/`pty`/`images` so existing
+/// call sites stay unchanged; those are re-pointed on switch.
+struct Session {
+    id: u64,
+    state: Arc<Mutex<TermState>>,
+    pty: Arc<Mutex<PtyHandle>>,
+    images: Arc<Mutex<ImageStore>>,
+    app_rx: Receiver<AppEvent>,
+    title: String,
 }
 
 fn main() -> Result<()> {
@@ -955,43 +967,15 @@ fn main() -> Result<()> {
     let blink = cfg.cursor.blink;
 
     let (cols, rows) = (80u16, 24u16);
-    let (app_tx, app_rx) = channel();
-    let (reply_tx, reply_rx) = channel::<Reply>();
-    let mut parser = Processor::new();
-    let mut term = Term::new(
-        alacritty_terminal::term::Config {
-            scrolling_history: cfg.scrollback.lines as usize,
-            ..TermConfig::default()
-        },
-        &TermSize::new(cols as usize, rows as usize),
-        EventProxy { reply_tx, app_tx },
-    );
-    // Load the color palette into the VT color table so `resolve` returns themed colors.
-    parser.advance(&mut term, &color_setup(&cfg.colors));
-    let state = Arc::new(Mutex::new(TermState {
-        parser,
-        term,
-        decrqcra: DecrqcraScanner::new(),
-        image_scanner: ImageScanner::new(),
-        dcs: DcsScanner::new(),
-    }));
-    let images = Arc::new(Mutex::new(ImageStore::default()));
-
-    let (tx, rx) = channel();
-    let pty = Arc::new(Mutex::new(spawn(
-        SpawnConfig {
-            shell,
-            args: shell_args,
-            cwd,
-            cols,
-            rows,
-            env: vec![],
-        },
-        tx,
-    )?));
-
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+
+    // The first tab, from the CLI shell/args/cwd. Its pump thread starts inside.
+    let session = spawn_session(0, &proxy, cols, rows, &cfg, shell, shell_args, cwd)?;
+    let state = Arc::clone(&session.state);
+    let pty = Arc::clone(&session.pty);
+    let images = Arc::clone(&session.images);
+    let sessions = vec![session];
 
     // Watch the config file (mtime poll) and wake the loop on change → live reload.
     if let Some(path) = sampa_config::default_config_path() {
@@ -1023,13 +1007,12 @@ fn main() -> Result<()> {
         });
     }
 
-    thread::spawn({
-        let (state, pty, images) = (Arc::clone(&state), Arc::clone(&pty), Arc::clone(&images));
-        move || pump(rx, state, proxy, reply_rx, pty, images)
-    });
-
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
+        sessions,
+        active: 0,
+        next_id: 1,
+        proxy,
         state,
         pty,
         cols,
@@ -1044,7 +1027,6 @@ fn main() -> Result<()> {
         last_click: None,
         click_count: 0,
         clipboard: arboard::Clipboard::new().ok(),
-        app_rx,
         osc52_allow: std::env::var("SAMPA_OSC52").map(|v| v == "allow").unwrap_or(false),
         title: win_title,
         images,
@@ -1059,6 +1041,52 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Create a tab: channels, VT state (with config palette + scrollback), PTY, image
+/// layer, and a per-session reader→VT pump thread. Returns the `Session` handle.
+#[allow(clippy::too_many_arguments)]
+fn spawn_session(
+    id: u64,
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    cols: u16,
+    rows: u16,
+    cfg: &sampa_config::Config,
+    shell: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+) -> Result<Session> {
+    let (app_tx, app_rx) = channel();
+    let (reply_tx, reply_rx) = channel::<Reply>();
+    let mut parser = Processor::new();
+    let mut term = Term::new(
+        alacritty_terminal::term::Config {
+            scrolling_history: cfg.scrollback.lines as usize,
+            ..TermConfig::default()
+        },
+        &TermSize::new(cols as usize, rows as usize),
+        EventProxy { reply_tx, app_tx },
+    );
+    parser.advance(&mut term, &color_setup(&cfg.colors));
+    let state = Arc::new(Mutex::new(TermState {
+        parser,
+        term,
+        decrqcra: DecrqcraScanner::new(),
+        image_scanner: ImageScanner::new(),
+        dcs: DcsScanner::new(),
+    }));
+    let images = Arc::new(Mutex::new(ImageStore::default()));
+    let (tx, rx) = channel();
+    let pty = Arc::new(Mutex::new(spawn(
+        SpawnConfig { shell, args, cwd, cols, rows, env: vec![] },
+        tx,
+    )?));
+    thread::spawn({
+        let (state, pty, images, proxy) =
+            (Arc::clone(&state), Arc::clone(&pty), Arc::clone(&images), proxy.clone());
+        move || pump(rx, state, proxy, reply_rx, pty, images, id)
+    });
+    Ok(Session { id, state, pty, images, app_rx, title: "shell".to_string() })
+}
+
 fn pump(
     rx: Receiver<PtyEvent>,
     state: Arc<Mutex<TermState>>,
@@ -1066,6 +1094,7 @@ fn pump(
     reply_rx: Receiver<Reply>,
     pty: Arc<Mutex<PtyHandle>>,
     image_store: Arc<Mutex<ImageStore>>,
+    id: u64,
 ) {
     for ev in rx {
         match ev {
@@ -1192,7 +1221,7 @@ fn pump(
                 let _ = proxy.send_event(UserEvent::Redraw);
             }
             PtyEvent::Exit(info) => {
-                let _ = proxy.send_event(UserEvent::Exit(info.detail));
+                let _ = proxy.send_event(UserEvent::SessionExit { id, detail: info.detail });
                 break;
             }
         }
@@ -1200,6 +1229,12 @@ fn pump(
 }
 
 struct App {
+    sessions: Vec<Session>,
+    active: usize,
+    next_id: u64,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    // Active-session pointers (Arc-clones re-pointed on switch) so existing call sites
+    // (`self.state` / `self.pty` / `self.images`) keep working.
     state: Arc<Mutex<TermState>>,
     pty: Arc<Mutex<PtyHandle>>,
     cols: u16,
@@ -1215,7 +1250,6 @@ struct App {
     last_click: Option<(std::time::Instant, usize, usize)>,
     click_count: u8,
     clipboard: Option<arboard::Clipboard>,
-    app_rx: Receiver<AppEvent>,
     osc52_allow: bool,
     title: String,
     images: Arc<Mutex<ImageStore>>,
@@ -1259,12 +1293,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.drain_app_events();
                 self.request_redraw();
             }
-            UserEvent::Exit(detail) => {
-                if let Some(w) = &self.window {
-                    w.set_title(&format!("Sampa (native) — [{detail}]"));
+            UserEvent::SessionExit { id, detail } => {
+                let _ = detail; // (v1: close the tab; --hold could keep it open)
+                if let Some(idx) = self.sessions.iter().position(|s| s.id == id) {
+                    if self.close_session(idx) {
+                        event_loop.exit(); // last tab closed
+                    }
                 }
-                self.request_redraw();
-                event_loop.exit();
             }
             UserEvent::ConfigReload => self.reload_config(),
             UserEvent::CursorBlink => {
@@ -1279,7 +1314,11 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                if let Ok(mut p) = self.pty.lock() { let _ = p.kill(); }
+                for s in &self.sessions {
+                    if let Ok(mut p) = s.pty.lock() {
+                        let _ = p.kill();
+                    }
+                }
                 event_loop.exit();
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
@@ -1304,7 +1343,20 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                 }
-                // App keybindings (Ctrl+Shift+C/V) never reach the PTY.
+                // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs.
+                if m.control_key() && matches!(event.logical_key, Key::Named(NamedKey::Tab)) {
+                    let n = self.sessions.len();
+                    if n > 1 {
+                        let next = if m.shift_key() {
+                            (self.active + n - 1) % n
+                        } else {
+                            (self.active + 1) % n
+                        };
+                        self.switch_to(next);
+                    }
+                    return;
+                }
+                // App keybindings (Ctrl+Shift+C/V, Ctrl+Shift+T/W) never reach the PTY.
                 if m.control_key() && m.shift_key() {
                     if let Key::Character(s) = &event.logical_key {
                         match s.to_lowercase().as_str() {
@@ -1314,6 +1366,16 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             "v" => {
                                 self.paste_clipboard();
+                                return;
+                            }
+                            "t" => {
+                                self.new_tab();
+                                return;
+                            }
+                            "w" => {
+                                if self.close_session(self.active) {
+                                    event_loop.exit();
+                                }
                                 return;
                             }
                             _ => {}
@@ -1346,6 +1408,16 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => self.on_mouse_wheel(delta),
             _ => {}
         }
+    }
+}
+
+/// Which tab becomes active after removing tab `closed` (with `remaining` ≥ 1 left):
+/// shift down if the closed tab was before it, else clamp to the new last.
+fn active_after_close(active: usize, closed: usize, remaining: usize) -> usize {
+    if closed < active {
+        active - 1
+    } else {
+        active.min(remaining - 1)
     }
 }
 
@@ -1558,10 +1630,15 @@ impl App {
         if cols != self.cols || rows != self.rows {
             self.cols = cols;
             self.rows = rows;
-            if let Ok(mut g) = self.state.lock() {
-                g.term.resize(TermSize::new(cols as usize, rows as usize));
+            // Resize every tab so switching never needs a reflow.
+            for s in &self.sessions {
+                if let Ok(mut g) = s.state.lock() {
+                    g.term.resize(TermSize::new(cols as usize, rows as usize));
+                }
+                if let Ok(p) = s.pty.lock() {
+                    let _ = p.resize(cols, rows, w as u16, h as u16);
+                }
             }
-            if let Ok(p) = self.pty.lock() { let _ = p.resize(cols, rows, w as u16, h as u16); }
         }
     }
 
@@ -1577,26 +1654,91 @@ impl App {
         }
     }
 
+    /// Window title reflects the active tab (with `[i/n]` when there's more than one).
+    fn update_title(&self) {
+        if let (Some(w), Some(s)) = (&self.window, self.sessions.get(self.active)) {
+            let t = if self.sessions.len() > 1 {
+                format!("{} [{}/{}]", s.title, self.active + 1, self.sessions.len())
+            } else {
+                s.title.clone()
+            };
+            w.set_title(&t);
+        }
+    }
+
+    /// Make tab `i` active: re-point the active-session Arcs, swap the renderer's image
+    /// layer, and repaint.
+    fn switch_to(&mut self, i: usize) {
+        let Some(s) = self.sessions.get(i) else { return };
+        self.active = i;
+        self.state = Arc::clone(&s.state);
+        self.pty = Arc::clone(&s.pty);
+        self.images = Arc::clone(&s.images);
+        if let Some(gfx) = &mut self.gfx {
+            gfx.r.set_images(Arc::clone(&self.images));
+        }
+        self.cursor_on = true;
+        self.update_title();
+        self.request_redraw();
+    }
+
+    /// Open a new tab running `$SHELL` at the current grid size, and switch to it.
+    fn new_tab(&mut self) {
+        let cfg = load_config();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        match spawn_session(self.next_id, &self.proxy, self.cols, self.rows, &cfg, shell, vec![], None) {
+            Ok(session) => {
+                self.next_id += 1;
+                self.sessions.push(session);
+                self.switch_to(self.sessions.len() - 1);
+            }
+            Err(e) => eprintln!("new tab: {e}"),
+        }
+    }
+
+    /// Close tab `idx` (reaps its shell). Returns true when no tabs remain.
+    fn close_session(&mut self, idx: usize) -> bool {
+        if idx >= self.sessions.len() {
+            return self.sessions.is_empty();
+        }
+        if let Ok(mut p) = self.sessions[idx].pty.lock() {
+            let _ = p.kill();
+        }
+        self.sessions.remove(idx);
+        if self.sessions.is_empty() {
+            return true;
+        }
+        self.switch_to(active_after_close(self.active, idx, self.sessions.len()));
+        false
+    }
+
     /// Apply VT-raised side effects on the main thread (§13): route query replies to
     /// the PTY, sanitize + set the window title, and gate OSC-52 clipboard writes.
     fn drain_app_events(&mut self) {
-        while let Ok(ev) = self.app_rx.try_recv() {
-            match ev {
-                AppEvent::Title(s) => {
-                    if let Some(w) = &self.window {
-                        w.set_title(&sanitize_title(&s));
+        // Drain every tab's UI events (title updates per-tab; window title tracks the
+        // active one). Collect first to avoid borrow conflicts with self.clipboard.
+        let mut retitle = false;
+        let mut stores: Vec<String> = Vec::new();
+        for i in 0..self.sessions.len() {
+            while let Ok(ev) = self.sessions[i].app_rx.try_recv() {
+                match ev {
+                    AppEvent::Title(s) => {
+                        self.sessions[i].title = sanitize_title(&s);
+                        retitle |= i == self.active;
                     }
-                }
-                AppEvent::ClipboardStore(s) => {
                     // OSC-52 write gate: denied by default (SAMPA_OSC52=allow to permit).
-                    if self.osc52_allow {
-                        if let Some(clip) = self.clipboard.as_mut() {
-                            let _ = clip.set_text(s);
-                        }
-                    }
+                    AppEvent::ClipboardStore(s) if self.osc52_allow => stores.push(s),
+                    AppEvent::ClipboardStore(_) | AppEvent::Bell => {}
                 }
-                AppEvent::Bell => {}
             }
+        }
+        if let Some(clip) = self.clipboard.as_mut() {
+            for s in stores {
+                let _ = clip.set_text(s);
+            }
+        }
+        if retitle {
+            self.update_title();
         }
     }
 
@@ -2439,6 +2581,13 @@ impl Renderer {
         self.buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
     }
 
+    /// Point the renderer at a different tab's image layer (on tab switch); drop the
+    /// previous tab's GPU textures (re-uploaded lazily on the next paint).
+    fn set_images(&mut self, images: Arc<Mutex<ImageStore>>) {
+        self.image_textures.clear();
+        self.images = images;
+    }
+
     fn chan(&self, v: u8) -> f32 {
         let n = v as f32 / 255.0;
         if self.srgb {
@@ -2907,6 +3056,15 @@ mod tests {
         let curs = cell_vis(&term.grid()[Line(0)][Column(0)], colors, true, false, SELECTION_BG);
         assert_eq!(curs.fg, plain.bg);
         assert_eq!(curs.bg, plain.fg);
+    }
+
+    #[test]
+    fn tab_active_index_after_close() {
+        // 4 tabs [0,1,2,3], active=2 → 3 remain after a close.
+        assert_eq!(active_after_close(2, 0, 3), 1); // closed before active → shift down
+        assert_eq!(active_after_close(2, 2, 3), 2); // closed active (not last) → next shifts in
+        assert_eq!(active_after_close(2, 3, 3), 2); // closed after active → unchanged
+        assert_eq!(active_after_close(3, 3, 3), 2); // closed active==last → clamp to new last
     }
 
     #[test]
