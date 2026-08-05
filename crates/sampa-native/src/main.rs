@@ -28,6 +28,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
+use sampa_palette::list_executables;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
@@ -62,6 +63,9 @@ const SEARCH_MATCH_BG: [u8; 3] = [0x66, 0x5c, 0x1e];
 const SEARCH_CURRENT_BG: [u8; 3] = [0xe0, 0xa0, 0x22];
 /// Cap on matches tracked per search, to bound work on huge scrollback.
 const SEARCH_MAX_MATCHES: usize = 2000;
+/// Command palette: rows shown at once, and the cap on filtered results kept.
+const PALETTE_VISIBLE: usize = 10;
+const PALETTE_LIST_MAX: usize = 200;
 
 // --- XTWINOPS pixel/display metrics (§17 conformance) -------------------------
 // alacritty answers only the char-size winop (CSI 18 t) and drops the pixel/report
@@ -218,6 +222,14 @@ impl Snapshot {
         }
         s
     }
+}
+
+/// What the renderer needs to draw the command-palette dropdown: the query, the
+/// currently-visible rows, and which of those rows is selected.
+struct PaletteView<'a> {
+    query: &'a str,
+    rows: &'a [String],
+    selected: usize,
 }
 
 /// Side effects the VT engine raises during parsing, forwarded from the parser
@@ -1052,6 +1064,11 @@ fn main() -> Result<()> {
         search_query: String::new(),
         search_matches: Vec::new(),
         search_idx: 0,
+        palette_on: false,
+        palette_query: String::new(),
+        palette_all: Vec::new(),
+        palette_filtered: Vec::new(),
+        palette_idx: 0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -1282,6 +1299,12 @@ struct App {
     search_query: String,
     search_matches: Vec<Match>,
     search_idx: usize,
+    // command palette
+    palette_on: bool,
+    palette_query: String,
+    palette_all: Vec<String>,
+    palette_filtered: Vec<String>,
+    palette_idx: usize,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -1352,6 +1375,18 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => self.render_now(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let m = self.modifiers;
+                // The command palette captures all input while open (Ctrl+Shift+P closes it).
+                if self.palette_on {
+                    if m.control_key()
+                        && m.shift_key()
+                        && matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("p"))
+                    {
+                        self.palette_close();
+                    } else {
+                        self.palette_key(&event.logical_key, event.text.as_deref());
+                    }
+                    return;
+                }
                 // The search overlay captures all input while open (Ctrl+Shift+F closes it).
                 if self.search_on {
                     if m.control_key()
@@ -1415,6 +1450,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             "f" => {
                                 self.search_open();
+                                return;
+                            }
+                            "p" => {
+                                self.palette_open();
                                 return;
                             }
                             _ => {}
@@ -1498,6 +1537,57 @@ fn find_matches<L: EventListener>(term: &Term<L>, query: &str, max: usize) -> Ve
     RegexIter::new(start, end, Direction::Right, term, &mut re)
         .take(max)
         .collect()
+}
+
+/// Case-insensitive subsequence fuzzy score of `needle` against `hay`, or `None` if
+/// `needle` isn't a subsequence. Rewards a match at the start, consecutive matches,
+/// and shorter candidates. An empty needle matches everything with a neutral score.
+fn fuzzy_score(needle: &str, hay: &str) -> Option<i32> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let n: Vec<char> = needle.chars().flat_map(|c| c.to_lowercase()).collect();
+    let h: Vec<char> = hay.chars().flat_map(|c| c.to_lowercase()).collect();
+    let mut ni = 0;
+    let mut score = 0i32;
+    let mut prev: Option<usize> = None;
+    for (hi, &hc) in h.iter().enumerate() {
+        if ni < n.len() && hc == n[ni] {
+            score += 10;
+            if hi == 0 {
+                score += 15; // anchored at the very start
+            }
+            if prev == Some(hi.wrapping_sub(1)) {
+                score += 20; // contiguous run
+            }
+            prev = Some(hi);
+            ni += 1;
+        }
+    }
+    (ni == n.len()).then(|| score - h.len() as i32)
+}
+
+/// Fuzzy-filter `all` by `query`, best score first (ties broken alphabetically),
+/// capped at `max`. An empty query returns the head of the list unchanged.
+fn filter_commands(all: &[String], query: &str, max: usize) -> Vec<String> {
+    if query.is_empty() {
+        return all.iter().take(max).cloned().collect();
+    }
+    let mut scored: Vec<(i32, &String)> = all
+        .iter()
+        .filter_map(|c| fuzzy_score(query, c).map(|s| (s, c)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.into_iter().take(max).map(|(_, c)| c.clone()).collect()
+}
+
+/// Start index of the visible window so `idx` stays on screen (centered when possible).
+fn palette_window(idx: usize, total: usize, visible: usize) -> usize {
+    if total <= visible {
+        0
+    } else {
+        idx.saturating_sub(visible / 2).min(total - visible)
+    }
 }
 
 /// Next match index when stepping (wrapping) over `n` matches (`n` ≥ 1).
@@ -1985,6 +2075,76 @@ impl App {
         format_search_bar(&self.search_query, self.search_matches.len(), self.search_idx)
     }
 
+    /// Open the command palette: enumerate `$PATH` executables once, reset the query.
+    fn palette_open(&mut self) {
+        let path = std::env::var("PATH").unwrap_or_default();
+        self.palette_all = list_executables(&path);
+        self.palette_query.clear();
+        self.palette_on = true;
+        self.palette_refilter();
+    }
+
+    fn palette_close(&mut self) {
+        self.palette_on = false;
+        self.request_redraw();
+    }
+
+    /// Keys while the palette owns input: Esc closes, Enter inserts the selected command
+    /// at the prompt, ↑/↓ move the selection, Backspace/text edit the query.
+    fn palette_key(&mut self, key: &Key, text: Option<&str>) {
+        match key {
+            Key::Named(NamedKey::Escape) => self.palette_close(),
+            Key::Named(NamedKey::Enter) => self.palette_run(),
+            Key::Named(NamedKey::ArrowDown) => self.palette_move(true),
+            Key::Named(NamedKey::ArrowUp) => self.palette_move(false),
+            Key::Named(NamedKey::Backspace) if !self.palette_query.is_empty() => {
+                self.palette_query.pop();
+                self.palette_refilter();
+            }
+            _ => {
+                if let Some(t) = text {
+                    let add: String = t.chars().filter(|c| !c.is_control()).collect();
+                    if !add.is_empty() {
+                        self.palette_query.push_str(&add);
+                        self.palette_refilter();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-run the fuzzy filter for the current query and reset the selection to the top.
+    fn palette_refilter(&mut self) {
+        self.palette_filtered = filter_commands(&self.palette_all, &self.palette_query, PALETTE_LIST_MAX);
+        self.palette_idx = 0;
+        self.request_redraw();
+    }
+
+    /// Move the selection down/up, clamped (no wrap).
+    fn palette_move(&mut self, down: bool) {
+        let n = self.palette_filtered.len();
+        if n == 0 {
+            return;
+        }
+        self.palette_idx = if down {
+            (self.palette_idx + 1).min(n - 1)
+        } else {
+            self.palette_idx.saturating_sub(1)
+        };
+        self.request_redraw();
+    }
+
+    /// Insert the selected command (plus a trailing space) at the prompt, then close.
+    /// Deliberately does not append a newline — the user reviews/adds args and runs it.
+    fn palette_run(&mut self) {
+        if let Some(cmd) = self.palette_filtered.get(self.palette_idx) {
+            let bytes = format!("{cmd} ").into_bytes();
+            self.pty_write(&bytes);
+            self.scroll(Scroll::Bottom);
+        }
+        self.palette_close();
+    }
+
     /// Apply VT-raised side effects on the main thread (§13): route query replies to
     /// the PTY, sanitize + set the window title, and gate OSC-52 clipboard writes.
     fn drain_app_events(&mut self) {
@@ -2087,8 +2247,21 @@ impl App {
         let tabs: Vec<String> = self.sessions.iter().map(|s| s.title.clone()).collect();
         let active = self.active;
         let search = self.search_on.then(|| self.search_bar_text());
+        // Window the filtered command list around the selection for the dropdown.
+        let (pal_rows, pal_sel): (Vec<String>, usize) = if self.palette_on {
+            let start = palette_window(self.palette_idx, self.palette_filtered.len(), PALETTE_VISIBLE);
+            let rows = self.palette_filtered.iter().skip(start).take(PALETTE_VISIBLE).cloned().collect();
+            (rows, self.palette_idx - start)
+        } else {
+            (Vec::new(), 0)
+        };
+        let palette = self.palette_on.then(|| PaletteView {
+            query: &self.palette_query,
+            rows: &pal_rows,
+            selected: pal_sel,
+        });
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap, &tabs, active, search.as_deref());
+            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref());
         }
     }
 
@@ -2564,8 +2737,9 @@ struct Renderer {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     buffer: Buffer,
-    tab_buffers: Vec<Buffer>, // one per tab-bar label, grown lazily
-    search_buffer: Buffer,    // the search-bar text
+    tab_buffers: Vec<Buffer>,     // one per tab-bar label, grown lazily
+    search_buffer: Buffer,        // the search-bar text
+    palette_buffers: Vec<Buffer>, // [0] = query line, [1..] = result rows
     quad_pipeline: wgpu::RenderPipeline,
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
@@ -2762,6 +2936,7 @@ impl Renderer {
             buffer,
             tab_buffers: Vec::new(),
             search_buffer,
+            palette_buffers: Vec::new(),
             quad_pipeline,
             quad_uniform,
             quad_bind_group,
@@ -2862,8 +3037,9 @@ impl Renderer {
         self.cell_w = measure_cell_w(&mut self.font_system, font_size, self.line_h, &self.font_family);
         self.buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.search_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
-        // Tab-label buffers carry the old line height — drop so they're rebuilt.
+        // Overlay row buffers carry the old line height — drop so they're rebuilt.
         self.tab_buffers.clear();
+        self.palette_buffers.clear();
     }
 
     /// Point the renderer at a different tab's image layer (on tab switch); drop the
@@ -2948,12 +3124,46 @@ impl Renderer {
         }
     }
 
+    /// Shape the palette's query line (buffer 0) + visible result rows (1..) into their
+    /// reusable buffers. Row buffers are grown lazily and reused across frames.
+    fn shape_palette(&mut self, p: &PaletteView, w: u32, rowh: f32) {
+        let need = p.rows.len() + 1;
+        let fs = self.line_h / 1.2;
+        while self.palette_buffers.len() < need {
+            let b = Buffer::new(&mut self.font_system, Metrics::new(fs, self.line_h));
+            self.palette_buffers.push(b);
+        }
+        let fg = self.theme.fg;
+        let width = (w as f32 - 2.0 * PAD - 16.0).max(1.0);
+        // Row 0: the query line with a caret; rows 1.. : command names.
+        let query = format!("> {}\u{2582}", p.query);
+        for i in 0..need {
+            let text = if i == 0 { query.as_str() } else { p.rows[i - 1].as_str() };
+            let attrs = Attrs::new()
+                .family(family_of(&self.font_family))
+                .color(Color::rgb(fg[0], fg[1], fg[2]));
+            let buf = &mut self.palette_buffers[i];
+            buf.set_size(Some(width), Some(rowh));
+            buf.set_rich_text([(text, attrs)], &Attrs::new(), Shaping::Advanced, None);
+            buf.shape_until_scroll(&mut self.font_system, false);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>) {
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>) {
         // The grid starts below the tab bar when it's shown (more than one tab), and
         // the search bar overlays a strip at the bottom while open.
         let top = top_offset(tabs.len());
         let grid_bottom = if search.is_some() { (h as f32 - SEARCH_H).max(0.0) } else { h as f32 };
+        // The command palette drops down as a full-width panel below the tab bar.
+        let pal_rowh = self.line_h + 6.0;
+        let pal_top = top + 2.0;
+        let pal_bottom = palette
+            .map(|p| pal_top + pal_rowh * (p.rows.len() as f32 + 1.0) + 8.0)
+            .unwrap_or(pal_top);
+        // Grid text is clipped below the palette so it doesn't show through the panel
+        // (clamped so a palette taller than the window leaves a valid, empty grid area).
+        let grid_top = if palette.is_some() { pal_bottom.min(grid_bottom) } else { top };
         // Background/cursor quads (drawn under the text) and decoration quads
         // (underline/strikethrough, drawn over it).
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
@@ -2961,23 +3171,26 @@ impl Renderer {
         // Tab-bar segment quads render first, under everything.
         self.tab_bar_quads(tabs, active, w, &mut bg_quads);
         for r in 0..snap.rows {
+            let y = top + r as f32 * self.line_h;
+            // Rows hidden behind an overlay (palette dropdown / search bar) skip their
+            // decorations + cursor, which are drawn after the panel and would leak over it.
+            let row_visible = y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5;
             for c in 0..snap.cols {
                 let cell = snap.cell(r, c);
                 let x = PAD + c as f32 * self.cell_w;
-                let y = top + r as f32 * self.line_h;
                 if cell.bg != self.theme.bg {
                     bg_quads.push(QuadInstance {
                         rect: [x, y, self.cell_w + 0.5, self.line_h],
                         color: self.color4(cell.bg),
                     });
                 }
-                if cell.underline || cell.hyperlink {
+                if row_visible && (cell.underline || cell.hyperlink) {
                     deco_quads.push(QuadInstance {
                         rect: [x, y + self.line_h - 2.0, self.cell_w, 1.5],
                         color: self.color4(cell.fg),
                     });
                 }
-                if cell.strike {
+                if row_visible && cell.strike {
                     deco_quads.push(QuadInstance {
                         rect: [x, y + self.line_h * 0.45, self.cell_w, 1.5],
                         color: self.color4(cell.fg),
@@ -2986,7 +3199,10 @@ impl Renderer {
             }
         }
         // Bar/underline cursor (block inverts its cell in build_snapshot).
-        if let Some((r, c)) = snap.cursor {
+        if let Some((r, c)) = snap.cursor.filter(|(r, _)| {
+            let y = top + *r as f32 * self.line_h;
+            y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5
+        }) {
             let (x, y) = (PAD + c as f32 * self.cell_w, top + r as f32 * self.line_h);
             let rect = match self.cursor_style {
                 CursorStyle::Bar => Some([x, y, 2.0, self.line_h]),
@@ -3009,6 +3225,25 @@ impl Renderer {
                 rect: [0.0, grid_bottom, w as f32, 1.0],
                 color: self.color4(rule),
             });
+        }
+        // Command-palette panel: opaque background (over the grid), input field, the
+        // selected-row highlight, and rules. Pushed last so it covers grid cells.
+        if let Some(p) = palette {
+            let panel = self.color4(blend(self.theme.bg, self.theme.fg, 0.09));
+            let inputbg = self.color4(blend(self.theme.bg, self.theme.fg, 0.16));
+            let rule = self.color4(blend(self.theme.bg, self.theme.fg, 0.34));
+            let wf = w as f32;
+            bg_quads.push(QuadInstance { rect: [0.0, pal_top, wf, pal_bottom - pal_top], color: panel });
+            bg_quads.push(QuadInstance { rect: [0.0, pal_top, wf, pal_rowh], color: inputbg });
+            bg_quads.push(QuadInstance { rect: [0.0, pal_top + pal_rowh, wf, 1.0], color: rule });
+            if !p.rows.is_empty() {
+                let sel_y = pal_top + pal_rowh * (p.selected as f32 + 1.0);
+                bg_quads.push(QuadInstance {
+                    rect: [0.0, sel_y, wf, pal_rowh],
+                    color: self.color4(self.theme.selection),
+                });
+            }
+            bg_quads.push(QuadInstance { rect: [0.0, pal_bottom - 1.0, wf, 1.0], color: rule });
         }
 
         // Foreground text as per-cell colored rich-text spans.
@@ -3046,9 +3281,12 @@ impl Renderer {
             None,
         );
         self.buffer.shape_until_scroll(&mut self.font_system, false);
-        // Shape the tab-bar labels + search text (no-ops when hidden) before borrowing
-        // the buffers to build text areas.
+        // Shape the tab-bar labels + search text + palette rows (no-ops when hidden)
+        // before borrowing the buffers to build text areas.
         self.shape_tab_labels(tabs, active, w);
+        if let Some(p) = palette {
+            self.shape_palette(p, w, pal_rowh);
+        }
         if let Some(text) = search {
             let attrs = Attrs::new()
                 .family(family_of(&self.font_family))
@@ -3066,7 +3304,7 @@ impl Renderer {
             left: PAD,
             top,
             scale: 1.0,
-            bounds: TextBounds { left: 0, top: top as i32, right: w as i32, bottom: grid_bottom as i32 },
+            bounds: TextBounds { left: 0, top: grid_top as i32, right: w as i32, bottom: grid_bottom as i32 },
             default_color: Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]),
             custom_glyphs: &[],
         });
@@ -3081,6 +3319,29 @@ impl Renderer {
                 default_color: Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]),
                 custom_glyphs: &[],
             });
+        }
+        if let Some(p) = palette {
+            let lpad = PAD + 8.0;
+            let voff = ((pal_rowh - self.line_h) / 2.0).max(0.0);
+            let fg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
+            // Row 0 is the query line; rows 1.. are the results (buffer i+1).
+            for (i, buf) in self.palette_buffers.iter().enumerate().take(p.rows.len() + 1) {
+                let ry = pal_top + pal_rowh * i as f32;
+                text_areas.push(TextArea {
+                    buffer: buf,
+                    left: lpad,
+                    top: ry + voff,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: ry as i32,
+                        right: w as i32,
+                        bottom: (ry + pal_rowh) as i32,
+                    },
+                    default_color: fg,
+                    custom_glyphs: &[],
+                });
+            }
         }
         if tabs.len() > 1 {
             let tabw = w as f32 / tabs.len() as f32;
@@ -3188,11 +3449,12 @@ impl Renderer {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..4, 0..deco_quads.len() as u32);
             }
-            // Inline images composite on top — but scissored to the grid area so they
-            // never bleed into the tab bar (top) or the search bar (bottom).
-            if !image_bufs.is_empty() {
-                let gh = (grid_bottom - top).max(0.0) as u32;
-                pass.set_scissor_rect(0, top as u32, w, gh.min(h - top as u32));
+            // Inline images composite on top — but scissored to the visible grid area
+            // so they never bleed into the tab bar, palette dropdown, or search bar.
+            let y0 = (grid_top as u32).min(h);
+            let gh = ((grid_bottom - grid_top).max(0.0) as u32).min(h - y0);
+            if !image_bufs.is_empty() && gh > 0 {
+                pass.set_scissor_rect(0, y0, w, gh);
                 pass.set_pipeline(&self.image_pipeline);
                 pass.set_bind_group(0, &self.quad_bind_group, &[]);
                 for (id, buf) in &image_bufs {
@@ -3262,7 +3524,7 @@ impl Gfx {
         self.surface.configure(&self.r.device, &self.config);
     }
 
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>) {
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -3270,8 +3532,16 @@ impl Gfx {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.r
-            .paint(snap, &view, self.config.width, self.config.height, tabs, active, search);
+        self.r.paint(
+            snap,
+            &view,
+            self.config.width,
+            self.config.height,
+            tabs,
+            active,
+            search,
+            palette,
+        );
         self.r.queue.present(frame);
     }
 }
@@ -3349,9 +3619,21 @@ fn capture(path: &str) -> Result<()> {
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_default();
     let top = top_offset(demo_tabs.len());
+    // Optional palette demo: SAMPA_CAPTURE_PALETTE="query,row1,row2,..." (row 0 selected).
+    let demo_pal: Vec<String> = std::env::var("SAMPA_CAPTURE_PALETTE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_default();
+    // Grow the capture so the dropdown (query row + result rows) isn't clipped.
+    let pal_extra = if demo_pal.is_empty() {
+        0.0
+    } else {
+        (r.line_h + 6.0) * demo_pal.len() as f32 + 12.0
+    };
 
     let w = (PAD * 2.0 + cols as f32 * r.cell_w).ceil() as u32;
-    let h = (top + PAD + rows as f32 * r.line_h).ceil() as u32;
+    let h = (top + PAD + rows as f32 * r.line_h + pal_extra).ceil() as u32;
 
     let tex = r.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("capture"),
@@ -3365,6 +3647,11 @@ fn capture(path: &str) -> Result<()> {
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
     let demo_search = std::env::var("SAMPA_CAPTURE_SEARCH").ok().filter(|s| !s.is_empty());
+    let demo_palette = (!demo_pal.is_empty()).then(|| PaletteView {
+        query: &demo_pal[0],
+        rows: &demo_pal[1..],
+        selected: 0,
+    });
     r.paint(
         &snap,
         &view,
@@ -3373,6 +3660,7 @@ fn capture(path: &str) -> Result<()> {
         &demo_tabs,
         1.min(demo_tabs.len().saturating_sub(1)),
         demo_search.as_deref(),
+        demo_palette.as_ref(),
     );
 
     let bpr = (w * 4).div_ceil(256) * 256; // 256-byte row alignment
@@ -3483,6 +3771,44 @@ mod tests {
         let curs = cell_vis(&term.grid()[Line(0)][Column(0)], colors, true, false, SELECTION_BG);
         assert_eq!(curs.fg, plain.bg);
         assert_eq!(curs.bg, plain.fg);
+    }
+
+    #[test]
+    fn fuzzy_scoring_and_ranking() {
+        // Non-subsequence → no match; subsequence → Some.
+        assert!(fuzzy_score("xyz", "grep").is_none());
+        assert!(fuzzy_score("gp", "grep").is_some());
+        assert!(fuzzy_score("", "anything").is_some()); // empty needle matches
+        // Case-insensitive.
+        assert!(fuzzy_score("GREP", "grep").is_some());
+        // A contiguous, start-anchored match outranks a scattered one.
+        let contiguous = fuzzy_score("gre", "grep").unwrap();
+        let scattered = fuzzy_score("gre", "gxrxe").unwrap();
+        assert!(contiguous > scattered, "{contiguous} vs {scattered}");
+    }
+
+    #[test]
+    fn filter_ranks_and_caps() {
+        let all: Vec<String> = ["grep", "egrep", "pgrep", "ls", "cat"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = filter_commands(&all, "grep", 10);
+        assert_eq!(out[0], "grep", "exact/start match ranks first: {out:?}");
+        assert!(out.contains(&"egrep".to_string()) && out.contains(&"pgrep".to_string()));
+        assert!(!out.contains(&"ls".to_string()));
+        // Empty query returns the head unchanged, capped at max.
+        assert_eq!(filter_commands(&all, "", 2), vec!["grep", "egrep"]);
+    }
+
+    #[test]
+    fn palette_scroll_window() {
+        // Fits entirely → always start at 0.
+        assert_eq!(palette_window(7, 8, 10), 0);
+        // Larger than the window → center the selection, clamped to both ends.
+        assert_eq!(palette_window(0, 100, 10), 0);
+        assert_eq!(palette_window(50, 100, 10), 45);
+        assert_eq!(palette_window(99, 100, 10), 90); // clamped so the last row shows
     }
 
     #[test]
