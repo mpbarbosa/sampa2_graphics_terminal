@@ -166,7 +166,14 @@ interactive pass + wider program coverage outstanding.)*
   **click-to-switch**; the grid offsets below it (and reflows on the 1↔2 boundary).
   Geometry/label/close-index math unit-tested; bar rendered + verified via `--capture`.
   ⬜ still: **splits**, tab reordering/drag, a “＋” new-tab affordance.
-- ⬜ **Search overlay** — native, incremental match + highlight over scrollback.
+- ✅ **Search overlay** — **Ctrl+Shift+F** opens a bottom search bar; incremental
+  regex match over the whole buffer (scrollback included) via `alacritty_terminal`'s
+  `RegexSearch`/`RegexIter`. All matches highlighted, the current one brighter;
+  **Enter**/↓ next, **Shift+Enter**/↑ previous (wrapping), the match scrolled into
+  view; the bar shows `i/n` (or “no matches”). **Esc** closes. Grid text is clipped
+  above the bar and inline images are scissored to the grid so nothing bleeds into the
+  chrome. `find_matches`/nav/format are unit-tested (incl. a real-`Term` scrollback +
+  regex test); bar rendered + verified via `--capture`.
 
 **Exit:** a config edit hot-reloads theme/font/cursor; a Powerline + truecolor prompt
 renders; tabs run independent shells; search highlights scrollback matches.

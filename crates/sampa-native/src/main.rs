@@ -25,8 +25,9 @@ use std::thread;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, VoidListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
+use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
@@ -54,6 +55,13 @@ const LINE_HEIGHT: f32 = 18.0;
 const PAD: f32 = 6.0;
 /// Height of the visual tab bar, shown only when more than one tab is open.
 const TAB_BAR_H: f32 = 26.0;
+/// Height of the search bar (overlaid at the bottom while search is open).
+const SEARCH_H: f32 = 22.0;
+/// Highlight backgrounds for search matches (all) and the current match.
+const SEARCH_MATCH_BG: [u8; 3] = [0x66, 0x5c, 0x1e];
+const SEARCH_CURRENT_BG: [u8; 3] = [0xe0, 0xa0, 0x22];
+/// Cap on matches tracked per search, to bound work on huge scrollback.
+const SEARCH_MAX_MATCHES: usize = 2000;
 
 // --- XTWINOPS pixel/display metrics (§17 conformance) -------------------------
 // alacritty answers only the char-size winop (CSI 18 t) and drops the pixel/report
@@ -1040,6 +1048,10 @@ fn main() -> Result<()> {
         cursor_style,
         cursor_on: true,
         blink,
+        search_on: false,
+        search_query: String::new(),
+        search_matches: Vec::new(),
+        search_idx: 0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -1265,6 +1277,11 @@ struct App {
     cursor_style: CursorStyle,
     cursor_on: bool,
     blink: bool,
+    // search overlay
+    search_on: bool,
+    search_query: String,
+    search_matches: Vec<Match>,
+    search_idx: usize,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -1335,6 +1352,18 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => self.render_now(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let m = self.modifiers;
+                // The search overlay captures all input while open (Ctrl+Shift+F closes it).
+                if self.search_on {
+                    if m.control_key()
+                        && m.shift_key()
+                        && matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("f"))
+                    {
+                        self.search_close();
+                    } else {
+                        self.search_key(&event.logical_key, event.text.as_deref(), m.shift_key());
+                    }
+                    return;
+                }
                 // Shift+PageUp/PageDown scroll scrollback locally (never reach the PTY).
                 if m.shift_key() {
                     match &event.logical_key {
@@ -1382,6 +1411,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 if self.close_session(self.active) {
                                     event_loop.exit();
                                 }
+                                return;
+                            }
+                            "f" => {
+                                self.search_open();
                                 return;
                             }
                             _ => {}
@@ -1449,6 +1482,52 @@ fn blend(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     let f = t.clamp(0.0, 1.0);
     let m = |x: u8, y: u8| (x as f32 * (1.0 - f) + y as f32 * f).round() as u8;
     [m(a[0], b[0]), m(a[1], b[1]), m(a[2], b[2])]
+}
+
+/// All matches of `query` across the whole buffer (scrollback included), left-to-right
+/// top-to-bottom, capped at `max`. Empty on an invalid regex or empty query.
+fn find_matches<L: EventListener>(term: &Term<L>, query: &str, max: usize) -> Vec<Match> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let Ok(mut re) = RegexSearch::new(query) else {
+        return Vec::new();
+    };
+    let start = Point::new(term.topmost_line(), Column(0));
+    let end = Point::new(term.bottommost_line(), term.last_column());
+    RegexIter::new(start, end, Direction::Right, term, &mut re)
+        .take(max)
+        .collect()
+}
+
+/// Next match index when stepping (wrapping) over `n` matches (`n` ≥ 1).
+fn search_step_index(idx: usize, n: usize, forward: bool) -> usize {
+    if forward {
+        (idx + 1) % n
+    } else {
+        (idx + n - 1) % n
+    }
+}
+
+/// The match to select after a query change: the first whose start line is at or
+/// below the current viewport top, else the last (`starts` non-empty, sorted asc).
+fn nearest_match_index(starts: &[i32], view_top: i32) -> usize {
+    starts
+        .iter()
+        .position(|&l| l >= view_top)
+        .unwrap_or(starts.len().saturating_sub(1))
+}
+
+/// The search-bar line: `/<query>` + a caret + a counter (or "no matches").
+fn format_search_bar(query: &str, matches: usize, idx: usize) -> String {
+    let tail = if query.is_empty() {
+        String::new()
+    } else if matches == 0 {
+        "   no matches".to_string()
+    } else {
+        format!("   {}/{}", idx + 1, matches)
+    };
+    format!("  /{}\u{2582}{}", query, tail)
 }
 
 /// A compact tab-bar label: `<n>: <title>`, blank titles shown as "shell",
@@ -1789,6 +1868,123 @@ impl App {
         false
     }
 
+    /// Open the incremental-search overlay (reusing any previous query).
+    fn search_open(&mut self) {
+        self.search_on = true;
+        self.search_recompute();
+    }
+
+    /// Close the overlay and drop the highlights (the query is kept for reopen).
+    fn search_close(&mut self) {
+        self.search_on = false;
+        self.request_redraw();
+    }
+
+    /// Handle a key while the overlay owns input: Esc closes, Enter/↓ next match,
+    /// Shift+Enter/↑ previous, Backspace edits, printable text extends the query.
+    fn search_key(&mut self, key: &Key, text: Option<&str>, shift: bool) {
+        match key {
+            Key::Named(NamedKey::Escape) => self.search_close(),
+            Key::Named(NamedKey::Enter) => self.search_step(!shift), // Shift+Enter = previous
+            Key::Named(NamedKey::ArrowDown) => self.search_step(true),
+            Key::Named(NamedKey::ArrowUp) => self.search_step(false),
+            Key::Named(NamedKey::Backspace) if !self.search_query.is_empty() => {
+                self.search_query.pop();
+                self.search_recompute();
+            }
+            _ => {
+                if let Some(t) = text {
+                    let add: String = t.chars().filter(|c| !c.is_control()).collect();
+                    if !add.is_empty() {
+                        self.search_query.push_str(&add);
+                        self.search_recompute();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Recompute all matches for the current query across the whole buffer (scrollback
+    /// included), pick the one nearest the current view, and scroll it in.
+    fn search_recompute(&mut self) {
+        self.search_matches.clear();
+        self.search_idx = 0;
+        let q = self.search_query.clone();
+        if !q.is_empty() {
+            if let Ok(g) = self.state.lock() {
+                self.search_matches = find_matches(&g.term, &q, SEARCH_MAX_MATCHES);
+            }
+        }
+        // Pick the first match at or below the current viewport top, else the last.
+        if !self.search_matches.is_empty() {
+            let view_top = self
+                .state
+                .lock()
+                .ok()
+                .map(|g| -(g.term.grid().display_offset() as i32))
+                .unwrap_or(0);
+            let starts: Vec<i32> = self.search_matches.iter().map(|m| m.start().line.0).collect();
+            self.search_idx = nearest_match_index(&starts, view_top);
+            self.search_scroll_to_current();
+        }
+        self.request_redraw();
+    }
+
+    /// Advance to the next/previous match (wrapping) and scroll it into view.
+    fn search_step(&mut self, forward: bool) {
+        let n = self.search_matches.len();
+        if n == 0 {
+            return;
+        }
+        self.search_idx = search_step_index(self.search_idx, n, forward);
+        self.search_scroll_to_current();
+        self.request_redraw();
+    }
+
+    /// Scroll the display so the current match's start line is on screen.
+    fn search_scroll_to_current(&mut self) {
+        if let Some(m) = self.search_matches.get(self.search_idx).cloned() {
+            if let Ok(mut g) = self.state.lock() {
+                g.term.scroll_to_point(*m.start());
+            }
+        }
+    }
+
+    /// Paint search highlights onto a freshly built snapshot: every visible match gets
+    /// a highlight bg, the current one a brighter bg + dark fg. No-op when closed.
+    fn apply_search_highlight(&self, snap: &mut Snapshot) {
+        if !self.search_on || self.search_matches.is_empty() {
+            return;
+        }
+        let (rows, cols, offset) = (snap.rows, snap.cols, snap.offset);
+        for (i, m) in self.search_matches.iter().enumerate() {
+            let current = i == self.search_idx;
+            let (s, e) = (m.start(), m.end());
+            for abs in s.line.0..=e.line.0 {
+                let r = abs + offset;
+                if r < 0 || r as usize >= rows {
+                    continue;
+                }
+                let c0 = if abs == s.line.0 { s.column.0 } else { 0 };
+                let c1 = if abs == e.line.0 { e.column.0 } else { cols - 1 };
+                for c in c0..=c1.min(cols - 1) {
+                    let cell = &mut snap.cells[r as usize * cols + c];
+                    if current {
+                        cell.bg = SEARCH_CURRENT_BG;
+                        cell.fg = [0x14, 0x14, 0x14];
+                    } else {
+                        cell.bg = SEARCH_MATCH_BG;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The one-line search-bar text: the query plus a match counter (or "no matches").
+    fn search_bar_text(&self) -> String {
+        format_search_bar(&self.search_query, self.search_matches.len(), self.search_idx)
+    }
+
     /// Apply VT-raised side effects on the main thread (§13): route query replies to
     /// the PTY, sanitize + set the window title, and gate OSC-52 clipboard writes.
     fn drain_app_events(&mut self) {
@@ -1872,10 +2068,11 @@ impl App {
     }
 
     fn render_now(&mut self) {
-        let snap = match self.state.lock() {
+        let mut snap = match self.state.lock() {
             Ok(g) => build_snapshot(&g.term, &self.theme, self.cursor_style, self.cursor_on),
             Err(_) => return,
         };
+        self.apply_search_highlight(&mut snap);
         if !self.dumped && std::env::var_os("SAMPA_DUMP_GRID").is_some() {
             let text = snap.to_text();
             if text.contains("SEAM_OK") {
@@ -1889,8 +2086,9 @@ impl App {
         }
         let tabs: Vec<String> = self.sessions.iter().map(|s| s.title.clone()).collect();
         let active = self.active;
+        let search = self.search_on.then(|| self.search_bar_text());
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap, &tabs, active);
+            gfx.render(&snap, &tabs, active, search.as_deref());
         }
     }
 
@@ -2367,6 +2565,7 @@ struct Renderer {
     text_renderer: TextRenderer,
     buffer: Buffer,
     tab_buffers: Vec<Buffer>, // one per tab-bar label, grown lazily
+    search_buffer: Buffer,    // the search-bar text
     quad_pipeline: wgpu::RenderPipeline,
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
@@ -2405,6 +2604,7 @@ impl Renderer {
         // Measure the monospace advance so the quad grid lines up with the glyphs.
         let cell_w = measure_cell_w(&mut font_system, font_size, line_h, &font_family);
         let buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+        let search_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quad"),
@@ -2561,6 +2761,7 @@ impl Renderer {
             text_renderer,
             buffer,
             tab_buffers: Vec::new(),
+            search_buffer,
             quad_pipeline,
             quad_uniform,
             quad_bind_group,
@@ -2660,6 +2861,7 @@ impl Renderer {
         self.line_h = (font_size * 1.2).ceil();
         self.cell_w = measure_cell_w(&mut self.font_system, font_size, self.line_h, &self.font_family);
         self.buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.search_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         // Tab-label buffers carry the old line height — drop so they're rebuilt.
         self.tab_buffers.clear();
     }
@@ -2746,9 +2948,12 @@ impl Renderer {
         }
     }
 
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize) {
-        // The grid starts below the tab bar when it's shown (more than one tab).
+    #[allow(clippy::too_many_arguments)]
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>) {
+        // The grid starts below the tab bar when it's shown (more than one tab), and
+        // the search bar overlays a strip at the bottom while open.
         let top = top_offset(tabs.len());
+        let grid_bottom = if search.is_some() { (h as f32 - SEARCH_H).max(0.0) } else { h as f32 };
         // Background/cursor quads (drawn under the text) and decoration quads
         // (underline/strikethrough, drawn over it).
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
@@ -2792,6 +2997,19 @@ impl Renderer {
                 deco_quads.push(QuadInstance { rect, color: self.color4(self.theme.cursor) });
             }
         }
+        // Search bar: an opaque strip at the bottom (drawn over the grid) + a top rule.
+        if search.is_some() {
+            let bar_bg = blend(self.theme.bg, self.theme.fg, 0.14);
+            let rule = blend(self.theme.bg, self.theme.fg, 0.30);
+            bg_quads.push(QuadInstance {
+                rect: [0.0, grid_bottom, w as f32, SEARCH_H],
+                color: self.color4(bar_bg),
+            });
+            bg_quads.push(QuadInstance {
+                rect: [0.0, grid_bottom, w as f32, 1.0],
+                color: self.color4(rule),
+            });
+        }
 
         // Foreground text as per-cell colored rich-text spans.
         let base = Attrs::new().family(family_of(&self.font_family));
@@ -2828,22 +3046,42 @@ impl Renderer {
             None,
         );
         self.buffer.shape_until_scroll(&mut self.font_system, false);
-        // Shape the tab-bar labels (no-op when the bar is hidden) before borrowing
+        // Shape the tab-bar labels + search text (no-ops when hidden) before borrowing
         // the buffers to build text areas.
         self.shape_tab_labels(tabs, active, w);
+        if let Some(text) = search {
+            let attrs = Attrs::new()
+                .family(family_of(&self.font_family))
+                .color(Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]));
+            self.search_buffer.set_size(Some((w as f32 - 2.0 * PAD).max(1.0)), Some(SEARCH_H));
+            self.search_buffer.set_rich_text([(text, attrs)], &Attrs::new(), Shaping::Advanced, None);
+            self.search_buffer.shape_until_scroll(&mut self.font_system, false);
+        }
 
         self.viewport
             .update(&self.queue, Resolution { width: w, height: h });
-        let mut text_areas: Vec<TextArea> = Vec::with_capacity(1 + tabs.len());
+        let mut text_areas: Vec<TextArea> = Vec::with_capacity(2 + tabs.len());
         text_areas.push(TextArea {
             buffer: &self.buffer,
             left: PAD,
             top,
             scale: 1.0,
-            bounds: TextBounds { left: 0, top: top as i32, right: w as i32, bottom: h as i32 },
+            bounds: TextBounds { left: 0, top: top as i32, right: w as i32, bottom: grid_bottom as i32 },
             default_color: Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]),
             custom_glyphs: &[],
         });
+        if search.is_some() {
+            let ltop = grid_bottom + ((SEARCH_H - self.line_h) / 2.0).max(0.0);
+            text_areas.push(TextArea {
+                buffer: &self.search_buffer,
+                left: PAD,
+                top: ltop,
+                scale: 1.0,
+                bounds: TextBounds { left: 0, top: grid_bottom as i32, right: w as i32, bottom: h as i32 },
+                default_color: Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]),
+                custom_glyphs: &[],
+            });
+        }
         if tabs.len() > 1 {
             let tabw = w as f32 / tabs.len() as f32;
             let label_top = ((TAB_BAR_H - self.line_h) / 2.0).max(0.0);
@@ -2950,8 +3188,11 @@ impl Renderer {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..4, 0..deco_quads.len() as u32);
             }
-            // Inline images composite on top.
+            // Inline images composite on top — but scissored to the grid area so they
+            // never bleed into the tab bar (top) or the search bar (bottom).
             if !image_bufs.is_empty() {
+                let gh = (grid_bottom - top).max(0.0) as u32;
+                pass.set_scissor_rect(0, top as u32, w, gh.min(h - top as u32));
                 pass.set_pipeline(&self.image_pipeline);
                 pass.set_bind_group(0, &self.quad_bind_group, &[]);
                 for (id, buf) in &image_bufs {
@@ -3021,7 +3262,7 @@ impl Gfx {
         self.surface.configure(&self.r.device, &self.config);
     }
 
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize) {
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -3030,7 +3271,7 @@ impl Gfx {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.r
-            .paint(snap, &view, self.config.width, self.config.height, tabs, active);
+            .paint(snap, &view, self.config.width, self.config.height, tabs, active, search);
         self.r.queue.present(frame);
     }
 }
@@ -3123,7 +3364,16 @@ fn capture(path: &str) -> Result<()> {
         view_formats: &[],
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    r.paint(&snap, &view, w, h, &demo_tabs, 1.min(demo_tabs.len().saturating_sub(1)));
+    let demo_search = std::env::var("SAMPA_CAPTURE_SEARCH").ok().filter(|s| !s.is_empty());
+    r.paint(
+        &snap,
+        &view,
+        w,
+        h,
+        &demo_tabs,
+        1.min(demo_tabs.len().saturating_sub(1)),
+        demo_search.as_deref(),
+    );
 
     let bpr = (w * 4).div_ceil(256) * 256; // 256-byte row alignment
     let readback = r.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3233,6 +3483,30 @@ mod tests {
         let curs = cell_vis(&term.grid()[Line(0)][Column(0)], colors, true, false, SELECTION_BG);
         assert_eq!(curs.fg, plain.bg);
         assert_eq!(curs.bg, plain.fg);
+    }
+
+    #[test]
+    fn search_navigation_wraps() {
+        assert_eq!(search_step_index(0, 3, true), 1);
+        assert_eq!(search_step_index(2, 3, true), 0); // wrap forward
+        assert_eq!(search_step_index(0, 3, false), 2); // wrap backward
+        assert_eq!(search_step_index(1, 3, false), 0);
+    }
+
+    #[test]
+    fn search_nearest_match_pick() {
+        let starts = [-30, -10, -2, 5];
+        assert_eq!(nearest_match_index(&starts, -12), 1); // first at/below view top
+        assert_eq!(nearest_match_index(&starts, -2), 2);
+        assert_eq!(nearest_match_index(&starts, 100), 3); // none below → last
+        assert_eq!(nearest_match_index(&starts, -100), 0);
+    }
+
+    #[test]
+    fn search_bar_formatting() {
+        assert_eq!(format_search_bar("", 0, 0), "  /\u{2582}"); // empty query: no counter
+        assert_eq!(format_search_bar("err", 0, 0), "  /err\u{2582}   no matches");
+        assert_eq!(format_search_bar("err", 5, 1), "  /err\u{2582}   2/5"); // 1-based counter
     }
 
     #[test]
@@ -3472,6 +3746,29 @@ mod tests {
         let scrolled = build_snapshot(&term, &Theme::default(), CursorStyle::Block, true).to_text();
         assert_ne!(bottom, scrolled, "view should change after scrolling up");
         assert!(scrolled.contains("L4"), "scrolled view: {scrolled:?}");
+    }
+
+    #[test]
+    fn search_finds_matches_across_scrollback() {
+        let mut parser: Processor = Processor::new();
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(20, 3), VoidListener);
+        // "foo" appears on the first line (scrolled into history) and the last.
+        parser.advance(&mut term, b"foo one\r\n");
+        for i in 0..5 {
+            parser.advance(&mut term, format!("line{i}\r\n").as_bytes());
+        }
+        parser.advance(&mut term, b"bar foo baz");
+
+        let m = find_matches(&term, "foo", 100);
+        assert_eq!(m.len(), 2, "should find both foo occurrences: {m:?}");
+        // Matches come top-to-bottom: the scrollback one first (more negative line).
+        assert!(m[0].start().line.0 < m[1].start().line.0);
+        // The first "foo" starts at column 0 of its line.
+        assert_eq!(m[0].start().column.0, 0);
+        // Regex works too; a query with no match is empty; empty query is empty.
+        assert_eq!(find_matches(&term, "line[0-9]", 100).len(), 5);
+        assert!(find_matches(&term, "nope", 100).is_empty());
+        assert!(find_matches(&term, "", 100).is_empty());
     }
 
     // --- selection (§8.3) ---
