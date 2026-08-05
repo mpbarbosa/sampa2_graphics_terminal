@@ -150,8 +150,11 @@ interactive pass + wider program coverage outstanding.)*
   `resolve` returns them), ✅ **font family** (CSS-list primary, `glyphon` generics) +
   **size** (drives cell metrics), ✅ **scrollback lines** → `TermConfig`. Verified by
   unit tests (hex/family parse, palette→table) **and a config-aware `--capture`** (navy
-  `#001830` bg + size-20 font applied). ⬜ still: **live reload** (watch + re-apply),
-  **cursor shape/blink**, ligatures toggle, bell, fontconfig fallback chain.
+  `#001830` bg + size-20 font applied). ✅ **live reload** — an mtime-poll watcher wakes
+  the loop on a config edit (`UserEvent::ConfigReload`) and re-applies theme + font
+  (re-measures the cell advance, rebuilds the text buffer, resizes term/PTY) without a
+  restart. ⬜ still: **cursor shape/blink**, ligatures toggle, bell, fontconfig fallback;
+  scrollback change still needs a restart (fresh `Term`).
 - ⬜ **Tabs** on `pty-core`'s session table.
 - ⬜ **Search overlay** — native, incremental match + highlight over scrollback.
 
