@@ -174,6 +174,15 @@ interactive pass + wider program coverage outstanding.)*
   above the bar and inline images are scissored to the grid so nothing bleeds into the
   chrome. `find_matches`/nav/format are unit-tested (incl. a real-`Term` scrollback +
   regex test); bar rendered + verified via `--capture`.
+- ✅ **Zoom** — **Ctrl +/−/0** change the font size at runtime (clamped 6–48 pt; 0
+  resets to the configured size), rebuilding renderer metrics + reflowing the grid/PTY.
+- ✅ **Help overlay** — **Ctrl+Shift+?** toggles a modal shortcut list to the
+  [help-overlay spec](spec-help-overlay.md): rows built each open from a single
+  keybinding source of truth (§3a actions + §3b fixed rows), chords **prettified** per
+  §4 (`Slash`→`?`, `Equal`→`=`, `Minus`→`−`, arrows…). Closes on the chord, **Esc**
+  (scoped so it never steals Esc from palette/search/panels), or a **backdrop click**.
+  `prettify_chord`/`help_rows` unit-tested; rendered + verified via `--capture`.
+  ⬜ still: config-driven *rebinding* (needs a keybindings config section), a ✕ button.
 
 **Exit:** a config edit hot-reloads theme/font/cursor; a Powerline + truecolor prompt
 renders; tabs run independent shells; search highlights scrollback matches.

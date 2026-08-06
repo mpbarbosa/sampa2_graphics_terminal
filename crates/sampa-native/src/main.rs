@@ -71,6 +71,36 @@ const MAN_VISIBLE: usize = 18;
 /// Preview panel: max body lines shown, and the debounce before a settled line runs.
 const PREVIEW_VISIBLE: usize = 12;
 const PREVIEW_DEBOUNCE_MS: u64 = 550;
+/// Font-size bounds for zoom (Ctrl +/−/0).
+const FONT_SIZE_MIN: f32 = 6.0;
+const FONT_SIZE_MAX: f32 = 48.0;
+
+/// The keyboard shortcuts shown in the help overlay (`Ctrl+Shift+?`) — the single
+/// source of truth for what the app-level keys do (`docs/spec-help-overlay.md` §3a).
+/// Chords are in the spec's token form; [`prettify_chord`] renders them for display.
+const KEYBINDINGS: &[(&str, &str)] = &[
+    ("Ctrl+Shift+T", "New tab"),
+    ("Ctrl+Shift+W", "Close tab"),
+    ("Ctrl+Tab", "Next tab"),
+    ("Ctrl+Shift+Tab", "Previous tab"),
+    ("Ctrl+Shift+C", "Copy selection"),
+    ("Ctrl+Shift+F", "Find in terminal"),
+    ("Ctrl+Shift+P", "Command palette"),
+    ("Ctrl+Shift+M", "Toggle man-page panel"),
+    ("Ctrl+Shift+E", "Toggle command preview"),
+    ("Ctrl+Equal", "Zoom in"),
+    ("Ctrl+Minus", "Zoom out"),
+    ("Ctrl+0", "Reset zoom"),
+    ("Ctrl+Shift+Slash", "This help"),
+];
+
+/// Fixed help rows for built-ins that aren't app keybindings (spec §3b).
+const HELP_FIXED: &[(&str, &str)] = &[
+    ("Ctrl+Shift+V", "Paste"),
+    ("Shift+PageUp", "Scroll history up"),
+    ("Shift+PageDown", "Scroll history down"),
+    ("Esc", "Close this help, an overlay, or a panel"),
+];
 
 // --- XTWINOPS pixel/display metrics (§17 conformance) -------------------------
 // alacritty answers only the char-size winop (CSI 18 t) and drops the pixel/report
@@ -1072,10 +1102,12 @@ fn main() -> Result<()> {
         images,
         theme,
         font_size,
+        font_size_base: font_size,
         font_family,
         cursor_style,
         cursor_on: true,
         blink,
+        help_on: false,
         search_on: false,
         search_query: String::new(),
         search_matches: Vec::new(),
@@ -1317,10 +1349,14 @@ struct App {
     images: Arc<Mutex<ImageStore>>,
     theme: Theme,
     font_size: f32,
+    /// The configured font size, restored by zoom-reset (Ctrl+0).
+    font_size_base: f32,
     font_family: String,
     cursor_style: CursorStyle,
     cursor_on: bool,
     blink: bool,
+    /// Keyboard-shortcut help overlay (Ctrl+Shift+?).
+    help_on: bool,
     // search overlay
     search_on: bool,
     search_query: String,
@@ -1419,6 +1455,19 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => self.render_now(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let m = self.modifiers;
+                // The help overlay is modal: while open it swallows keys, closing on
+                // Esc or its own chord (Ctrl+Shift+?), so it never steals Esc from the
+                // other overlays (which it can't coexist with — it opens only here).
+                if self.help_on {
+                    if matches!(&event.logical_key, Key::Named(NamedKey::Escape))
+                        || (m.control_key()
+                            && matches!(&event.logical_key, Key::Character(s) if s.as_str() == "?" || s.as_str() == "/"))
+                    {
+                        self.help_on = false;
+                        self.request_redraw();
+                    }
+                    return;
+                }
                 // The man panel captures navigation/close keys while open.
                 if self.man_on {
                     if m.control_key()
@@ -1518,6 +1567,31 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             "e" => {
                                 self.preview_toggle();
+                                return;
+                            }
+                            "?" | "/" => {
+                                self.help_on = !self.help_on; // Ctrl+Shift+? toggles help
+                                self.request_redraw();
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Zoom: Ctrl +/−/0 change the font size at runtime (never reach the PTY).
+                if m.control_key() {
+                    if let Key::Character(s) = &event.logical_key {
+                        match s.as_str() {
+                            "=" | "+" => {
+                                self.zoom_by(1.0);
+                                return;
+                            }
+                            "-" | "_" => {
+                                self.zoom_by(-1.0);
+                                return;
+                            }
+                            "0" => {
+                                self.zoom_reset();
                                 return;
                             }
                             _ => {}
@@ -1713,6 +1787,39 @@ fn filter_commands(all: &[String], query: &str, max: usize) -> Vec<PaletteMatch>
         .collect()
 }
 
+/// Prettify a chord for display (spec §4): map only the *final* key token to a symbol,
+/// leaving modifiers and letter/digit tokens as-is. Unknown tokens display verbatim.
+fn prettify_chord(chord: &str) -> String {
+    let mut tokens: Vec<String> = chord.split('+').map(str::to_string).collect();
+    if let Some(last) = tokens.last_mut() {
+        let sym = match last.as_str() {
+            "Slash" => "?",
+            "Equal" => "=",
+            "Plus" => "+",
+            "Minus" => "−",
+            "Right" => "→",
+            "Left" => "←",
+            "Up" => "↑",
+            "Down" => "↓",
+            other => other,
+        };
+        *last = sym.to_string();
+    }
+    tokens.join("+")
+}
+
+/// The help overlay's rows — `(prettified chord, label)` — rebuilt each open (spec §5):
+/// the configurable actions (§3a) followed by the fixed built-ins (§3b). Empty chords
+/// are skipped so a missing binding never shows a blank row.
+fn help_rows() -> Vec<(String, String)> {
+    KEYBINDINGS
+        .iter()
+        .chain(HELP_FIXED)
+        .filter(|(chord, _)| !chord.is_empty())
+        .map(|(chord, label)| (prettify_chord(chord), label.to_string()))
+        .collect()
+}
+
 /// The command whose man page to show for an input line: the first whitespace token,
 /// with a leading `\` stripped (`\ls`→`ls`) and a leading `sudo`/`command` skipped
 /// (`sudo grep …`→`grep`).
@@ -1895,6 +2002,12 @@ impl App {
             MouseButton::Right => 2,
             _ => return,
         };
+        // While the help overlay is open, any click dismisses it (backdrop-to-close).
+        if self.help_on && button == MouseButton::Left && pressed {
+            self.help_on = false;
+            self.request_redraw();
+            return;
+        }
         // A click in the visual tab bar switches tabs (never reaches the grid).
         if button == MouseButton::Left
             && pressed
@@ -2515,6 +2628,7 @@ impl App {
         let cfg = load_config();
         self.theme = theme_from(&cfg.colors);
         self.font_size = cfg.font.size.clamp(6.0, 72.0);
+        self.font_size_base = self.font_size; // zoom resets to the configured size
         self.font_family = primary_family(&cfg.font.family);
         self.cursor_style = cfg.cursor.style;
         self.blink = cfg.cursor.blink;
@@ -2543,6 +2657,31 @@ impl App {
         // New cell metrics → recompute grid geometry and resize the term/PTY.
         if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
             self.resize(size.width.max(1), size.height.max(1));
+        }
+        self.request_redraw();
+    }
+
+    /// Change the font size by `delta` points (Ctrl +/−), clamped, then re-lay the grid.
+    fn zoom_by(&mut self, delta: f32) {
+        self.apply_font_size((self.font_size + delta).clamp(FONT_SIZE_MIN, FONT_SIZE_MAX));
+    }
+
+    /// Restore the configured font size (Ctrl+0).
+    fn zoom_reset(&mut self) {
+        self.apply_font_size(self.font_size_base);
+    }
+
+    /// Apply a new font size: rebuild the renderer's metrics and reflow the grid/PTY.
+    fn apply_font_size(&mut self, size: f32) {
+        if (size - self.font_size).abs() < f32::EPSILON {
+            return;
+        }
+        self.font_size = size;
+        if let Some(gfx) = &mut self.gfx {
+            gfx.r.apply_config(self.theme, self.font_size, self.font_family.clone(), self.cursor_style);
+        }
+        if let Some(sz) = self.window.as_ref().map(|w| w.inner_size()) {
+            self.resize(sz.width.max(1), sz.height.max(1));
         }
         self.request_redraw();
     }
@@ -2621,8 +2760,10 @@ impl App {
         } else {
             None
         };
+        // Help overlay: rebuilt each frame it's open (spec §5), so a config reload shows.
+        let help = self.help_on.then(help_rows);
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref());
+            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref());
         }
     }
 
@@ -3103,6 +3244,7 @@ struct Renderer {
     palette_buffers: Vec<Buffer>, // [0] = query line, [1..] = result rows
     panel_title_buffer: Buffer, // bottom-panel header (man/preview)
     panel_body_buffer: Buffer,  // bottom-panel body (multi-line)
+    help_buffer: Buffer,        // keyboard-shortcut help overlay (title + rows)
     quad_pipeline: wgpu::RenderPipeline,
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
@@ -3144,6 +3286,7 @@ impl Renderer {
         let search_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let panel_title_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let panel_body_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+        let help_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quad"),
@@ -3304,6 +3447,7 @@ impl Renderer {
             palette_buffers: Vec::new(),
             panel_title_buffer,
             panel_body_buffer,
+            help_buffer,
             quad_pipeline,
             quad_uniform,
             quad_bind_group,
@@ -3406,6 +3550,7 @@ impl Renderer {
         self.search_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.panel_title_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.panel_body_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.help_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         // Overlay row buffers carry the old line height — drop so they're rebuilt.
         self.tab_buffers.clear();
         self.palette_buffers.clear();
@@ -3552,7 +3697,7 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>) {
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
         // search bar and the bottom panel (man page / command preview) each overlay a
         // strip/panel at the bottom.
@@ -3574,9 +3719,20 @@ impl Renderer {
         let pal_bottom = palette
             .map(|p| pal_top + pal_rowh * (p.rows.len() as f32 + 1.0) + 8.0)
             .unwrap_or(pal_top);
-        // Grid text is clipped below the palette so it doesn't show through the panel
-        // (clamped so a palette taller than the window leaves a valid, empty grid area).
-        let grid_top = if palette.is_some() { pal_bottom.min(grid_bottom) } else { top };
+        // The help overlay is a top panel too (title line + a blank + one row each).
+        let help_top = top + 2.0;
+        let help_bottom = help
+            .map(|rows| help_top + (rows.len() as f32 + 3.0) * self.line_h + 12.0)
+            .unwrap_or(help_top);
+        // Grid text is clipped below whichever top panel is open so it doesn't show
+        // through (clamped so a panel taller than the window leaves a valid grid area).
+        let grid_top = if help.is_some() {
+            help_bottom.min(grid_bottom)
+        } else if palette.is_some() {
+            pal_bottom.min(grid_bottom)
+        } else {
+            top
+        };
         // Background/cursor quads (drawn under the text) and decoration quads
         // (underline/strikethrough, drawn over it).
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
@@ -3669,6 +3825,14 @@ impl Renderer {
             bg_quads.push(QuadInstance { rect: [0.0, panel_top, wf, 1.0], color: rule });
             bg_quads.push(QuadInstance { rect: [0.0, panel_top + panel_header_h, wf, 1.0], color: rule });
         }
+        // Help overlay: an opaque top panel with a bottom rule (modal shortcut list).
+        if help.is_some() {
+            let body_bg = self.color4(blend(self.theme.bg, self.theme.fg, 0.09));
+            let rule = self.color4(blend(self.theme.bg, self.theme.fg, 0.34));
+            let wf = w as f32;
+            bg_quads.push(QuadInstance { rect: [0.0, help_top, wf, help_bottom - help_top], color: body_bg });
+            bg_quads.push(QuadInstance { rect: [0.0, help_bottom - 1.0, wf, 1.0], color: rule });
+        }
 
         // Foreground text as per-cell colored rich-text spans.
         let base = Attrs::new().family(family_of(&self.font_family));
@@ -3742,6 +3906,38 @@ impl Renderer {
             );
             self.panel_body_buffer.shape_until_scroll(&mut self.font_system, false);
         }
+        if let Some(rows) = help {
+            let fam = family_of(&self.font_family);
+            let fg = self.theme.fg;
+            let hi = self.theme.cursor;
+            let width = (w as f32 - 2.0 * PAD).max(1.0);
+            let height = (help_bottom - help_top).max(self.line_h);
+            // Title (accent, bold) then a blank line, then "chord<pad>label" per row —
+            // the chord in the accent color, the label in fg, aligned in the monospace.
+            let wmax = rows.iter().map(|(c, _)| c.chars().count()).max().unwrap_or(0);
+            let mut spans: Vec<(String, [u8; 3], bool)> = Vec::new();
+            spans.push(("Keyboard shortcuts\n\n".to_string(), hi, true));
+            for (chord, label) in rows {
+                let pad = " ".repeat(wmax.saturating_sub(chord.chars().count()) + 3);
+                spans.push((chord.clone(), hi, false));
+                spans.push((format!("{pad}{label}\n"), fg, false));
+            }
+            let buf = &mut self.help_buffer;
+            buf.set_size(Some(width), Some(height));
+            buf.set_rich_text(
+                spans.iter().map(|(s, c, bold)| {
+                    let mut a = Attrs::new().family(fam).color(Color::rgb(c[0], c[1], c[2]));
+                    if *bold {
+                        a = a.weight(Weight::BOLD);
+                    }
+                    (s.as_str(), a)
+                }),
+                &Attrs::new(),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(&mut self.font_system, false);
+        }
 
         self.viewport
             .update(&self.queue, Resolution { width: w, height: h });
@@ -3786,6 +3982,18 @@ impl Renderer {
                 top: body_top,
                 scale: 1.0,
                 bounds: TextBounds { left: 0, top: body_top as i32, right: w as i32, bottom: h as i32 },
+                default_color: fg,
+                custom_glyphs: &[],
+            });
+        }
+        if help.is_some() {
+            let fg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
+            text_areas.push(TextArea {
+                buffer: &self.help_buffer,
+                left: PAD + 8.0,
+                top: help_top + 8.0,
+                scale: 1.0,
+                bounds: TextBounds { left: 0, top: help_top as i32, right: w as i32, bottom: help_bottom as i32 },
                 default_color: fg,
                 custom_glyphs: &[],
             });
@@ -3995,7 +4203,8 @@ impl Gfx {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>) {
+    #[allow(clippy::too_many_arguments)]
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -4013,6 +4222,7 @@ impl Gfx {
             search,
             palette,
             panel,
+            help,
         );
         self.r.queue.present(frame);
     }
@@ -4117,9 +4327,15 @@ fn capture(path: &str) -> Result<()> {
     } else {
         (r.line_h + 6.0) + (demo_man.len().saturating_sub(1)) as f32 * r.line_h + 12.0
     };
+    // Optional help-overlay demo: SAMPA_CAPTURE_HELP=1 renders the shortcut list.
+    let demo_help = std::env::var("SAMPA_CAPTURE_HELP").is_ok().then(help_rows);
+    let help_extra = demo_help
+        .as_ref()
+        .map(|rows| (rows.len() as f32 + 3.0) * r.line_h + 12.0)
+        .unwrap_or(0.0);
 
     let w = (PAD * 2.0 + cols as f32 * r.cell_w).ceil() as u32;
-    let h = (top + PAD + rows as f32 * r.line_h + pal_extra + man_extra).ceil() as u32;
+    let h = (top + PAD + rows as f32 * r.line_h + pal_extra + man_extra + help_extra).ceil() as u32;
 
     let tex = r.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("capture"),
@@ -4167,6 +4383,7 @@ fn capture(path: &str) -> Result<()> {
         demo_search.as_deref(),
         demo_palette.as_ref(),
         demo_manview.as_ref(),
+        demo_help.as_deref(),
     );
 
     let bpr = (w * 4).div_ceil(256) * 256; // 256-byte row alignment
@@ -4380,6 +4597,31 @@ mod tests {
             other => panic!("cat should run, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chord_prettifying() {
+        // Only the final token maps; modifiers/letters/digits stay (spec §4).
+        assert_eq!(prettify_chord("Ctrl+Shift+Slash"), "Ctrl+Shift+?");
+        assert_eq!(prettify_chord("Ctrl+Equal"), "Ctrl+=");
+        assert_eq!(prettify_chord("Ctrl+Minus"), "Ctrl+−");
+        assert_eq!(prettify_chord("Ctrl+Shift+Right"), "Ctrl+Shift+→");
+        assert_eq!(prettify_chord("Ctrl+Shift+Tab"), "Ctrl+Shift+Tab"); // unknown → verbatim
+        assert_eq!(prettify_chord("Ctrl+Shift+T"), "Ctrl+Shift+T");
+    }
+
+    #[test]
+    fn help_rows_are_complete_and_prettified() {
+        let rows = help_rows();
+        // Every configurable action + fixed row is present (none dropped).
+        assert_eq!(rows.len(), KEYBINDINGS.len() + HELP_FIXED.len());
+        let by_label = |lbl: &str| rows.iter().find(|(_, l)| l == lbl).map(|(c, _)| c.clone());
+        assert_eq!(by_label("This help").as_deref(), Some("Ctrl+Shift+?")); // prettified
+        assert_eq!(by_label("New tab").as_deref(), Some("Ctrl+Shift+T"));
+        assert_eq!(by_label("Zoom out").as_deref(), Some("Ctrl+−"));
+        assert_eq!(by_label("Paste").as_deref(), Some("Ctrl+Shift+V")); // fixed row present
+        // No blank chords (spec §5: empty bindings are skipped).
+        assert!(rows.iter().all(|(c, _)| !c.is_empty()));
     }
 
     #[test]
