@@ -809,6 +809,210 @@ impl ImageScanner {
     }
 }
 
+// --- Sixel graphics (DCS <params> q … ST, §6.4) ------------------------------
+// alacritty ignores DCS sixel, so a parallel scanner captures the payload and
+// `parse_sixel` rasterizes it into the same `DecodedImage`/`ImageStore` path the
+// iTerm2 images use. The parser is pure and unit-tested.
+
+/// Payload cap for one sixel image (raw command bytes), and a pixel cap on the result.
+const MAX_SIXEL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SIXEL_PIXELS: usize = 4_000_000;
+
+/// Read a run of ASCII digits as a number, saturating; returns the value and next index.
+fn sixel_num(data: &[u8], mut i: usize) -> (u32, usize) {
+    let mut n = 0u32;
+    while i < data.len() && data[i].is_ascii_digit() {
+        n = n.saturating_mul(10).saturating_add((data[i] - b'0') as u32);
+        i += 1;
+    }
+    (n, i)
+}
+
+/// The default sixel color registers: the 16 VT340-ish colors, rest black. Most sixels
+/// define their own colors with `#n;2;r;g;b`, so this only backstops undefined registers.
+fn default_sixel_palette() -> [[u8; 3]; 256] {
+    let mut p = [[0u8; 3]; 256];
+    let base = [
+        [0, 0, 0], [205, 0, 0], [0, 205, 0], [205, 205, 0], [0, 0, 238], [205, 0, 205],
+        [0, 205, 205], [229, 229, 229], [127, 127, 127], [255, 0, 0], [0, 255, 0],
+        [255, 255, 0], [92, 92, 255], [255, 0, 255], [0, 255, 255], [255, 255, 255],
+    ];
+    for (i, c) in base.iter().enumerate() {
+        p[i] = *c;
+    }
+    p
+}
+
+/// Walk sixel command `data` (the bytes after `q`), calling `emit(x, y, rgb)` for every
+/// lit pixel. Handles color select/define (`#`), RLE (`!`), CR (`$`), LF (`-`), and the
+/// sixel data bytes `?`..`~` (each = 6 vertical pixels). Colors resolve at emit time.
+fn sixel_walk(data: &[u8], mut emit: impl FnMut(u32, u32, [u8; 3])) {
+    let mut palette = default_sixel_palette();
+    let mut color = palette[0];
+    let (mut x, mut band) = (0u32, 0u32);
+    let mut i = 0;
+    let scale = |v: u32| ((v.min(100) * 255 + 50) / 100) as u8;
+    while i < data.len() {
+        match data[i] {
+            b'#' => {
+                let (n, j) = sixel_num(data, i + 1);
+                i = j;
+                let reg = (n & 0xff) as usize;
+                if i < data.len() && data[i] == b';' {
+                    // Definition: ;Pu;Px;Py;Pz — Pu=2 is RGB (0..100 each).
+                    let (pu, j) = sixel_num(data, i + 1);
+                    i = j;
+                    let mut vals = [0u32; 3];
+                    let mut k = 0;
+                    while k < 3 && i < data.len() && data[i] == b';' {
+                        let (v, j) = sixel_num(data, i + 1);
+                        i = j;
+                        vals[k] = v;
+                        k += 1;
+                    }
+                    if pu == 2 {
+                        palette[reg] = [scale(vals[0]), scale(vals[1]), scale(vals[2])];
+                    }
+                }
+                color = palette[reg];
+            }
+            b'!' => {
+                let (rep, j) = sixel_num(data, i + 1);
+                i = j;
+                let rep = rep.max(1);
+                if i < data.len() && (0x3f..=0x7e).contains(&data[i]) {
+                    let bits = data[i] - 0x3f;
+                    for k in 0..rep {
+                        for bit in 0..6u32 {
+                            if bits & (1 << bit) != 0 {
+                                emit(x + k, band * 6 + bit, color);
+                            }
+                        }
+                    }
+                    x += rep;
+                    i += 1;
+                }
+            }
+            b'$' => {
+                x = 0;
+                i += 1;
+            }
+            b'-' => {
+                x = 0;
+                band += 1;
+                i += 1;
+            }
+            c @ 0x3f..=0x7e => {
+                let bits = c - 0x3f;
+                for bit in 0..6u32 {
+                    if bits & (1 << bit) != 0 {
+                        emit(x, band * 6 + bit, color);
+                    }
+                }
+                x += 1;
+                i += 1;
+            }
+            _ => i += 1, // whitespace / newlines / unknown
+        }
+    }
+}
+
+/// Rasterize a sixel DCS payload (`<params> q <data>`) into RGBA. `None` if it isn't a
+/// sixel (the pre-`q` params must be numeric) or has no pixels / exceeds the caps.
+fn parse_sixel(payload: &[u8]) -> Option<DecodedImage> {
+    let qpos = payload.iter().position(|&b| b == b'q')?;
+    if !payload[..qpos].iter().all(|&b| b.is_ascii_digit() || b == b';' || b == b' ') {
+        return None; // e.g. DECRQSS `$q…` — not a sixel
+    }
+    let data = &payload[qpos + 1..];
+    // Pass 1: extent.
+    let (mut mx, mut my, mut any) = (0u32, 0u32, false);
+    sixel_walk(data, |x, y, _| {
+        any = true;
+        mx = mx.max(x);
+        my = my.max(y);
+    });
+    if !any {
+        return None;
+    }
+    let (w, h) = (mx + 1, my + 1);
+    if w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM || (w as usize) * (h as usize) > MAX_SIXEL_PIXELS {
+        return None;
+    }
+    // Pass 2: rasterize (opaque where lit, transparent elsewhere).
+    let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+    sixel_walk(data, |x, y, c| {
+        let idx = ((y * w + x) as usize) * 4;
+        rgba[idx..idx + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+    });
+    Some(DecodedImage { width: w, height: h, rgba })
+}
+
+/// Watches the stream for a DCS sixel (`ESC P <params> q … ST/BEL`) and returns the
+/// completed payload. Runs beside the VT parser (which ignores DCS) and the DECRQSS
+/// `DcsScanner`; `parse_sixel` rejects non-sixel DCS, so the two don't conflict.
+#[derive(Default)]
+struct SixelScanner {
+    state: DcsState,
+    buf: Vec<u8>,
+    over: bool,
+}
+
+impl SixelScanner {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        let out = (!self.over && !self.buf.is_empty()).then(|| std::mem::take(&mut self.buf));
+        self.buf.clear();
+        self.over = false;
+        self.state = DcsState::Ground;
+        out
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            match self.state {
+                DcsState::Ground => {
+                    if b == 0x1b {
+                        self.state = DcsState::Esc;
+                    }
+                }
+                DcsState::Esc => match b {
+                    b'P' => {
+                        self.state = DcsState::Dcs;
+                        self.buf.clear();
+                        self.over = false;
+                    }
+                    0x1b => {}
+                    _ => self.state = DcsState::Ground,
+                },
+                DcsState::Dcs => match b {
+                    0x07 => out.extend(self.finish()),
+                    0x1b => self.state = DcsState::EscInDcs,
+                    _ => {
+                        if self.buf.len() < MAX_SIXEL_BYTES {
+                            self.buf.push(b);
+                        } else {
+                            self.over = true;
+                        }
+                    }
+                },
+                DcsState::EscInDcs => match b {
+                    b'\\' => out.extend(self.finish()),
+                    _ => {
+                        self.buf.clear();
+                        self.state = if b == 0x1b { DcsState::Esc } else { DcsState::Ground };
+                    }
+                },
+            }
+        }
+        out
+    }
+}
+
 /// One decoded image placed on the grid. `anchor` is an absolute grid line at insert
 /// time; the renderer draws it at `anchor - display_offset`. `id` keys the GPU texture.
 struct PlacedImage {
@@ -955,6 +1159,7 @@ struct TermState {
     term: Term<EventProxy>,
     decrqcra: DecrqcraScanner,
     image_scanner: ImageScanner,
+    sixel: SixelScanner,
     dcs: DcsScanner,
 }
 
@@ -1163,6 +1368,7 @@ fn spawn_session(
         term,
         decrqcra: DecrqcraScanner::new(),
         image_scanner: ImageScanner::new(),
+        sixel: SixelScanner::new(),
         dcs: DcsScanner::new(),
     }));
     let images = Arc::new(Mutex::new(ImageStore::default()));
@@ -1275,6 +1481,16 @@ fn pump(
                     // cursor, and reserve vertical space so following text flows below.
                     for payload in g.image_scanner.feed(&bytes) {
                         if let Some(img) = parse_iterm_image(&payload) {
+                            let cur = g.term.renderable_content().cursor.point;
+                            let (anchor, col) = (cur.line.0, cur.column.0);
+                            let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
+                            g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
+                            image_adds.push((anchor, col, img));
+                        }
+                    }
+                    // Sixel graphics (DCS): rasterize + place like an inline image.
+                    for payload in g.sixel.feed(&bytes) {
+                        if let Some(img) = parse_sixel(&payload) {
                             let cur = g.term.renderable_content().cursor.point;
                             let (anchor, col) = (cur.line.0, cur.column.0);
                             let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
@@ -4283,6 +4499,17 @@ fn capture(path: &str) -> Result<()> {
             .unwrap()
             .add(6, 2, DecodedImage { width: iw, height: ih, rgba });
     }
+    // Optional sixel demo: SAMPA_CAPTURE_SIXEL=<file> rasterizes a real sixel into view.
+    if let Ok(path) = std::env::var("SAMPA_CAPTURE_SIXEL") {
+        if let Ok(bytes) = std::fs::read(&path) {
+            let mut sc = SixelScanner::new();
+            for payload in sc.feed(&bytes) {
+                if let Some(img) = parse_sixel(&payload) {
+                    images.lock().unwrap().add(4, 30, img);
+                }
+            }
+        }
+    }
     let mut r = Renderer::new(
         device,
         queue,
@@ -4597,6 +4824,52 @@ mod tests {
             other => panic!("cat should run, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sixel_parses_pixels_and_color() {
+        // "#1;2;100;0;0" defines register 1 = red; "@" = 0x40 → bits: 0x40-0x3f = 1 →
+        // only bit 0 set → one lit pixel at the top of the band. Two "@" → a 2×1 image.
+        let img = parse_sixel(b"0;0;0q#1;2;100;0;0@@").expect("valid sixel");
+        assert_eq!((img.width, img.height), (2, 1));
+        // Pixel (0,0) is red, opaque.
+        assert_eq!(&img.rgba[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&img.rgba[4..8], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn sixel_rle_newline_and_bits() {
+        // "!3~" repeats 0x7e (all 6 bits) three times → a 3-wide, 6-tall column;
+        // "-" drops a band; "@" lights the top pixel of the new band at x=0.
+        let img = parse_sixel(b"q#0;2;0;100;0!3~-@").expect("valid sixel");
+        assert_eq!(img.width, 3);
+        assert_eq!(img.height, 7); // 6 (first band) + 1 (second band, row 6)
+        // Column 0, all six rows lit (green) in the first band.
+        for y in 0..6 {
+            let idx = ((y * 3) * 4) as usize;
+            assert_eq!(&img.rgba[idx..idx + 4], &[0, 255, 0, 255], "row {y}");
+        }
+        // The new-band pixel is at (0, 6).
+        assert_eq!(&img.rgba[((6 * 3) * 4) as usize..][..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn sixel_rejects_non_sixel_dcs() {
+        // DECRQSS `$q…` has a non-numeric param before `q` → not a sixel.
+        assert!(parse_sixel(b"$q\"p").is_none());
+        // No lit pixels → nothing to show.
+        assert!(parse_sixel(b"q").is_none());
+    }
+
+    #[test]
+    fn sixel_scanner_extracts_dcs_payload() {
+        let mut sc = SixelScanner::new();
+        // ESC P q <data> ESC \
+        let out = sc.feed(b"\x1bPq#1~\x1b\\");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], b"q#1~");
+        // And the extracted payload rasterizes.
+        assert!(parse_sixel(&out[0]).is_some());
     }
 
     #[test]
