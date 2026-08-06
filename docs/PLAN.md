@@ -247,8 +247,15 @@ refuses writes (file provably untouched) and clears on Enter.
   extracts the payload (chunk-split-safe), `image` decodes it, and a wgpu **textured
   pipeline composites** it into the scene at the cursor; **§13 OOM caps** (max dims,
   source bytes, in-flight OSC bytes, live-image count with oldest-evicted). 3 unit tests
-  + PNG. ⬜ still: **sixel** + **kitty** protocols; precise **scroll-out lifecycle**
-  (anchored to an absolute line — drifts if the grid scrolls after insert).
+  + PNG. ✅ **Sixel (DCS)** — a parallel `SixelScanner` captures the DCS payload (which
+  alacritty ignores; `parse_sixel` rejects non-sixel DCS so it coexists with DECRQSS),
+  and a pure two-pass rasterizer decodes it (color select/define `#`, RLE `!`, CR `$`,
+  band-LF `-`, `?`..`~` sixels) into the **same `DecodedImage`/`ImageStore`/textured-quad
+  path** as OSC 1337, honoring the dim/pixel caps. 4 unit tests (pixels/color/RLE/bands,
+  scanner extraction, non-sixel rejection) + a pump smoke (consumed cleanly, no text leak)
+  + a real-sixel `--capture` render. ⬜ still: **kitty** graphics protocol; precise
+  **scroll-out lifecycle** (anchored to an absolute line — drifts if the grid scrolls
+  after insert).
 - 🔨 **OSC 8 hyperlinks:** ✅ OSC-8 tracked (via `alacritty_terminal`), rendered
   **underlined**, **Ctrl+click-to-open** with the target shown in the title and a strict
   **http/https scheme gate** (§13 — never `file:`/`javascript:`); auto-opens nothing.
