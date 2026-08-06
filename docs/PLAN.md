@@ -176,13 +176,18 @@ interactive pass + wider program coverage outstanding.)*
   regex test); bar rendered + verified via `--capture`.
 - ✅ **Zoom** — **Ctrl +/−/0** change the font size at runtime (clamped 6–48 pt; 0
   resets to the configured size), rebuilding renderer metrics + reflowing the grid/PTY.
-- ✅ **Help overlay** — **Ctrl+Shift+?** toggles a modal shortcut list to the
-  [help-overlay spec](spec-help-overlay.md): rows built each open from a single
-  keybinding source of truth (§3a actions + §3b fixed rows), chords **prettified** per
-  §4 (`Slash`→`?`, `Equal`→`=`, `Minus`→`−`, arrows…). Closes on the chord, **Esc**
-  (scoped so it never steals Esc from palette/search/panels), or a **backdrop click**.
-  `prettify_chord`/`help_rows` unit-tested; rendered + verified via `--capture`.
-  ⬜ still: config-driven *rebinding* (needs a keybindings config section), a ✕ button.
+- ✅ **Help overlay + keybinding config** — **Ctrl+Shift+?** toggles a modal shortcut
+  list to the [help-overlay spec](spec-help-overlay.md): rows built each open, chords
+  **prettified** per §4. Closes on the (bound) chord, **Esc** (scoped so it never steals
+  Esc from palette/search/panels), or a **backdrop click**. Now fully **config-driven**:
+  an `Action` enum + `ACTIONS` table are the single source; `Keybindings::load()` applies
+  `[keybindings]` overrides from the config file over the defaults; every app shortcut
+  goes through one `dispatch(action)` (chord matched by `action_for`, layout-tolerant via
+  `normalize_key` folding shifted symbols to a base token). So **rebinding a key changes
+  both its trigger and its help row** (spec §6) — verified end-to-end (`[keybindings]`
+  override → rendered help shows the new chord). `parse_chord`/`normalize_key`/
+  `action_for`/`help_rows`/rebinding all unit-tested (66 tests). ⬜ still: a ✕ button;
+  chord *validation* diagnostics.
 
 **Exit:** a config edit hot-reloads theme/font/cursor; a Powerline + truecolor prompt
 renders; tabs run independent shells; search highlights scrollback matches.
