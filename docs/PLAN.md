@@ -270,7 +270,16 @@ refuses writes (file provably untouched) and clears on Enter.
 - **IME / dead keys / compose:** wire IBus/fcitx via winit IME events — *historically
   where native terminals sink time* (feasibility §4). CJK/emoji width from the text
   stack.
-- **Accessibility:** an **AccessKit** tree (the webview gave one free).
+- ✅ **Accessibility (AccessKit):** the window now exposes an OS accessibility tree — a
+  `Window` root labeled with the tab title + a `Role::Terminal` child whose value is the
+  live screen text — so a screen reader (Orca/AT-SPI on Linux, and the other platforms
+  `accesskit_winit` covers) can read the terminal. The adapter is created before the
+  window is shown (start hidden → attach → reveal) and observes every window event; the
+  tree is pushed via `update_if_active`, which **no-ops unless a client is attached**, so
+  there's zero cost otherwise. `a11y_tree` is unit-tested; boots cleanly with the adapter
+  under headless Xvfb (graceful with no session bus). ⬜ still: **caret/selection**
+  exposure, per-line text nodes, action handling — screen-reader read-back can't be
+  verified in this environment.
 - 🔨 **Escape hardening in the VT layer (§13)** — a real `EventProxy` listener
   (replacing `VoidListener` for the live terminal) funnels VT events to the main loop:
   - ✅ **query replies routed** — DA/DSR/DECRQSS `PtyWrite` and OSC 4/10/11 color

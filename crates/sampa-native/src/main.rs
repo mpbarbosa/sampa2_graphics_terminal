@@ -29,6 +29,7 @@ use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use sampa_palette::list_executables;
+use accesskit::{Node as AccessNode, NodeId as AccessNodeId, Role as AccessRole, Tree as AccessTree, TreeUpdate};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
@@ -1177,7 +1178,7 @@ struct TermState {
     dcs: DcsScanner,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum UserEvent {
     Redraw,
     SessionExit { id: u64, detail: String },
@@ -1187,6 +1188,14 @@ enum UserEvent {
     ManReady { cmd: String, lines: Option<Vec<String>> },
     /// A debounced command preview finished; `gen` guards against stale results.
     PreviewReady { gen: u64, line: String, ran: bool, text: String },
+    /// An AccessKit adapter event (tree request / action / deactivation).
+    AccessKit(accesskit_winit::Event),
+}
+
+impl From<accesskit_winit::Event> for UserEvent {
+    fn from(e: accesskit_winit::Event) -> Self {
+        UserEvent::AccessKit(e)
+    }
 }
 
 /// One terminal tab: its VT state, PTY, image layer, and per-tab UI-event channel.
@@ -1306,6 +1315,7 @@ fn main() -> Result<()> {
         rows,
         window: None,
         gfx: None,
+        a11y: None,
         modifiers: ModifiersState::empty(),
         dumped: false,
         mouse_col: 0,
@@ -1564,6 +1574,8 @@ struct App {
     rows: u16,
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
+    /// AccessKit adapter (created with the window); drives the OS accessibility tree.
+    a11y: Option<accesskit_winit::Adapter>,
     modifiers: ModifiersState,
     dumped: bool,
     // mouse / selection
@@ -1623,8 +1635,12 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title(&self.title);
+        // The AccessKit adapter must be created before the window is first shown, so
+        // start hidden, attach the adapter, then reveal.
+        let attrs = Window::default_attributes().with_title(&self.title).with_visible(false);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        let a11y = accesskit_winit::Adapter::with_event_loop_proxy(&window, self.proxy.clone());
+        window.set_visible(true);
         let gfx = pollster::block_on(Gfx::new(
             Arc::clone(&window),
             Arc::clone(&self.images),
@@ -1635,6 +1651,7 @@ impl ApplicationHandler<UserEvent> for App {
         ));
         self.window = Some(window);
         self.gfx = Some(gfx);
+        self.a11y = Some(a11y);
         if let Ok(cmd) = std::env::var("SAMPA_AUTORUN") {
             self.pty_write(format!("{cmd}\r").as_bytes());
         }
@@ -1661,6 +1678,12 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ConfigReload => self.reload_config(),
             UserEvent::ManReady { cmd, lines } => self.man_ready(cmd, lines),
             UserEvent::PreviewReady { gen, line, ran, text } => self.preview_ready(gen, line, ran, text),
+            UserEvent::AccessKit(e) => {
+                // A screen reader attached / requested the tree — push the current one.
+                if matches!(e.window_event, accesskit_winit::WindowEvent::InitialTreeRequested) {
+                    self.update_a11y();
+                }
+            }
             UserEvent::CursorBlink => {
                 if self.blink {
                     self.cursor_on = !self.cursor_on;
@@ -1671,6 +1694,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Let the AccessKit adapter observe every window event (focus, geometry, …).
+        if let (Some(a), Some(w)) = (self.a11y.as_mut(), self.window.as_ref()) {
+            a.process_event(w, &event);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 for s in &self.sessions {
@@ -3072,6 +3099,31 @@ impl App {
         if let Some(gfx) = &mut self.gfx {
             gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref());
         }
+        self.update_a11y();
+    }
+
+    /// Push the current terminal text to the accessibility tree — but only if a client
+    /// (screen reader) is active, so it costs nothing otherwise. The closure captures
+    /// owned data (not `self`) to keep clear of the `a11y` borrow.
+    fn update_a11y(&mut self) {
+        let Some(adapter) = self.a11y.as_mut() else {
+            return;
+        };
+        let title = self
+            .sessions
+            .get(self.active)
+            .map(|s| s.title.clone())
+            .unwrap_or_else(|| self.title.clone());
+        let state = Arc::clone(&self.state);
+        let cursor_style = self.cursor_style;
+        adapter.update_if_active(|| {
+            let text = state
+                .lock()
+                .ok()
+                .map(|g| build_snapshot(&g.term, &Theme::default(), cursor_style, false).to_text())
+                .unwrap_or_default();
+            a11y_tree(&title, &text)
+        });
     }
 
 }
@@ -3285,6 +3337,27 @@ fn build_snapshot<L: EventListener>(
         }
     }
     Snapshot { cols, rows, offset, cells, cursor: cursor_cell }
+}
+
+/// AccessKit node ids: a `Window` root containing one `Terminal` node whose value is
+/// the visible grid text (so a screen reader can read it).
+const A11Y_ROOT: AccessNodeId = AccessNodeId(0);
+const A11Y_TERMINAL: AccessNodeId = AccessNodeId(1);
+
+/// Build the accessibility tree: a window root labeled with the title, and a terminal
+/// child whose value is `text` (the visible grid). Rebuilt on each update so the value
+/// tracks the screen. Pure — unit-tested independently of the platform adapter.
+fn a11y_tree(title: &str, text: &str) -> TreeUpdate {
+    let mut root = AccessNode::new(AccessRole::Window);
+    root.set_label(title);
+    root.set_children(vec![A11Y_TERMINAL]);
+    let mut term = AccessNode::new(AccessRole::Terminal);
+    term.set_value(text);
+    TreeUpdate {
+        nodes: vec![(A11Y_ROOT, root), (A11Y_TERMINAL, term)],
+        tree: Some(AccessTree::new(A11Y_ROOT)),
+        focus: A11Y_TERMINAL,
+    }
 }
 
 /// Whether grid cell (line, col) falls inside a selection range.
@@ -4917,6 +4990,24 @@ mod tests {
             other => panic!("cat should run, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a11y_tree_exposes_terminal_text() {
+        let up = a11y_tree("sampa — zsh", "line one\nline two\n");
+        // Root window + terminal child, focus on the terminal.
+        assert_eq!(up.nodes.len(), 2);
+        assert_eq!(up.focus, A11Y_TERMINAL);
+        assert_eq!(up.tree.as_ref().unwrap().root, A11Y_ROOT);
+        let (rid, root) = &up.nodes[0];
+        assert_eq!(*rid, A11Y_ROOT);
+        assert_eq!(root.role(), AccessRole::Window);
+        assert_eq!(root.label(), Some("sampa — zsh"));
+        assert_eq!(root.children(), &[A11Y_TERMINAL]);
+        let (tid, term) = &up.nodes[1];
+        assert_eq!(*tid, A11Y_TERMINAL);
+        assert_eq!(term.role(), AccessRole::Terminal);
+        assert_eq!(term.value(), Some("line one\nline two\n")); // screen text is readable
     }
 
     #[test]
