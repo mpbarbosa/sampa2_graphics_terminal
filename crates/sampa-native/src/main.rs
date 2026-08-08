@@ -75,31 +75,45 @@ const PREVIEW_DEBOUNCE_MS: u64 = 550;
 const FONT_SIZE_MIN: f32 = 6.0;
 const FONT_SIZE_MAX: f32 = 48.0;
 
-/// The keyboard shortcuts shown in the help overlay (`Ctrl+Shift+?`) — the single
-/// source of truth for what the app-level keys do (`docs/spec-help-overlay.md` §3a).
-/// Chords are in the spec's token form; [`prettify_chord`] renders them for display.
-const KEYBINDINGS: &[(&str, &str)] = &[
-    ("Ctrl+Shift+T", "New tab"),
-    ("Ctrl+Shift+W", "Close tab"),
-    ("Ctrl+Tab", "Next tab"),
-    ("Ctrl+Shift+Tab", "Previous tab"),
-    ("Ctrl+Shift+C", "Copy selection"),
-    ("Ctrl+Shift+F", "Find in terminal"),
-    ("Ctrl+Shift+P", "Command palette"),
-    ("Ctrl+Shift+M", "Toggle man-page panel"),
-    ("Ctrl+Shift+E", "Toggle command preview"),
-    ("Ctrl+Equal", "Zoom in"),
-    ("Ctrl+Minus", "Zoom out"),
-    ("Ctrl+0", "Reset zoom"),
-    ("Ctrl+Shift+Slash", "This help"),
-];
+/// An app-level keyboard action, bound to a chord via [`Keybindings`] and dispatched
+/// centrally. The single source of truth for what the non-PTY keys do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Action {
+    NewTab,
+    CloseTab,
+    NextTab,
+    PrevTab,
+    Copy,
+    Paste,
+    Search,
+    Palette,
+    ToggleMan,
+    TogglePreview,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    Help,
+}
 
-/// Fixed help rows for built-ins that aren't app keybindings (spec §3b).
-const HELP_FIXED: &[(&str, &str)] = &[
-    ("Ctrl+Shift+V", "Paste"),
-    ("Shift+PageUp", "Scroll history up"),
-    ("Shift+PageDown", "Scroll history down"),
-    ("Esc", "Close this help, an overlay, or a panel"),
+/// Action metadata: `(action, config key, help label, default chord)`. The config key
+/// is what a `[keybindings]` TOML entry overrides; the default chord is in the spec's
+/// token form (rendered by [`prettify_chord`]). Order is the help overlay's §3a order,
+/// with `Paste` last (shown as a §3b fixed row, not in §3a).
+const ACTIONS: &[(Action, &str, &str, &str)] = &[
+    (Action::NewTab, "new_tab", "New tab", "Ctrl+Shift+T"),
+    (Action::CloseTab, "close_tab", "Close tab", "Ctrl+Shift+W"),
+    (Action::NextTab, "next_tab", "Next tab", "Ctrl+Tab"),
+    (Action::PrevTab, "prev_tab", "Previous tab", "Ctrl+Shift+Tab"),
+    (Action::Copy, "copy", "Copy selection", "Ctrl+Shift+C"),
+    (Action::Search, "search", "Find in terminal", "Ctrl+Shift+F"),
+    (Action::Palette, "palette", "Command palette", "Ctrl+Shift+P"),
+    (Action::ToggleMan, "toggle_man", "Toggle man-page panel", "Ctrl+Shift+M"),
+    (Action::TogglePreview, "toggle_preview", "Toggle command preview", "Ctrl+Shift+E"),
+    (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
+    (Action::ZoomOut, "zoom_out", "Zoom out", "Ctrl+Minus"),
+    (Action::ZoomReset, "zoom_reset", "Reset zoom", "Ctrl+0"),
+    (Action::Help, "help", "This help", "Ctrl+Shift+Slash"),
+    (Action::Paste, "paste", "Paste", "Ctrl+Shift+V"),
 ];
 
 // --- XTWINOPS pixel/display metrics (§17 conformance) -------------------------
@@ -1313,6 +1327,7 @@ fn main() -> Result<()> {
         cursor_on: true,
         blink,
         help_on: false,
+        keys: Keybindings::load(),
         search_on: false,
         search_query: String::new(),
         search_matches: Vec::new(),
@@ -1573,6 +1588,8 @@ struct App {
     blink: bool,
     /// Keyboard-shortcut help overlay (Ctrl+Shift+?).
     help_on: bool,
+    /// Live keybindings (defaults + `[keybindings]` config overrides).
+    keys: Keybindings,
     // search overlay
     search_on: bool,
     search_query: String,
@@ -1671,49 +1688,36 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => self.render_now(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let m = self.modifiers;
-                // The help overlay is modal: while open it swallows keys, closing on
-                // Esc or its own chord (Ctrl+Shift+?), so it never steals Esc from the
-                // other overlays (which it can't coexist with — it opens only here).
+                let action = self.keys.action_for(&event.logical_key, m);
+                let is_esc = matches!(&event.logical_key, Key::Named(NamedKey::Escape));
+                // Modal overlays capture keys while open, closing on their bound toggle
+                // action (so a rebind still closes them) or Esc — scoped so Esc is never
+                // swallowed for anyone else. Only one of these can be open at a time.
                 if self.help_on {
-                    if matches!(&event.logical_key, Key::Named(NamedKey::Escape))
-                        || (m.control_key()
-                            && matches!(&event.logical_key, Key::Character(s) if s.as_str() == "?" || s.as_str() == "/"))
-                    {
+                    if action == Some(Action::Help) || is_esc {
                         self.help_on = false;
                         self.request_redraw();
                     }
                     return;
                 }
-                // The man panel captures navigation/close keys while open.
                 if self.man_on {
-                    if m.control_key()
-                        && m.shift_key()
-                        && matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("m"))
-                    {
+                    if action == Some(Action::ToggleMan) {
                         self.man_close();
                     } else {
                         self.man_key(&event.logical_key);
                     }
                     return;
                 }
-                // The command palette captures all input while open (Ctrl+Shift+P closes it).
                 if self.palette_on {
-                    if m.control_key()
-                        && m.shift_key()
-                        && matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("p"))
-                    {
+                    if action == Some(Action::Palette) {
                         self.palette_close();
                     } else {
                         self.palette_key(&event.logical_key, event.text.as_deref());
                     }
                     return;
                 }
-                // The search overlay captures all input while open (Ctrl+Shift+F closes it).
                 if self.search_on {
-                    if m.control_key()
-                        && m.shift_key()
-                        && matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("f"))
-                    {
+                    if action == Some(Action::Search) {
                         self.search_close();
                     } else {
                         self.search_key(&event.logical_key, event.text.as_deref(), m.shift_key());
@@ -1734,85 +1738,10 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                 }
-                // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs.
-                if m.control_key() && matches!(event.logical_key, Key::Named(NamedKey::Tab)) {
-                    let n = self.sessions.len();
-                    if n > 1 {
-                        let next = if m.shift_key() {
-                            (self.active + n - 1) % n
-                        } else {
-                            (self.active + 1) % n
-                        };
-                        self.switch_to(next);
-                    }
+                // Dispatch a bound app action (never reaches the PTY).
+                if let Some(a) = action {
+                    self.dispatch(a, event_loop);
                     return;
-                }
-                // App keybindings (Ctrl+Shift+C/V, Ctrl+Shift+T/W) never reach the PTY.
-                if m.control_key() && m.shift_key() {
-                    if let Key::Character(s) = &event.logical_key {
-                        match s.to_lowercase().as_str() {
-                            "c" => {
-                                self.copy_selection();
-                                return;
-                            }
-                            "v" => {
-                                self.paste_clipboard();
-                                return;
-                            }
-                            "t" => {
-                                self.new_tab();
-                                return;
-                            }
-                            "w" => {
-                                if self.close_session(self.active) {
-                                    event_loop.exit();
-                                }
-                                return;
-                            }
-                            "f" => {
-                                self.search_open();
-                                return;
-                            }
-                            "p" => {
-                                self.palette_open();
-                                return;
-                            }
-                            "m" => {
-                                self.man_open();
-                                return;
-                            }
-                            "e" => {
-                                self.preview_toggle();
-                                return;
-                            }
-                            "?" | "/" => {
-                                self.help_on = !self.help_on; // Ctrl+Shift+? toggles help
-                                self.request_redraw();
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                // Zoom: Ctrl +/−/0 change the font size at runtime (never reach the PTY).
-                if m.control_key() {
-                    if let Key::Character(s) = &event.logical_key {
-                        match s.as_str() {
-                            "=" | "+" => {
-                                self.zoom_by(1.0);
-                                return;
-                            }
-                            "-" | "_" => {
-                                self.zoom_by(-1.0);
-                                return;
-                            }
-                            "0" => {
-                                self.zoom_reset();
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
                 }
                 let app_cursor = self
                     .state
@@ -2024,16 +1953,140 @@ fn prettify_chord(chord: &str) -> String {
     tokens.join("+")
 }
 
-/// The help overlay's rows — `(prettified chord, label)` — rebuilt each open (spec §5):
-/// the configurable actions (§3a) followed by the fixed built-ins (§3b). Empty chords
-/// are skipped so a missing binding never shows a blank row.
-fn help_rows() -> Vec<(String, String)> {
-    KEYBINDINGS
-        .iter()
-        .chain(HELP_FIXED)
-        .filter(|(chord, _)| !chord.is_empty())
-        .map(|(chord, label)| (prettify_chord(chord), label.to_string()))
-        .collect()
+/// A parsed key chord: required modifiers + a normalized key token (spec §4 form, e.g.
+/// `T`, `Tab`, `Slash`, `Equal`). Events normalize to the same space for matching.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct Chord {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    key: String,
+}
+
+/// Parse a `Ctrl+Shift+T`-style chord string. `None` if empty or malformed (a missing
+/// binding then simply never matches — spec §5).
+fn parse_chord(s: &str) -> Option<Chord> {
+    let mut c = Chord::default();
+    for tok in s.split('+') {
+        match tok {
+            "Ctrl" | "Control" => c.ctrl = true,
+            "Shift" => c.shift = true,
+            "Alt" | "Meta" => c.alt = true,
+            "" => return None,
+            k if c.key.is_empty() => c.key = k.to_string(),
+            _ => return None, // two keys → malformed
+        }
+    }
+    (!c.key.is_empty()).then_some(c)
+}
+
+/// Normalize a winit logical key to a chord token so a live event compares equal to a
+/// parsed chord. Letters uppercase; shifted symbols fold to their base name so the
+/// Shift bit is the only signal (`/`+`?`→`Slash`, `=`+`+`→`Equal`, `-`+`_`→`Minus`).
+fn normalize_key(key: &Key) -> Option<String> {
+    match key {
+        Key::Named(NamedKey::Tab) => Some("Tab".into()),
+        Key::Named(NamedKey::Enter) => Some("Enter".into()),
+        Key::Named(NamedKey::Space) => Some("Space".into()),
+        Key::Character(s) => match s.as_str() {
+            "/" | "?" => Some("Slash".into()),
+            "=" | "+" => Some("Equal".into()),
+            "-" | "_" => Some("Minus".into()),
+            c if c.chars().count() == 1 => Some(c.to_uppercase()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The live keybinding table: each action's chord string (for display) + its parsed
+/// form (for matching). Built from [`ACTIONS`] defaults with `[keybindings]` overrides.
+struct Keybindings {
+    map: Vec<(Action, String, Option<Chord>)>,
+}
+
+impl Keybindings {
+    /// Load defaults, then apply any `[keybindings]` entries from the config file.
+    fn load() -> Self {
+        let overrides = read_keybinding_overrides();
+        let map = ACTIONS
+            .iter()
+            .map(|(a, key, _label, def)| {
+                let s = overrides.get(*key).cloned().unwrap_or_else(|| def.to_string());
+                let parsed = parse_chord(&s);
+                (*a, s, parsed)
+            })
+            .collect();
+        Self { map }
+    }
+
+    /// The action bound to a live key event, if any.
+    fn action_for(&self, key: &Key, m: ModifiersState) -> Option<Action> {
+        let ekey = normalize_key(key)?;
+        let e = Chord { ctrl: m.control_key(), shift: m.shift_key(), alt: m.alt_key(), key: ekey };
+        self.map.iter().find(|(_, _, ch)| ch.as_ref() == Some(&e)).map(|(a, _, _)| *a)
+    }
+
+    /// The (unprettified) chord string bound to `action`.
+    fn chord_str(&self, action: Action) -> &str {
+        self.map.iter().find(|(a, _, _)| *a == action).map(|(_, s, _)| s.as_str()).unwrap_or("")
+    }
+
+    /// The help overlay's rows — `(prettified chord, label)` — rebuilt each open (§5) so
+    /// a rebind shows immediately: the §3a actions in order, then the §3b fixed rows
+    /// (Paste from its live binding; scroll/Esc are literals). Empty chords are skipped.
+    fn help_rows(&self) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = ACTIONS
+            .iter()
+            .filter(|(a, _, _, _)| *a != Action::Paste)
+            .filter_map(|(a, _, label, _)| {
+                let c = self.chord_str(*a);
+                (!c.is_empty()).then(|| (prettify_chord(c), label.to_string()))
+            })
+            .collect();
+        let paste = self.chord_str(Action::Paste);
+        if !paste.is_empty() {
+            rows.push((prettify_chord(paste), "Paste".to_string()));
+        }
+        rows.push(("Shift+PageUp".to_string(), "Scroll history up".to_string()));
+        rows.push(("Shift+PageDown".to_string(), "Scroll history down".to_string()));
+        rows.push(("Esc".to_string(), "Close this help, an overlay, or a panel".to_string()));
+        rows
+    }
+}
+
+/// Read `[keybindings]` `key = "chord"` entries from the config file (a tiny hand
+/// parser — the shared `sampa-config` doesn't model keybindings). Missing file/section
+/// yields no overrides, so the defaults stand.
+fn read_keybinding_overrides() -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Some(path) = sampa_config::default_config_path() else {
+        return out;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let mut in_section = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_section = line == "[keybindings]";
+            continue;
+        }
+        if in_section {
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim();
+                let v = v.trim().trim_matches(['"', '\'']);
+                if !k.is_empty() {
+                    out.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The command whose man page to show for an input line: the first whitespace token,
@@ -2383,6 +2436,43 @@ impl App {
         self.cursor_on = true;
         self.update_title();
         self.request_redraw();
+    }
+
+    /// Cycle to the next/previous tab (wrapping); no-op with a single tab.
+    fn cycle_tab(&mut self, forward: bool) {
+        let n = self.sessions.len();
+        if n > 1 {
+            let next = if forward { (self.active + 1) % n } else { (self.active + n - 1) % n };
+            self.switch_to(next);
+        }
+    }
+
+    /// Run a bound keyboard action. The single place app shortcuts take effect, so the
+    /// keybinding table (defaults + config) fully drives behavior + the help overlay.
+    fn dispatch(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        match action {
+            Action::NewTab => self.new_tab(),
+            Action::CloseTab => {
+                if self.close_session(self.active) {
+                    event_loop.exit();
+                }
+            }
+            Action::NextTab => self.cycle_tab(true),
+            Action::PrevTab => self.cycle_tab(false),
+            Action::Copy => self.copy_selection(),
+            Action::Paste => self.paste_clipboard(),
+            Action::Search => self.search_open(),
+            Action::Palette => self.palette_open(),
+            Action::ToggleMan => self.man_open(),
+            Action::TogglePreview => self.preview_toggle(),
+            Action::ZoomIn => self.zoom_by(1.0),
+            Action::ZoomOut => self.zoom_by(-1.0),
+            Action::ZoomReset => self.zoom_reset(),
+            Action::Help => {
+                self.help_on = !self.help_on;
+                self.request_redraw();
+            }
+        }
     }
 
     /// Recompute the grid for the current window size — used when the tab bar
@@ -2845,6 +2935,7 @@ impl App {
         self.theme = theme_from(&cfg.colors);
         self.font_size = cfg.font.size.clamp(6.0, 72.0);
         self.font_size_base = self.font_size; // zoom resets to the configured size
+        self.keys = Keybindings::load(); // pick up any [keybindings] changes
         self.font_family = primary_family(&cfg.font.family);
         self.cursor_style = cfg.cursor.style;
         self.blink = cfg.cursor.blink;
@@ -2977,7 +3068,7 @@ impl App {
             None
         };
         // Help overlay: rebuilt each frame it's open (spec §5), so a config reload shows.
-        let help = self.help_on.then(help_rows);
+        let help = self.help_on.then(|| self.keys.help_rows());
         if let Some(gfx) = &mut self.gfx {
             gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref());
         }
@@ -4555,7 +4646,9 @@ fn capture(path: &str) -> Result<()> {
         (r.line_h + 6.0) + (demo_man.len().saturating_sub(1)) as f32 * r.line_h + 12.0
     };
     // Optional help-overlay demo: SAMPA_CAPTURE_HELP=1 renders the shortcut list.
-    let demo_help = std::env::var("SAMPA_CAPTURE_HELP").is_ok().then(help_rows);
+    let demo_help = std::env::var("SAMPA_CAPTURE_HELP")
+        .is_ok()
+        .then(|| Keybindings::load().help_rows());
     let help_extra = demo_help
         .as_ref()
         .map(|rows| (rows.len() as f32 + 3.0) * r.line_h + 12.0)
@@ -4883,18 +4976,76 @@ mod tests {
         assert_eq!(prettify_chord("Ctrl+Shift+T"), "Ctrl+Shift+T");
     }
 
+    /// A Keybindings built straight from ACTIONS defaults (no config file).
+    fn default_keys() -> Keybindings {
+        let map = ACTIONS
+            .iter()
+            .map(|(a, _, _, def)| (*a, def.to_string(), parse_chord(def)))
+            .collect();
+        Keybindings { map }
+    }
+
     #[test]
     fn help_rows_are_complete_and_prettified() {
-        let rows = help_rows();
-        // Every configurable action + fixed row is present (none dropped).
-        assert_eq!(rows.len(), KEYBINDINGS.len() + HELP_FIXED.len());
+        let rows = default_keys().help_rows();
         let by_label = |lbl: &str| rows.iter().find(|(_, l)| l == lbl).map(|(c, _)| c.clone());
+        // §3a actions + §3b fixed (Paste + 2 scroll + Esc).
+        assert_eq!(rows.len(), (ACTIONS.len() - 1) + 4);
         assert_eq!(by_label("This help").as_deref(), Some("Ctrl+Shift+?")); // prettified
         assert_eq!(by_label("New tab").as_deref(), Some("Ctrl+Shift+T"));
         assert_eq!(by_label("Zoom out").as_deref(), Some("Ctrl+−"));
         assert_eq!(by_label("Paste").as_deref(), Some("Ctrl+Shift+V")); // fixed row present
-        // No blank chords (spec §5: empty bindings are skipped).
-        assert!(rows.iter().all(|(c, _)| !c.is_empty()));
+        assert_eq!(by_label("Close this help, an overlay, or a panel").as_deref(), Some("Esc"));
+        assert!(rows.iter().all(|(c, _)| !c.is_empty())); // spec §5
+    }
+
+    #[test]
+    fn chord_parse_and_normalize_round_trip() {
+        // Parse produces a normalized token that matches the event normalization.
+        assert_eq!(parse_chord("Ctrl+Shift+T"), Some(Chord { ctrl: true, shift: true, alt: false, key: "T".into() }));
+        assert_eq!(parse_chord("Ctrl+Equal").unwrap().key, "Equal");
+        assert!(parse_chord("").is_none());
+        assert!(parse_chord("Ctrl+").is_none());
+        assert!(parse_chord("Ctrl+A+B").is_none()); // two keys
+        // Shifted symbols fold to the base token so Shift is the only distinguishing bit.
+        assert_eq!(normalize_key(&Key::Character("?".into())).as_deref(), Some("Slash"));
+        assert_eq!(normalize_key(&Key::Character("/".into())).as_deref(), Some("Slash"));
+        assert_eq!(normalize_key(&Key::Character("t".into())).as_deref(), Some("T"));
+        assert_eq!(normalize_key(&Key::Named(NamedKey::Tab)).as_deref(), Some("Tab"));
+    }
+
+    #[test]
+    fn action_for_matches_events() {
+        let keys = default_keys();
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        // Ctrl+Shift+T (char arrives uppercased) → NewTab.
+        assert_eq!(keys.action_for(&Key::Character("T".into()), ctrl_shift), Some(Action::NewTab));
+        // Ctrl+Shift+/ yields "?" → Help.
+        assert_eq!(keys.action_for(&Key::Character("?".into()), ctrl_shift), Some(Action::Help));
+        // Ctrl+= (no shift) → ZoomIn; adding Shift breaks the match (strict modifiers).
+        assert_eq!(keys.action_for(&Key::Character("=".into()), ModifiersState::CONTROL), Some(Action::ZoomIn));
+        assert_eq!(keys.action_for(&Key::Character("+".into()), ctrl_shift), None);
+        // A bare letter isn't an action (goes to the PTY).
+        assert_eq!(keys.action_for(&Key::Character("t".into()), ModifiersState::empty()), None);
+    }
+
+    #[test]
+    fn rebinding_changes_trigger_and_help_row() {
+        // Spec §6: rebinding `help` changes both the match and the displayed chord.
+        let mut keys = default_keys();
+        for e in keys.map.iter_mut() {
+            if e.0 == Action::Help {
+                e.1 = "Ctrl+Shift+H".to_string();
+                e.2 = parse_chord("Ctrl+Shift+H");
+            }
+        }
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        // New chord fires; old one no longer does.
+        assert_eq!(keys.action_for(&Key::Character("H".into()), ctrl_shift), Some(Action::Help));
+        assert_eq!(keys.action_for(&Key::Character("?".into()), ctrl_shift), None);
+        // Help row reflects the rebind.
+        let help_row = keys.help_rows().into_iter().find(|(_, l)| l == "This help").unwrap();
+        assert_eq!(help_row.0, "Ctrl+Shift+H");
     }
 
     #[test]
