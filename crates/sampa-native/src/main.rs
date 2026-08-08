@@ -46,7 +46,8 @@ use pty_core::pty::{spawn, PtyEvent, PtyHandle, SpawnConfig};
 use sampa_config::CursorStyle;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -256,6 +257,7 @@ struct Snapshot {
     offset: i32, // display_offset: image at absolute line L shows at row L + offset
     cells: Vec<CellVis>, // row-major, len == cols * rows
     cursor: Option<(usize, usize)>, // (row, col) for bar/underline cursors (block inverts the cell)
+    cursor_rc: Option<(usize, usize)>, // (row, col) of the cursor for ANY style (IME preedit anchor)
 }
 
 impl Snapshot {
@@ -1338,6 +1340,7 @@ fn main() -> Result<()> {
         blink,
         help_on: false,
         keys: Keybindings::load(),
+        preedit: String::new(),
         search_on: false,
         search_query: String::new(),
         search_matches: Vec::new(),
@@ -1602,6 +1605,8 @@ struct App {
     help_on: bool,
     /// Live keybindings (defaults + `[keybindings]` config overrides).
     keys: Keybindings,
+    /// The in-progress IME composition (preedit) text, drawn at the cursor.
+    preedit: String,
     // search overlay
     search_on: bool,
     search_query: String,
@@ -1640,6 +1645,7 @@ impl ApplicationHandler<UserEvent> for App {
         let attrs = Window::default_attributes().with_title(&self.title).with_visible(false);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let a11y = accesskit_winit::Adapter::with_event_loop_proxy(&window, self.proxy.clone());
+        window.set_ime_allowed(true); // enable IME (compose / CJK input)
         window.set_visible(true);
         let gfx = pollster::block_on(Gfx::new(
             Arc::clone(&window),
@@ -1713,6 +1719,31 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => self.render_now(),
+            WindowEvent::Ime(ime) => match ime {
+                // The composed result: send it to the shell like typed input.
+                Ime::Commit(text) => {
+                    self.preedit.clear();
+                    if !text.is_empty() {
+                        self.pty_write(text.as_bytes());
+                        for c in text.chars() {
+                            self.input_line.push(c);
+                        }
+                        self.schedule_preview();
+                        self.scroll(Scroll::Bottom);
+                        self.cursor_on = true;
+                    }
+                    self.request_redraw();
+                }
+                // Composition in progress: show it underlined at the cursor.
+                Ime::Preedit(text, _) => {
+                    self.preedit = text;
+                    self.request_redraw();
+                }
+                Ime::Enabled | Ime::Disabled => {
+                    self.preedit.clear();
+                    self.request_redraw();
+                }
+            },
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let m = self.modifiers;
                 let action = self.keys.action_for(&event.logical_key, m);
@@ -3096,8 +3127,20 @@ impl App {
         };
         // Help overlay: rebuilt each frame it's open (spec §5), so a config reload shows.
         let help = self.help_on.then(|| self.keys.help_rows());
+        // IME preedit: the in-progress composition, drawn at the cursor cell.
+        let preedit = (!self.preedit.is_empty())
+            .then_some(())
+            .and(snap.cursor_rc)
+            .map(|(r, c)| (self.preedit.as_str(), r, c));
+        // Keep the IME candidate window near the cursor while composing.
+        if let (Some(w), Some((r, c))) = (&self.window, preedit.map(|(_, r, c)| (r, c))) {
+            let (cw, lh) = self.cell_metrics();
+            let top = top_offset(self.sessions.len());
+            let (x, y) = (PAD + c as f32 * cw, top + r as f32 * lh);
+            w.set_ime_cursor_area(PhysicalPosition::new(x, y), PhysicalSize::new(cw * 8.0, lh));
+        }
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref());
+            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), preedit);
         }
         self.update_a11y();
     }
@@ -3317,10 +3360,14 @@ fn build_snapshot<L: EventListener>(
 
     let mut cells = Vec::with_capacity(rows * cols);
     let mut cursor_cell = None;
+    let mut cursor_rc = None;
     for r in 0..rows {
         let abs = r as i32 - offset;
         for c in 0..cols {
             let is_cursor = cursor_abs == Some((abs, c));
+            if is_cursor {
+                cursor_rc = Some((r, c)); // any style — used to anchor the IME preedit
+            }
             if is_cursor && !block {
                 cursor_cell = Some((r, c)); // bar/underline: drawn by the renderer
             }
@@ -3336,7 +3383,7 @@ fn build_snapshot<L: EventListener>(
             ));
         }
     }
-    Snapshot { cols, rows, offset, cells, cursor: cursor_cell }
+    Snapshot { cols, rows, offset, cells, cursor: cursor_cell, cursor_rc }
 }
 
 /// AccessKit node ids: a `Window` root containing one `Terminal` node whose value is
@@ -3625,6 +3672,7 @@ struct Renderer {
     panel_title_buffer: Buffer, // bottom-panel header (man/preview)
     panel_body_buffer: Buffer,  // bottom-panel body (multi-line)
     help_buffer: Buffer,        // keyboard-shortcut help overlay (title + rows)
+    preedit_buffer: Buffer,     // IME preedit (composition) text
     quad_pipeline: wgpu::RenderPipeline,
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
@@ -3667,6 +3715,7 @@ impl Renderer {
         let panel_title_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let panel_body_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let help_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+        let preedit_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quad"),
@@ -3828,6 +3877,7 @@ impl Renderer {
             panel_title_buffer,
             panel_body_buffer,
             help_buffer,
+            preedit_buffer,
             quad_pipeline,
             quad_uniform,
             quad_bind_group,
@@ -3931,6 +3981,7 @@ impl Renderer {
         self.panel_title_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.panel_body_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.help_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.preedit_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         // Overlay row buffers carry the old line height — drop so they're rebuilt.
         self.tab_buffers.clear();
         self.palette_buffers.clear();
@@ -4077,7 +4128,7 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>) {
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize)>) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
         // search bar and the bottom panel (man page / command preview) each overlay a
         // strip/panel at the bottom.
@@ -4213,6 +4264,21 @@ impl Renderer {
             bg_quads.push(QuadInstance { rect: [0.0, help_top, wf, help_bottom - help_top], color: body_bg });
             bg_quads.push(QuadInstance { rect: [0.0, help_bottom - 1.0, wf, 1.0], color: rule });
         }
+        // IME preedit: an opaque cell-strip + underline at the cursor (text added below).
+        if let Some((text, r, c)) = preedit {
+            let n = text.chars().count().max(1) as f32;
+            let x = PAD + c as f32 * self.cell_w;
+            let y = top + r as f32 * self.line_h;
+            let ww = n * self.cell_w;
+            bg_quads.push(QuadInstance {
+                rect: [x, y, ww, self.line_h],
+                color: self.color4(blend(self.theme.bg, self.theme.cursor, 0.25)),
+            });
+            deco_quads.push(QuadInstance {
+                rect: [x, y + self.line_h - 2.0, ww, 1.5],
+                color: self.color4(self.theme.cursor),
+            });
+        }
 
         // Foreground text as per-cell colored rich-text spans.
         let base = Attrs::new().family(family_of(&self.font_family));
@@ -4318,6 +4384,13 @@ impl Renderer {
             );
             buf.shape_until_scroll(&mut self.font_system, false);
         }
+        if let Some((text, _, _)) = preedit {
+            let fg = self.theme.fg;
+            let attrs = Attrs::new().family(family_of(&self.font_family)).color(Color::rgb(fg[0], fg[1], fg[2]));
+            self.preedit_buffer.set_size(Some((w as f32).max(1.0)), Some(self.line_h));
+            self.preedit_buffer.set_rich_text([(text, attrs)], &Attrs::new(), Shaping::Advanced, None);
+            self.preedit_buffer.shape_until_scroll(&mut self.font_system, false);
+        }
 
         self.viewport
             .update(&self.queue, Resolution { width: w, height: h });
@@ -4374,6 +4447,19 @@ impl Renderer {
                 top: help_top + 8.0,
                 scale: 1.0,
                 bounds: TextBounds { left: 0, top: help_top as i32, right: w as i32, bottom: help_bottom as i32 },
+                default_color: fg,
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((_, r, c)) = preedit {
+            let fg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
+            let (x, y) = (PAD + c as f32 * self.cell_w, top + r as f32 * self.line_h);
+            text_areas.push(TextArea {
+                buffer: &self.preedit_buffer,
+                left: x,
+                top: y,
+                scale: 1.0,
+                bounds: TextBounds { left: x as i32, top: y as i32, right: w as i32, bottom: (y + self.line_h) as i32 },
                 default_color: fg,
                 custom_glyphs: &[],
             });
@@ -4584,7 +4670,7 @@ impl Gfx {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>) {
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize)>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -4603,6 +4689,7 @@ impl Gfx {
             palette,
             panel,
             help,
+            preedit,
         );
         self.r.queue.present(frame);
     }
@@ -4777,6 +4864,7 @@ fn capture(path: &str) -> Result<()> {
         demo_palette.as_ref(),
         demo_manview.as_ref(),
         demo_help.as_deref(),
+        std::env::var("SAMPA_CAPTURE_PREEDIT").ok().as_deref().map(|t| (t, 6usize, 8usize)),
     );
 
     let bpr = (w * 4).div_ceil(256) * 256; // 256-byte row alignment
@@ -4990,6 +5078,24 @@ mod tests {
             other => panic!("cat should run, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_reports_cursor_for_any_style() {
+        let mut parser: Processor = Processor::new();
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(10, 3), VoidListener);
+        parser.advance(&mut term, b"ab"); // cursor now at row 0, col 2
+        // The IME anchor (cursor_rc) is set for a block cursor too, where `cursor` is None.
+        let block = build_snapshot(&term, &Theme::default(), CursorStyle::Block, true);
+        assert_eq!(block.cursor, None, "block cursor is drawn by cell inversion");
+        assert_eq!(block.cursor_rc, Some((0, 2)), "but the anchor position is still reported");
+        // For a bar cursor both are set to the same cell.
+        let bar = build_snapshot(&term, &Theme::default(), CursorStyle::Bar, true);
+        assert_eq!(bar.cursor, Some((0, 2)));
+        assert_eq!(bar.cursor_rc, Some((0, 2)));
+        // Hidden cursor → no anchor.
+        let off = build_snapshot(&term, &Theme::default(), CursorStyle::Block, false);
+        assert_eq!(off.cursor_rc, None);
     }
 
     #[test]
