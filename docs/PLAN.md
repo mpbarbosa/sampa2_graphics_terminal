@@ -267,9 +267,16 @@ refuses writes (file provably untouched) and clears on Enter.
   ✅ **plain-URL detection** too (`url_at`: whitespace token under the cursor → extract
   http/https, trim punctuation) so links work without OSC-8. 3 unit tests + PNG.
   ⬜ still: an in-window confirm/preview overlay (vs. title), hover affordance.
-- **IME / dead keys / compose:** wire IBus/fcitx via winit IME events — *historically
-  where native terminals sink time* (feasibility §4). CJK/emoji width from the text
-  stack.
+- 🔨 **IME / dead keys / compose:** IME is enabled (`set_ime_allowed`) and winit's `Ime`
+  events are wired — **Preedit** is stored and drawn **underlined at the cursor** (a
+  cursor-tinted strip + accent underline; CJK renders via `cosmic-text` fallback),
+  **Commit** sends the composed text to the shell (and feeds the man/preview input line),
+  Enabled/Disabled clear it. The **candidate window is positioned at the cursor**
+  (`set_ime_cursor_area`), tracked each frame via a new `Snapshot.cursor_rc` that reports
+  the cursor cell for **any** cursor style. Preedit render verified via `--capture`
+  (`にほんご` underlined); `cursor_rc` unit-tested; boots with IME enabled. ⏳ live IBus/
+  fcitx composition can't be exercised headlessly. ⬜ still: preedit caret sub-ranges,
+  dead-key/compose sequences beyond what the IM handles.
 - ✅ **Accessibility (AccessKit):** the window now exposes an OS accessibility tree — a
   `Window` root labeled with the tab title + a `Role::Terminal` child whose value is the
   live screen text — so a screen reader (Orca/AT-SPI on Linux, and the other platforms
