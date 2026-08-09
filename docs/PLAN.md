@@ -263,8 +263,15 @@ refuses writes (file provably untouched) and clears on Enter.
   position into the current view, so an image **rides up with its text as new output
   scrolls in** and off the top (instead of sticking to a fixed screen row), while still
   following scrollback when you scroll up. `image_row` unit-tested (fresh / scrolled-in /
-  scrolled-view / off-top / inserted-with-history). ⬜ still: the **kitty** graphics
-  protocol.
+  scrolled-view / off-top / inserted-with-history). ✅ **Kitty graphics (APC)** — a
+  parallel `KittyScanner` captures `ESC _ G … ST` APCs and **reassembles chunked
+  transmissions** (`m=1` … `m=0`); `parse_kitty` decodes the result — **PNG** (`f=100`),
+  raw **RGBA** (`f=32`), raw **RGB** (`f=24`, alpha filled) with `s`×`v` dims — for the
+  immediate transmit+display action (`a=T`) into the shared image path, and an
+  `ESC _ G i=<id>;OK ST` **ack** is sent so clients like `icat` don't block. 4 unit tests
+  (control parse, raw RGBA/RGB, action gate + ack, chunk reassembly) + a pump smoke + a
+  **chunked-PNG `--capture` render**. ⬜ still: image ids/placement (`a=t`/`a=p`),
+  deletion (`a=d`), z-index/placement geometry.
 - 🔨 **OSC 8 hyperlinks:** ✅ OSC-8 tracked (via `alacritty_terminal`), rendered
   **underlined**, **Ctrl+click-to-open** with the target shown in the title and a strict
   **http/https scheme gate** (§13 — never `file:`/`javascript:`); auto-opens nothing.

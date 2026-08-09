@@ -1031,6 +1031,167 @@ impl SixelScanner {
     }
 }
 
+// --- Kitty graphics protocol (APC G, §6.4) -----------------------------------
+// `ESC _ G <k=v,…> ; <base64 payload> ST`. alacritty ignores APC, so a parallel
+// scanner accumulates chunked transmissions (m=1) and `parse_kitty` decodes the
+// result into the shared image path. v1 handles immediate transmit+display (a=T).
+
+const MAX_KITTY_BYTES: usize = 12 * 1024 * 1024; // in-flight APC accumulation cap
+
+/// Value of control key `key` in a kitty `k=v,k=v` control string, if present.
+fn kitty_key<'a>(control: &'a str, key: &str) -> Option<&'a str> {
+    control.split(',').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k.trim() == key).then_some(v.trim())
+    })
+}
+
+fn kitty_num(control: &str, key: &str) -> Option<u32> {
+    kitty_key(control, key)?.parse().ok()
+}
+
+/// Decode a completed kitty transmission into RGBA — but only when it asks to display
+/// (`a=T`). Formats: `f=100` PNG (default here), `f=32` raw RGBA, `f=24` raw RGB; raw
+/// needs the pixel dimensions `s`×`v`. Enforces the shared dimension/byte caps.
+fn parse_kitty(control: &str, payload: &[u8]) -> Option<DecodedImage> {
+    if kitty_key(control, "a") != Some("T") {
+        return None; // transmit-only / placement / delete — not handled in v1
+    }
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    match kitty_key(control, "f").unwrap_or("100") {
+        "100" => {
+            let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            let (width, height) = rgba.dimensions();
+            (width > 0 && height > 0 && width <= MAX_IMAGE_DIM && height <= MAX_IMAGE_DIM)
+                .then(|| DecodedImage { width, height, rgba: rgba.into_raw() })
+        }
+        "32" | "24" => {
+            let (w, h) = (kitty_num(control, "s")?, kitty_num(control, "v")?);
+            if w == 0 || h == 0 || w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM {
+                return None;
+            }
+            let px = (w as usize) * (h as usize);
+            let rgba = if kitty_key(control, "f") == Some("24") {
+                if bytes.len() < px * 3 {
+                    return None;
+                }
+                bytes.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect()
+            } else {
+                if bytes.len() < px * 4 {
+                    return None;
+                }
+                bytes[..px * 4].to_vec()
+            };
+            Some(DecodedImage { width: w, height: h, rgba })
+        }
+        _ => None,
+    }
+}
+
+/// A kitty APC response (`ESC _ G i=<id>;OK ST`) so clients like `icat` don't block.
+/// Sent only when the transmission carried an id and didn't ask to be quiet (`q=1|2`).
+fn kitty_response(control: &str) -> Option<Vec<u8>> {
+    let id = kitty_key(control, "i")?;
+    if matches!(kitty_key(control, "q"), Some("1") | Some("2")) {
+        return None;
+    }
+    Some(format!("\x1b_Gi={id};OK\x1b\\").into_bytes())
+}
+
+/// Watches the stream for kitty graphics APCs (`ESC _ G … ST/BEL`), accumulating chunked
+/// transmissions (`m=1` … `m=0`) and yielding `(control, payload)` for completed images.
+#[derive(Default)]
+struct KittyScanner {
+    state: DcsState, // reuses the same Ground/Esc/Body/EscInBody shape
+    buf: Vec<u8>,
+    over: bool,
+    pending_control: Option<String>,
+    pending_payload: Vec<u8>,
+}
+
+impl KittyScanner {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process one completed APC body (the bytes between `ESC _` and `ST`).
+    fn complete(&mut self, out: &mut Vec<(String, Vec<u8>)>) {
+        let buf = std::mem::take(&mut self.buf);
+        self.state = DcsState::Ground;
+        if self.over {
+            self.over = false;
+            self.pending_control = None;
+            self.pending_payload.clear();
+            return;
+        }
+        let Some(body) = buf.strip_prefix(b"G") else {
+            return; // not a graphics APC
+        };
+        let (control, payload) = match body.iter().position(|&b| b == b';') {
+            Some(i) => (String::from_utf8_lossy(&body[..i]).into_owned(), body[i + 1..].to_vec()),
+            None => (String::from_utf8_lossy(body).into_owned(), Vec::new()),
+        };
+        let more = kitty_key(&control, "m") == Some("1");
+        if self.pending_control.is_some() {
+            self.pending_payload.extend_from_slice(&payload);
+            if !more {
+                let ctrl = self.pending_control.take().unwrap();
+                out.push((ctrl, std::mem::take(&mut self.pending_payload)));
+            }
+        } else if more {
+            self.pending_control = Some(control);
+            self.pending_payload = payload;
+        } else {
+            out.push((control, payload));
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            match self.state {
+                DcsState::Ground => {
+                    if b == 0x1b {
+                        self.state = DcsState::Esc;
+                    }
+                }
+                DcsState::Esc => match b {
+                    b'_' => {
+                        self.state = DcsState::Dcs;
+                        self.buf.clear();
+                        self.over = false;
+                    }
+                    0x1b => {}
+                    _ => self.state = DcsState::Ground,
+                },
+                DcsState::Dcs => match b {
+                    0x07 => self.complete(&mut out),
+                    0x1b => self.state = DcsState::EscInDcs,
+                    _ => {
+                        if self.buf.len() < MAX_KITTY_BYTES {
+                            self.buf.push(b);
+                        } else {
+                            self.over = true;
+                        }
+                    }
+                },
+                DcsState::EscInDcs => match b {
+                    b'\\' => self.complete(&mut out),
+                    _ => {
+                        self.buf.clear();
+                        self.state = if b == 0x1b { DcsState::Esc } else { DcsState::Ground };
+                    }
+                },
+            }
+        }
+        out
+    }
+}
+
 /// One decoded image placed on the grid. `anchor` is the screen line at insert time and
 /// `base_history` the scrollback depth then; together they pin the image to its content
 /// so it scrolls up with the text (see [`image_row`]). `id` keys the GPU texture.
@@ -1188,6 +1349,7 @@ struct TermState {
     decrqcra: DecrqcraScanner,
     image_scanner: ImageScanner,
     sixel: SixelScanner,
+    kitty: KittyScanner,
     dcs: DcsScanner,
 }
 
@@ -1408,6 +1570,7 @@ fn spawn_session(
         decrqcra: DecrqcraScanner::new(),
         image_scanner: ImageScanner::new(),
         sixel: SixelScanner::new(),
+        kitty: KittyScanner::new(),
         dcs: DcsScanner::new(),
     }));
     let images = Arc::new(Mutex::new(ImageStore::default()));
@@ -1531,6 +1694,18 @@ fn pump(
                     // Sixel graphics (DCS): rasterize + place like an inline image.
                     for payload in g.sixel.feed(&bytes) {
                         if let Some(img) = parse_sixel(&payload) {
+                            let cur = g.term.renderable_content().cursor.point;
+                            let (anchor, col) = (cur.line.0, cur.column.0);
+                            let base = g.term.grid().history_size();
+                            let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
+                            g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
+                            image_adds.push((anchor, base, col, img));
+                        }
+                    }
+                    // Kitty graphics (APC): decode chunked transmissions, place, and ack.
+                    for (control, payload) in g.kitty.feed(&bytes) {
+                        replies.extend(kitty_response(&control));
+                        if let Some(img) = parse_kitty(&control, &payload) {
                             let cur = g.term.renderable_content().cursor.point;
                             let (anchor, col) = (cur.line.0, cur.column.0);
                             let base = g.term.grid().history_size();
@@ -4774,6 +4949,17 @@ fn capture(path: &str) -> Result<()> {
             }
         }
     }
+    // Optional kitty demo: SAMPA_CAPTURE_KITTY=<file> decodes a real kitty APC into view.
+    if let Ok(path) = std::env::var("SAMPA_CAPTURE_KITTY") {
+        if let Ok(bytes) = std::fs::read(&path) {
+            let mut sc = KittyScanner::new();
+            for (control, payload) in sc.feed(&bytes) {
+                if let Some(img) = parse_kitty(&control, &payload) {
+                    images.lock().unwrap().add(4, 0, 30, img);
+                }
+            }
+        }
+    }
     let mut r = Renderer::new(
         device,
         queue,
@@ -5127,6 +5313,54 @@ mod tests {
         assert_eq!(*tid, A11Y_TERMINAL);
         assert_eq!(term.role(), AccessRole::Terminal);
         assert_eq!(term.value(), Some("line one\nline two\n")); // screen text is readable
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn kitty_control_parsing() {
+        assert_eq!(kitty_key("a=T,f=32,s=100", "f"), Some("32"));
+        assert_eq!(kitty_key("a=T,f=32", "x"), None);
+        assert_eq!(kitty_num("s=640,v=480", "v"), Some(480));
+    }
+
+    #[test]
+    fn kitty_decodes_raw_rgba_and_rgb() {
+        // f=32: two RGBA pixels (red, green), 2×1.
+        let rgba = [255, 0, 0, 255, 0, 255, 0, 255];
+        let img = parse_kitty("a=T,f=32,s=2,v=1", b64(&rgba).as_bytes()).unwrap();
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(img.rgba, rgba);
+        // f=24: two RGB pixels → alpha filled to 255.
+        let rgb = [10, 20, 30, 40, 50, 60];
+        let img = parse_kitty("a=T,f=24,s=2,v=1", b64(&rgb).as_bytes()).unwrap();
+        assert_eq!(img.rgba, [10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn kitty_requires_display_action_and_acks() {
+        // a=t (transmit only, not T) isn't displayed in v1.
+        assert!(parse_kitty("a=t,f=32,s=1,v=1", b64(&[1, 2, 3, 4]).as_bytes()).is_none());
+        // Ack carries the id; q=2 suppresses it.
+        assert_eq!(kitty_response("a=T,i=7"), Some(b"\x1b_Gi=7;OK\x1b\\".to_vec()));
+        assert_eq!(kitty_response("a=T,i=7,q=2"), None);
+        assert_eq!(kitty_response("a=T"), None); // no id → no ack
+    }
+
+    #[test]
+    fn kitty_scanner_reassembles_chunks() {
+        let mut sc = KittyScanner::new();
+        // First chunk (m=1) carries the control; the continuation (m=0) only more data.
+        let mut out = sc.feed(b"\x1b_Ga=T,f=32,s=2,v=1,m=1;AAAA\x1b\\");
+        assert!(out.is_empty(), "m=1 chunk is buffered, not emitted");
+        out = sc.feed(b"\x1b_Gm=0;BBBB\x1b\\");
+        assert_eq!(out.len(), 1);
+        let (control, payload) = &out[0];
+        assert_eq!(control, "a=T,f=32,s=2,v=1,m=1");
+        assert_eq!(payload, b"AAAABBBB"); // concatenated across chunks
     }
 
     #[test]
