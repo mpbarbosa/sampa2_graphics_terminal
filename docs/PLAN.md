@@ -155,7 +155,9 @@ interactive pass + wider program coverage outstanding.)*
   (re-measures the cell advance, rebuilds the text buffer, resizes term/PTY) without a
   restart. ✅ **cursor shape** (block inverts the cell; **bar**/**underline** drawn as a
   thin quad in the config cursor color) + **blink** (~530ms tick, resets on keypress,
-  honors the config toggle). ⬜ still: ligatures toggle, bell, fontconfig fallback;
+  honors the config toggle). ✅ **visual bell** — `BEL` from the active tab flashes a
+  bright (cursor-color) border frame for ~120 ms, self-clearing via a short redraw burst
+  (no audible bell). ⬜ still: ligatures toggle, fontconfig fallback;
   scrollback change still needs a restart (fresh `Term`).
 - ✅ **Tabs** — multi-session: each tab owns its VT state/PTY/image-layer/pump; `App`
   keeps active-session pointers (re-pointed on switch). **Ctrl+Shift+T** new,
@@ -315,7 +317,7 @@ refuses writes (file provably untouched) and clears on Enter.
     the rectangular-area checksum sees the exact grid state, replying
     `DCS Pid !~ HHHH ST` (raw 16-bit codepoint sum, empty = 0x20 — the
     `--xterm-checksum 334` convention). 6 unit tests (title/DA/OSC-52 ×2, scanner, checksum).
-  - 6 unit tests. ⬜ still: interactive OSC-52 **consent modal** (vs. env toggle); bell.
+  - 6 unit tests. ⬜ still: interactive OSC-52 **consent modal** (vs. env toggle).
 
 **Exit:** sixel renders within caps, oversized rejected not OOM; links need a click
 and show target; a CJK/emoji/compose input test passes; a screen reader sees the grid.
