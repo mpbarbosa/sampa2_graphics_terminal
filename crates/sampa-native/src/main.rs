@@ -237,14 +237,43 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(base.join("sampa2").join("config.toml"))
 }
 
+/// The raw config file text, if present.
+fn config_text() -> Option<String> {
+    std::fs::read_to_string(config_path()?).ok()
+}
+
+/// Parse the native-only top-level `opacity = <0..1>` key (background transparency),
+/// ignoring comments. `None` if absent/malformed. This key isn't in the shared
+/// `sampa-config` schema, so it's [`strip_native_keys`]-ped before that strict parse.
+fn parse_opacity(text: &str) -> Option<f32> {
+    text.lines().find_map(|l| {
+        let l = l.split('#').next().unwrap_or("").trim();
+        let rest = l.strip_prefix("opacity")?.trim_start().strip_prefix('=')?;
+        rest.trim().parse::<f32>().ok()
+    })
+}
+
+/// Remove native-only keys (currently `opacity`) so the file passes the strict
+/// `sampa-config` parse (both `Config` and its sections `deny_unknown_fields`).
+fn strip_native_keys(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.split('#').next().unwrap_or("").trim_start().starts_with("opacity"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Background opacity from the config (clamped 0..1), defaulting to 1.0 (opaque).
+fn load_opacity() -> f32 {
+    config_text().and_then(|t| parse_opacity(&t)).unwrap_or(1.0).clamp(0.0, 1.0)
+}
+
 /// Load config from the native XDG path if present, else built-in defaults (§11).
 fn load_config() -> sampa_config::Config {
-    if let Some(path) = config_path() {
-        if path.exists() {
-            match sampa_config::Config::load(&path) {
-                Ok(c) => return c,
-                Err(e) => eprintln!("config: {e}; using defaults"),
-            }
+    if let Some(text) = config_text() {
+        // Strip the native-only keys the strict sampa-config parse would reject.
+        match sampa_config::Config::from_toml(&strip_native_keys(&text)) {
+            Ok(c) => return c,
+            Err(e) => eprintln!("config: {e}; using defaults"),
         }
     }
     sampa_config::Config::from_toml("").expect("built-in default config parses")
@@ -1595,6 +1624,7 @@ fn main() -> Result<()> {
         font_family,
         cursor_style,
         ligatures: cfg.font.ligatures,
+        opacity: load_opacity(),
         cursor_on: true,
         blink,
         help_on: false,
@@ -1888,6 +1918,8 @@ struct App {
     font_family: String,
     cursor_style: CursorStyle,
     ligatures: bool,
+    /// Background opacity (1.0 = opaque). Set at launch; a change needs a restart.
+    opacity: f32,
     cursor_on: bool,
     blink: bool,
     /// Keyboard-shortcut help overlay (Ctrl+Shift+?).
@@ -1935,7 +1967,10 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // The AccessKit adapter must be created before the window is first shown, so
         // start hidden, attach the adapter, then reveal.
-        let attrs = Window::default_attributes().with_title(&self.title).with_visible(false);
+        let attrs = Window::default_attributes()
+            .with_title(&self.title)
+            .with_transparent(self.opacity < 1.0)
+            .with_visible(false);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let a11y = accesskit_winit::Adapter::with_event_loop_proxy(&window, self.proxy.clone());
         window.set_ime_allowed(true); // enable IME (compose / CJK input)
@@ -1948,6 +1983,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.font_family.clone(),
             self.cursor_style,
             self.ligatures,
+            self.opacity,
         ));
         self.window = Some(window);
         self.gfx = Some(gfx);
@@ -4011,6 +4047,8 @@ struct Renderer {
     font_family: String,
     cursor_style: CursorStyle,
     ligatures: bool, // grid text uses Advanced shaping when on, Basic (no ligatures) off
+    opacity: f32,    // background clear alpha (1.0 = opaque)
+    premultiplied: bool, // surface alpha mode is premultiplied → premultiply the clear
 }
 
 impl Renderer {
@@ -4025,6 +4063,8 @@ impl Renderer {
         font_family: String,
         cursor_style: CursorStyle,
         ligatures: bool,
+        opacity: f32,
+        premultiplied: bool,
     ) -> Self {
         let srgb = format.is_srgb();
         let line_h = (font_size * 1.2).ceil();
@@ -4218,6 +4258,8 @@ impl Renderer {
             font_family,
             cursor_style,
             ligatures,
+            opacity,
+            premultiplied,
         }
     }
 
@@ -4911,11 +4953,12 @@ impl Renderer {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg[0] as f64,
-                            g: bg[1] as f64,
-                            b: bg[2] as f64,
-                            a: 1.0,
+                        // Background clear at the configured opacity. Under a premultiplied
+                        // surface, the color channels are scaled by alpha too.
+                        load: wgpu::LoadOp::Clear({
+                            let a = self.opacity as f64;
+                            let s = if self.premultiplied { a } else { 1.0 };
+                            wgpu::Color { r: bg[0] as f64 * s, g: bg[1] as f64 * s, b: bg[2] as f64 * s, a }
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -4981,6 +5024,7 @@ impl Gfx {
         font_family: String,
         cursor_style: CursorStyle,
         ligatures: bool,
+        opacity: f32,
     ) -> Self {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
@@ -4999,9 +5043,22 @@ impl Gfx {
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
             .expect("request device");
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, w, h)
             .expect("surface default config");
+        // For a translucent background, pick an alpha-compositing surface mode the
+        // platform supports (premultiplied preferred). If none, stay opaque.
+        let caps = surface.get_capabilities(&adapter);
+        let has = |m| caps.alpha_modes.contains(&m);
+        let (opacity, premultiplied) = if opacity < 1.0 && has(wgpu::CompositeAlphaMode::PreMultiplied) {
+            config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+            (opacity, true)
+        } else if opacity < 1.0 && has(wgpu::CompositeAlphaMode::PostMultiplied) {
+            config.alpha_mode = wgpu::CompositeAlphaMode::PostMultiplied;
+            (opacity, false)
+        } else {
+            (1.0, false) // no transparent mode available → opaque
+        };
         let format = config.format;
         surface.configure(&device, &config);
         Gfx {
@@ -5009,7 +5066,7 @@ impl Gfx {
             config,
             r: Renderer::new(
                 device, queue, format, images, theme, font_size, font_family, cursor_style,
-                ligatures,
+                ligatures, opacity, premultiplied,
             ),
         }
     }
@@ -5020,8 +5077,6 @@ impl Gfx {
         self.surface.configure(&self.r.device, &self.config);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         let frame = match self.surface.get_current_texture() {
@@ -5136,6 +5191,8 @@ fn capture(path: &str) -> Result<()> {
         primary_family(&cfg.font.family),
         cfg.cursor.style,
         std::env::var("SAMPA_CAPTURE_LIGATURES").is_ok() || cfg.font.ligatures,
+        load_opacity(), // straight alpha into the capture texture (PNG alpha = opacity)
+        false,
     );
 
     // Optional visual check of the tab bar: SAMPA_CAPTURE_TABS="zsh,vim,htop".
@@ -5676,6 +5733,20 @@ mod tests {
         // Help row reflects the rebind.
         let help_row = keys.help_rows().into_iter().find(|(_, l)| l == "This help").unwrap();
         assert_eq!(help_row.0, "Ctrl+Shift+H");
+    }
+
+    #[test]
+    fn native_opacity_key_parsed_and_stripped() {
+        let cfg = "opacity = 0.80  # background transparency\n[font]\nsize = 12.0\n";
+        // The native key is read...
+        assert_eq!(parse_opacity(cfg), Some(0.80));
+        assert_eq!(parse_opacity("[font]\nsize = 12.0\n"), None); // absent
+        // ...and stripped so the strict sampa-config parse accepts the rest.
+        let stripped = strip_native_keys(cfg);
+        assert!(!stripped.contains("opacity"));
+        assert!(sampa_config::Config::from_toml(&stripped).is_ok());
+        // With the key left in, the strict parse would reject it (deny_unknown_fields).
+        assert!(sampa_config::Config::from_toml(cfg).is_err());
     }
 
     #[test]
