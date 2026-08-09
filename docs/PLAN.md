@@ -258,9 +258,13 @@ refuses writes (file provably untouched) and clears on Enter.
   band-LF `-`, `?`..`~` sixels) into the **same `DecodedImage`/`ImageStore`/textured-quad
   path** as OSC 1337, honoring the dim/pixel caps. 4 unit tests (pixels/color/RLE/bands,
   scanner extraction, non-sixel rejection) + a pump smoke (consumed cleanly, no text leak)
-  + a real-sixel `--capture` render. ⬜ still: **kitty** graphics protocol; precise
-  **scroll-out lifecycle** (anchored to an absolute line — drifts if the grid scrolls
-  after insert).
+  + a real-sixel `--capture` render. ✅ **Scroll-out lifecycle** — each image records the
+  scrollback depth at insert (`base_history`); `image_row` maps its content's stable
+  position into the current view, so an image **rides up with its text as new output
+  scrolls in** and off the top (instead of sticking to a fixed screen row), while still
+  following scrollback when you scroll up. `image_row` unit-tested (fresh / scrolled-in /
+  scrolled-view / off-top / inserted-with-history). ⬜ still: the **kitty** graphics
+  protocol.
 - 🔨 **OSC 8 hyperlinks:** ✅ OSC-8 tracked (via `alacritty_terminal`), rendered
   **underlined**, **Ctrl+click-to-open** with the target shown in the title and a strict
   **http/https scheme gate** (§13 — never `file:`/`javascript:`); auto-opens nothing.

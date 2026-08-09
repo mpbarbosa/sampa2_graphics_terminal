@@ -258,6 +258,7 @@ struct Snapshot {
     cells: Vec<CellVis>, // row-major, len == cols * rows
     cursor: Option<(usize, usize)>, // (row, col) for bar/underline cursors (block inverts the cell)
     cursor_rc: Option<(usize, usize)>, // (row, col) of the cursor for ANY style (IME preedit anchor)
+    history: usize, // scrollback depth now — pairs with each image's base_history
 }
 
 impl Snapshot {
@@ -1030,15 +1031,24 @@ impl SixelScanner {
     }
 }
 
-/// One decoded image placed on the grid. `anchor` is an absolute grid line at insert
-/// time; the renderer draws it at `anchor - display_offset`. `id` keys the GPU texture.
+/// One decoded image placed on the grid. `anchor` is the screen line at insert time and
+/// `base_history` the scrollback depth then; together they pin the image to its content
+/// so it scrolls up with the text (see [`image_row`]). `id` keys the GPU texture.
 struct PlacedImage {
     id: u64,
     anchor: i32,
+    base_history: usize,
     col: usize,
     width: u32,
     height: u32,
     rgba: Option<Vec<u8>>, // taken by the renderer on first upload
+}
+
+/// The visible grid row for an image: its content's stable position (`anchor` plus the
+/// scrollback that existed at insert) mapped into the current view. As new output scrolls
+/// in, `history` grows, so the image rides up with its text and eventually off the top.
+fn image_row(anchor: i32, base_history: usize, history: usize, offset: i32) -> i32 {
+    anchor - (history as i32 - base_history as i32) + offset
 }
 
 /// Live inline images, shared between the parser thread (adds) and the renderer
@@ -1050,12 +1060,13 @@ struct ImageStore {
 }
 
 impl ImageStore {
-    fn add(&mut self, anchor: i32, col: usize, img: DecodedImage) {
+    fn add(&mut self, anchor: i32, base_history: usize, col: usize, img: DecodedImage) {
         let id = self.next_id;
         self.next_id += 1;
         self.images.push(PlacedImage {
             id,
             anchor,
+            base_history,
             col,
             width: img.width,
             height: img.height,
@@ -1430,7 +1441,7 @@ fn pump(
                 // the next output byte is processed — that's what apps block on).
                 let mut replies: Vec<Vec<u8>> = Vec::new();
                 let mut pty_resize: Option<(u16, u16)> = None;
-                let mut image_adds: Vec<(i32, usize, DecodedImage)> = Vec::new();
+                let mut image_adds: Vec<(i32, usize, usize, DecodedImage)> = Vec::new();
                 if let Ok(mut g) = state.lock() {
                     let g = &mut *g;
                     // Split the feed at each DECRQCRA so the checksum sees the exact
@@ -1511,9 +1522,10 @@ fn pump(
                         if let Some(img) = parse_iterm_image(&payload) {
                             let cur = g.term.renderable_content().cursor.point;
                             let (anchor, col) = (cur.line.0, cur.column.0);
+                            let base = g.term.grid().history_size();
                             let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
                             g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-                            image_adds.push((anchor, col, img));
+                            image_adds.push((anchor, base, col, img));
                         }
                     }
                     // Sixel graphics (DCS): rasterize + place like an inline image.
@@ -1521,16 +1533,17 @@ fn pump(
                         if let Some(img) = parse_sixel(&payload) {
                             let cur = g.term.renderable_content().cursor.point;
                             let (anchor, col) = (cur.line.0, cur.column.0);
+                            let base = g.term.grid().history_size();
                             let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
                             g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-                            image_adds.push((anchor, col, img));
+                            image_adds.push((anchor, base, col, img));
                         }
                     }
                 }
                 if !image_adds.is_empty() {
                     if let Ok(mut store) = image_store.lock() {
-                        for (anchor, col, img) in image_adds {
-                            store.add(anchor, col, img);
+                        for (anchor, base, col, img) in image_adds {
+                            store.add(anchor, base, col, img);
                         }
                     }
                 }
@@ -3383,7 +3396,7 @@ fn build_snapshot<L: EventListener>(
             ));
         }
     }
-    Snapshot { cols, rows, offset, cells, cursor: cursor_cell, cursor_rc }
+    Snapshot { cols, rows, offset, cells, cursor: cursor_cell, cursor_rc, history: grid.history_size() }
 }
 
 /// AccessKit node ids: a `Window` root containing one `Terminal` node whose value is
@@ -3894,7 +3907,7 @@ impl Renderer {
 
     /// Upload any newly-added images to GPU textures and drop textures for evicted
     /// images. Returns the per-image draw rects (in pixels) for the current frame.
-    fn sync_images(&mut self, offset: i32, top: f32, w: u32, h: u32) -> Vec<(u64, [f32; 4])> {
+    fn sync_images(&mut self, offset: i32, history: usize, top: f32, w: u32, h: u32) -> Vec<(u64, [f32; 4])> {
         let mut rects = Vec::new();
         let Ok(mut store) = self.images.lock() else {
             return rects;
@@ -3954,7 +3967,7 @@ impl Renderer {
             }
             // Place at (col, absolute anchor + display_offset), natural pixel size.
             let x = PAD + img.col as f32 * self.cell_w;
-            let y = top + (img.anchor + offset) as f32 * self.line_h;
+            let y = top + image_row(img.anchor, img.base_history, history, offset) as f32 * self.line_h;
             if x < w as f32 && y < h as f32 && y + img.height as f32 > 0.0 {
                 rects.push((img.id, [x, y, img.width as f32, img.height as f32]));
             }
@@ -4527,7 +4540,7 @@ impl Renderer {
             bytemuck::bytes_of(&ScreenUniform { size: [w as f32, h as f32], _pad: [0.0, 0.0] }),
         );
         // Upload/evict image textures and build a one-rect vertex buffer per image.
-        let image_rects = self.sync_images(snap.offset, top, w, h);
+        let image_rects = self.sync_images(snap.offset, snap.history, top, w, h);
         let image_bufs: Vec<(u64, wgpu::Buffer)> = image_rects
             .iter()
             .map(|(id, rect)| {
@@ -4748,7 +4761,7 @@ fn capture(path: &str) -> Result<()> {
         images
             .lock()
             .unwrap()
-            .add(6, 2, DecodedImage { width: iw, height: ih, rgba });
+            .add(6, 0, 2, DecodedImage { width: iw, height: ih, rgba });
     }
     // Optional sixel demo: SAMPA_CAPTURE_SIXEL=<file> rasterizes a real sixel into view.
     if let Ok(path) = std::env::var("SAMPA_CAPTURE_SIXEL") {
@@ -4756,7 +4769,7 @@ fn capture(path: &str) -> Result<()> {
             let mut sc = SixelScanner::new();
             for payload in sc.feed(&bytes) {
                 if let Some(img) = parse_sixel(&payload) {
-                    images.lock().unwrap().add(4, 30, img);
+                    images.lock().unwrap().add(4, 0, 30, img);
                 }
             }
         }
@@ -5114,6 +5127,21 @@ mod tests {
         assert_eq!(*tid, A11Y_TERMINAL);
         assert_eq!(term.role(), AccessRole::Terminal);
         assert_eq!(term.value(), Some("line one\nline two\n")); // screen text is readable
+    }
+
+    #[test]
+    fn image_row_rides_with_content() {
+        // Inserted at screen row 5 with no scrollback, viewed at the bottom (offset 0).
+        assert_eq!(image_row(5, 0, 0, 0), 5);
+        // 3 lines of output scrolled in (history grew 0→3): the image rides up to row 2.
+        assert_eq!(image_row(5, 0, 3, 0), 2);
+        // Scrolling the view up 4 lines into history brings it back down.
+        assert_eq!(image_row(5, 0, 3, 4), 6);
+        // Enough new output pushes it off the top (negative row → not drawn).
+        assert_eq!(image_row(5, 0, 10, 0), -5);
+        // Inserted when scrollback already had 8 lines: only *later* growth moves it.
+        assert_eq!(image_row(2, 8, 8, 0), 2);
+        assert_eq!(image_row(2, 8, 11, 0), -1);
     }
 
     #[test]
