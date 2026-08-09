@@ -14,7 +14,7 @@ tools/conformance/run-esctest.sh --include CUP   # a subset by test-name regex
 ```
 
 The runner fetches a pinned esctest2, starts a private Xvfb, launches
-`sampa --title esctestrun -e python3 esctest.py …` (so esctest runs *inside* Sampa and
+`sampa2 --title esctestrun -e python3 esctest.py …` (so esctest runs *inside* Sampa and
 talks to it purely over the PTY), waits for the summary, and cleans up. It selects
 `--xterm-checksum 334` — the raw (non-negated) 16-bit codepoint-sum convention, empty
 cells counted as space (0x20) — which is exactly what `compute_decrqcra` replies with.

@@ -6,7 +6,7 @@ license.workspace = true
 description = "Sampa — Rust-only (native) graphical terminal (Path C)."
 
 [[bin]]
-name = "sampa"
+name = "sampa2"
 path = "src/main.rs"
 
 # --- Shared headless core (origin repo), per ADR 0002 -------------------------

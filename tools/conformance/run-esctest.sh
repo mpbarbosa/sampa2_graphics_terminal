@@ -7,7 +7,7 @@
 # Unlike the origin (Tauri/webview) build, this is a native winit+wgpu binary; under
 # Xvfb it uses the X11 backend, so xdotool window cleanup works. esctest itself talks
 # to the terminal purely over the PTY (stdout → render, stdin ← our DECRQCRA replies),
-# launched via `sampa -e python3 esctest.py`.
+# launched via `sampa2 -e python3 esctest.py`.
 #
 # Requirements: python3, git, xdotool, Xvfb. esctest2 is fetched (pinned) on first run.
 #
@@ -22,7 +22,7 @@ ESCTEST_DIR="$ESCTEST_TOP/esctest"          # contains esctest.py
 ESCTEST_REPO="https://github.com/ThomasDickey/esctest2.git"
 ESCTEST_COMMIT="664be3cf2c1e3f06bc93a8bafb48a0db83c607db"   # pinned
 
-BIN="$ROOT/target/release/sampa"
+BIN="$ROOT/target/release/sampa2"
 INCLUDE=".*"
 DISPLAY_ARG=""
 
