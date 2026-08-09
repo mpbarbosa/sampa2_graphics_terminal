@@ -70,6 +70,8 @@ const PALETTE_VISIBLE: usize = 10;
 const PALETTE_MAX: usize = 60;
 /// Man panel: the most body lines shown at once (fewer if the window is short).
 const MAN_VISIBLE: usize = 18;
+/// How long the visual bell border flashes.
+const BELL_FLASH: std::time::Duration = std::time::Duration::from_millis(120);
 /// Preview panel: max body lines shown, and the debounce before a settled line runs.
 const PREVIEW_VISIBLE: usize = 12;
 const PREVIEW_DEBOUNCE_MS: u64 = 550;
@@ -1586,6 +1588,7 @@ fn main() -> Result<()> {
         help_on: false,
         keys: Keybindings::load(),
         preedit: String::new(),
+        bell_until: None,
         search_on: false,
         search_query: String::new(),
         search_matches: Vec::new(),
@@ -1879,6 +1882,8 @@ struct App {
     keys: Keybindings,
     /// The in-progress IME composition (preedit) text, drawn at the cursor.
     preedit: String,
+    /// When set and still in the future, the visual bell border is flashing.
+    bell_until: Option<std::time::Instant>,
     // search overlay
     search_on: bool,
     search_query: String,
@@ -3220,6 +3225,7 @@ impl App {
         // Drain every tab's UI events (title updates per-tab; window title tracks the
         // active one). Collect first to avoid borrow conflicts with self.clipboard.
         let mut retitle = false;
+        let mut bell = false;
         let mut stores: Vec<String> = Vec::new();
         for i in 0..self.sessions.len() {
             while let Ok(ev) = self.sessions[i].app_rx.try_recv() {
@@ -3230,9 +3236,14 @@ impl App {
                     }
                     // OSC-52 write gate: denied by default (SAMPA_OSC52=allow to permit).
                     AppEvent::ClipboardStore(s) if self.osc52_allow => stores.push(s),
-                    AppEvent::ClipboardStore(_) | AppEvent::Bell => {}
+                    AppEvent::ClipboardStore(_) => {}
+                    AppEvent::Bell => bell |= i == self.active,
                 }
             }
+        }
+        if bell {
+            self.bell_until = Some(std::time::Instant::now() + BELL_FLASH);
+            self.request_redraw();
         }
         if let Some(clip) = self.clipboard.as_mut() {
             for s in stores {
@@ -3411,8 +3422,14 @@ impl App {
             let (x, y) = (PAD + c as f32 * cw, top + r as f32 * lh);
             w.set_ime_cursor_area(PhysicalPosition::new(x, y), PhysicalSize::new(cw * 8.0, lh));
         }
+        // Visual bell: flash a border while `bell_until` is in the future, re-drawing
+        // until it lapses (then one final frame clears it).
+        let bell = self.bell_until.is_some_and(|t| std::time::Instant::now() < t);
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), preedit);
+            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), preedit, bell);
+        }
+        if bell {
+            self.request_redraw();
         }
         self.update_a11y();
     }
@@ -4400,7 +4417,7 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize)>) {
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize)>, bell: bool) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
         // search bar and the bottom panel (man page / command preview) each overlay a
         // strip/panel at the bottom.
@@ -4550,6 +4567,19 @@ impl Renderer {
                 rect: [x, y + self.line_h - 2.0, ww, 1.5],
                 color: self.color4(self.theme.cursor),
             });
+        }
+        // Visual bell: a bright border frame over everything (drawn in the deco pass).
+        if bell {
+            let (wf, hf, t) = (w as f32, h as f32, 3.0);
+            let c = self.color4(self.theme.cursor);
+            for rect in [
+                [0.0, 0.0, wf, t],           // top
+                [0.0, hf - t, wf, t],        // bottom
+                [0.0, 0.0, t, hf],           // left
+                [wf - t, 0.0, t, hf],        // right
+            ] {
+                deco_quads.push(QuadInstance { rect, color: c });
+            }
         }
 
         // Foreground text as per-cell colored rich-text spans.
@@ -4942,7 +4972,8 @@ impl Gfx {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize)>) {
+    #[allow(clippy::too_many_arguments)]
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize)>, bell: bool) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -4962,6 +4993,7 @@ impl Gfx {
             panel,
             help,
             preedit,
+            bell,
         );
         self.r.queue.present(frame);
     }
@@ -5148,6 +5180,7 @@ fn capture(path: &str) -> Result<()> {
         demo_manview.as_ref(),
         demo_help.as_deref(),
         std::env::var("SAMPA_CAPTURE_PREEDIT").ok().as_deref().map(|t| (t, 6usize, 8usize)),
+        std::env::var("SAMPA_CAPTURE_BELL").is_ok(),
     );
 
     let bpr = (w * 4).div_ceil(256) * 256; // 256-byte row alignment
