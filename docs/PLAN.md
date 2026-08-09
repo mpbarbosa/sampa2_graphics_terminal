@@ -289,9 +289,11 @@ refuses writes (file provably untouched) and clears on Enter.
   Enabled/Disabled clear it. The **candidate window is positioned at the cursor**
   (`set_ime_cursor_area`), tracked each frame via a new `Snapshot.cursor_rc` that reports
   the cursor cell for **any** cursor style. Preedit render verified via `--capture`
-  (`にほんご` underlined); `cursor_rc` unit-tested; boots with IME enabled. ⏳ live IBus/
-  fcitx composition can't be exercised headlessly. ⬜ still: preedit caret sub-ranges,
-  dead-key/compose sequences beyond what the IM handles.
+  (`にほんご` underlined); `cursor_rc` unit-tested; boots with IME enabled. ✅ **preedit
+  caret** — winit's `Ime::Preedit` byte range is honored: a bright caret bar marks the IME
+  cursor within the composition (`preedit_caret_cells` maps the byte offset to a cell,
+  clamped/UTF-8-safe, unit-tested). ⏳ live IBus/fcitx composition can't be exercised
+  headlessly. ⬜ still: dead-key/compose sequences beyond what the IM handles.
 - ✅ **Accessibility (AccessKit):** the window now exposes an OS accessibility tree — a
   `Window` root labeled with the tab title + a `Role::Terminal` child whose value is the
   live screen text — so a screen reader (Orca/AT-SPI on Linux, and the other platforms

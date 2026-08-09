@@ -1589,6 +1589,7 @@ fn main() -> Result<()> {
         help_on: false,
         keys: Keybindings::load(),
         preedit: String::new(),
+        preedit_cursor: None,
         bell_until: None,
         search_on: false,
         search_query: String::new(),
@@ -1884,6 +1885,8 @@ struct App {
     keys: Keybindings,
     /// The in-progress IME composition (preedit) text, drawn at the cursor.
     preedit: String,
+    /// The IME cursor byte range within `preedit` (winit's `Ime::Preedit` range).
+    preedit_cursor: Option<(usize, usize)>,
     /// When set and still in the future, the visual bell border is flashing.
     bell_until: Option<std::time::Instant>,
     // search overlay
@@ -2003,6 +2006,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // The composed result: send it to the shell like typed input.
                 Ime::Commit(text) => {
                     self.preedit.clear();
+                    self.preedit_cursor = None;
                     if !text.is_empty() {
                         self.pty_write(text.as_bytes());
                         for c in text.chars() {
@@ -2014,13 +2018,16 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.request_redraw();
                 }
-                // Composition in progress: show it underlined at the cursor.
-                Ime::Preedit(text, _) => {
+                // Composition in progress: show it underlined at the cursor, with the
+                // IME caret marked at the reported byte range.
+                Ime::Preedit(text, range) => {
                     self.preedit = text;
+                    self.preedit_cursor = range;
                     self.request_redraw();
                 }
                 Ime::Enabled | Ime::Disabled => {
                     self.preedit.clear();
+                    self.preedit_cursor = None;
                     self.request_redraw();
                 }
             },
@@ -2430,6 +2437,16 @@ fn read_keybinding_overrides() -> std::collections::HashMap<String, String> {
 /// The command whose man page to show for an input line: the first whitespace token,
 /// with a leading `\` stripped (`\ls`→`ls`) and a leading `sudo`/`command` skipped
 /// (`sudo grep …`→`grep`).
+/// The caret column within the preedit, in cells: the number of chars before the IME
+/// cursor's byte offset (each char = one cell for the ASCII/compose case). With no range
+/// winit reports, the caret sits at the end of the composition.
+fn preedit_caret_cells(text: &str, range: Option<(usize, usize)>) -> usize {
+    match range {
+        Some((start, _)) => text.get(..start.min(text.len())).unwrap_or(text).chars().count(),
+        None => text.chars().count(),
+    }
+}
+
 fn first_command_token(line: &str) -> &str {
     let mut it = line.split_whitespace();
     let first = it.next().unwrap_or("");
@@ -3419,9 +3436,12 @@ impl App {
         let preedit = (!self.preedit.is_empty())
             .then_some(())
             .and(snap.cursor_rc)
-            .map(|(r, c)| (self.preedit.as_str(), r, c));
+            .map(|(r, c)| {
+                let caret = preedit_caret_cells(&self.preedit, self.preedit_cursor);
+                (self.preedit.as_str(), r, c, caret)
+            });
         // Keep the IME candidate window near the cursor while composing.
-        if let (Some(w), Some((r, c))) = (&self.window, preedit.map(|(_, r, c)| (r, c))) {
+        if let (Some(w), Some((r, c))) = (&self.window, preedit.map(|(_, r, c, _)| (r, c))) {
             let (cw, lh) = self.cell_metrics();
             let top = top_offset(self.sessions.len());
             let (x, y) = (PAD + c as f32 * cw, top + r as f32 * lh);
@@ -4428,7 +4448,7 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize)>, bell: bool) {
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
         // search bar and the bottom panel (man page / command preview) each overlay a
         // strip/panel at the bottom.
@@ -4564,8 +4584,9 @@ impl Renderer {
             bg_quads.push(QuadInstance { rect: [0.0, help_top, wf, help_bottom - help_top], color: body_bg });
             bg_quads.push(QuadInstance { rect: [0.0, help_bottom - 1.0, wf, 1.0], color: rule });
         }
-        // IME preedit: an opaque cell-strip + underline at the cursor (text added below).
-        if let Some((text, r, c)) = preedit {
+        // IME preedit: an opaque cell-strip + underline at the cursor (text added below),
+        // plus a bright caret bar at the IME cursor position within the composition.
+        if let Some((text, r, c, caret)) = preedit {
             let n = text.chars().count().max(1) as f32;
             let x = PAD + c as f32 * self.cell_w;
             let y = top + r as f32 * self.line_h;
@@ -4577,6 +4598,10 @@ impl Renderer {
             deco_quads.push(QuadInstance {
                 rect: [x, y + self.line_h - 2.0, ww, 1.5],
                 color: self.color4(self.theme.cursor),
+            });
+            deco_quads.push(QuadInstance {
+                rect: [x + caret as f32 * self.cell_w, y, 2.0, self.line_h],
+                color: self.color4(self.theme.fg),
             });
         }
         // Visual bell: a bright border frame over everything (drawn in the deco pass).
@@ -4697,7 +4722,7 @@ impl Renderer {
             );
             buf.shape_until_scroll(&mut self.font_system, false);
         }
-        if let Some((text, _, _)) = preedit {
+        if let Some((text, _, _, _)) = preedit {
             let fg = self.theme.fg;
             let attrs = Attrs::new().family(family_of(&self.font_family)).color(Color::rgb(fg[0], fg[1], fg[2]));
             self.preedit_buffer.set_size(Some((w as f32).max(1.0)), Some(self.line_h));
@@ -4764,7 +4789,7 @@ impl Renderer {
                 custom_glyphs: &[],
             });
         }
-        if let Some((_, r, c)) = preedit {
+        if let Some((_, r, c, _)) = preedit {
             let fg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
             let (x, y) = (PAD + c as f32 * self.cell_w, top + r as f32 * self.line_h);
             text_areas.push(TextArea {
@@ -4987,7 +5012,7 @@ impl Gfx {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize)>, bell: bool) {
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -5194,7 +5219,10 @@ fn capture(path: &str) -> Result<()> {
         demo_palette.as_ref(),
         demo_manview.as_ref(),
         demo_help.as_deref(),
-        std::env::var("SAMPA_CAPTURE_PREEDIT").ok().as_deref().map(|t| (t, 6usize, 8usize)),
+        std::env::var("SAMPA_CAPTURE_PREEDIT")
+            .ok()
+            .as_deref()
+            .map(|t| (t, 6usize, 8usize, t.chars().count().min(2))),
         std::env::var("SAMPA_CAPTURE_BELL").is_ok(),
     );
 
@@ -5637,6 +5665,19 @@ mod tests {
         // Help row reflects the rebind.
         let help_row = keys.help_rows().into_iter().find(|(_, l)| l == "This help").unwrap();
         assert_eq!(help_row.0, "Ctrl+Shift+H");
+    }
+
+    #[test]
+    fn preedit_caret_position() {
+        // Byte range start → char count before it (ASCII: byte == char).
+        assert_eq!(preedit_caret_cells("hello", Some((3, 3))), 3);
+        assert_eq!(preedit_caret_cells("hello", Some((0, 0))), 0);
+        // No range → caret at the end of the composition.
+        assert_eq!(preedit_caret_cells("hello", None), 5);
+        // Multi-byte: 'あ' is 3 bytes; a start of 3 is 1 char in.
+        assert_eq!(preedit_caret_cells("あい", Some((3, 3))), 1);
+        // Out-of-range start is clamped (never panics on a byte boundary).
+        assert_eq!(preedit_caret_cells("hi", Some((99, 99))), 2);
     }
 
     #[test]
