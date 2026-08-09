@@ -159,7 +159,13 @@ interactive pass + wider program coverage outstanding.)*
   bright (cursor-color) border frame for ~120 ms, self-clearing via a short redraw burst
   (no audible bell). ✅ **ligatures toggle** — `font.ligatures` (default off, safest for
   grid alignment) selects `cosmic-text` `Shaping::Advanced` vs `Basic` for the grid text;
-  applied live on config reload. ⬜ still: fontconfig fallback;
+  applied live on config reload. ✅ **background transparency** — a native-only top-level
+  `opacity` key (0–1; parsed + stripped before the strict `sampa-config` parse, since both
+  it and `Window` `deny_unknown_fields`) makes the window translucent: the surface picks a
+  premultiplied/postmultiplied alpha mode when the compositor supports one and the frame
+  clears at that alpha (default-bg cells transparent, colored cells stay opaque). Needs a
+  compositing WM; a change takes effect on restart. `parse_opacity`/`strip_native_keys`
+  unit-tested; verified via `--capture` alpha channel. ⬜ still: fontconfig fallback;
   scrollback change still needs a restart (fresh `Term`).
 - ✅ **Tabs** — multi-session: each tab owns its VT state/PTY/image-layer/pump; `App`
   keeps active-session pointers (re-pointed on switch). **Ctrl+Shift+T** new,
