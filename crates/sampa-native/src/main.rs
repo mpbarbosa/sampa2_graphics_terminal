@@ -441,6 +441,9 @@ enum ScanEvent {
     /// the private erase. With no DECSCA protection tracked (all cells unprotected), it
     /// is equivalent to plain ED/EL, which we inject. `line` = DECSEL (`K`).
     SelectiveErase { line: bool, ps: u16 },
+    /// A set/reset of a shadowed modifiable mode (SM/RM `CSI Ps h/l`, DECSET/DECRESET
+    /// `CSI ? Ps h/l`) whose DECRQM state the engine can't report — recorded so we can.
+    SetMode { dec: bool, mode: u16, set: bool },
 }
 
 impl DecrqcraScanner {
@@ -563,6 +566,17 @@ impl DecrqcraScanner {
                                     i + 1,
                                     ScanEvent::SaveRestoreCursor { save: b == b'h' },
                                 ));
+                            } else if (b == b'h' || b == b'l') && !self.star && !self.bang {
+                                // SM/RM (`CSI Ps h/l`) or DECSET/DECRESET (`CSI ? Ps h/l`):
+                                // shadow the set/reset of modes we track for DECRQM.
+                                for &m in &self.params {
+                                    if decrqm_modifiable_mode(self.private, m) {
+                                        out.push((
+                                            i + 1,
+                                            ScanEvent::SetMode { dec: self.private, mode: m, set: b == b'h' },
+                                        ));
+                                    }
+                                }
                             } else if b == b'n' && self.private && !self.star && !self.bang {
                                 // DECDSR: CSI ? Ps [; Pid] n — device-status report.
                                 out.push((
@@ -1294,6 +1308,48 @@ const DECRQM_PERM_RESET_ANSI: &[u16] = &[
 ];
 const DECRQM_PERM_RESET_DEC: &[u16] = &[60]; // DECHCCM
 
+// Modifiable modes esctest toggles + queries but `alacritty_terminal` doesn't track for
+// DECRQM: it reports "not recognized" (0) regardless of SM/RM/DECSET/DECRESET. We shadow
+// their set/reset state (from the toggle sequences) and rewrite the DECRQM reply to it.
+const DECRQM_MOD_ANSI: &[u16] = &[2, 12]; // KAM, SRM
+const DECRQM_MOD_DEC: &[u16] = &[
+    3,  // DECCOLM
+    4,  // DECSCLM
+    5,  // DECSCNM
+    18, // DECPFF
+    19, // DECPEX
+    42, // DECNRCM
+    66, // DECNKM
+    67, // DECBKM
+    69, // DECLRMM
+];
+
+/// True if `mode` in the given namespace is one we shadow for DECRQM.
+fn decrqm_modifiable_mode(dec: bool, mode: u16) -> bool {
+    if dec { DECRQM_MOD_DEC } else { DECRQM_MOD_ANSI }.contains(&mode)
+}
+
+/// Rewrite an alacritty DECRQM reply (`CSI [?] Ps ; St $ y`) for a shadowed modifiable
+/// mode to our tracked set/reset state (1 = set, 2 = reset; default reset when untoggled),
+/// since the engine can't report these. `None` for replies we don't override.
+fn decrqm_modifiable(
+    bytes: &[u8],
+    shadow: &std::collections::HashMap<(bool, u16), bool>,
+) -> Option<Vec<u8>> {
+    let inner = bytes.strip_prefix(b"\x1b[")?.strip_suffix(b"$y")?;
+    let (dec, nums) = match inner.strip_prefix(b"?") {
+        Some(rest) => (true, rest),
+        None => (false, inner),
+    };
+    let (mode_s, _state) = std::str::from_utf8(nums).ok()?.split_once(';')?;
+    let mode: u16 = mode_s.parse().ok()?;
+    if !decrqm_modifiable_mode(dec, mode) {
+        return None;
+    }
+    let state = if shadow.get(&(dec, mode)).copied().unwrap_or(false) { 1 } else { 2 };
+    Some(format!("\x1b[{}{};{}$y", if dec { "?" } else { "" }, mode, state).into_bytes())
+}
+
 /// If `bytes` is an alacritty DECRQM reply (`CSI [?] Ps ; Ps2 $ y`) reporting a
 /// permanently-reset mode as "not recognized" (state 0), return the corrected reply
 /// with state 4. Returns `None` for non-DECRQM replies and modes we don't override, so
@@ -1365,6 +1421,8 @@ struct TermState {
     sixel: SixelScanner,
     kitty: KittyScanner,
     dcs: DcsScanner,
+    /// Shadow set/reset state for modifiable modes the engine can't report via DECRQM.
+    decrqm_shadow: std::collections::HashMap<(bool, u16), bool>,
 }
 
 #[derive(Debug)]
@@ -1586,6 +1644,7 @@ fn spawn_session(
         sixel: SixelScanner::new(),
         kitty: KittyScanner::new(),
         dcs: DcsScanner::new(),
+        decrqm_shadow: std::collections::HashMap::new(),
     }));
     let images = Arc::new(Mutex::new(ImageStore::default()));
     let (tx, rx) = channel();
@@ -1641,6 +1700,10 @@ fn pump(
                             ScanEvent::SelectiveErase { line, ps } => {
                                 let fin = if line { 'K' } else { 'J' };
                                 g.parser.advance(&mut g.term, format!("\x1b[{ps}{fin}").as_bytes());
+                            }
+                            // Record a modifiable mode's set/reset for DECRQM reporting.
+                            ScanEvent::SetMode { dec, mode, set } => {
+                                g.decrqm_shadow.insert((dec, mode), set);
                             }
                             // alacritty ignores XTWINOPS resize — resize the grid here,
                             // and remember to resize the PTY once we release the lock.
@@ -1733,6 +1796,16 @@ fn pump(
                             image_adds.push((anchor, base, col, img));
                         }
                     }
+                    // Correct alacritty's DECRQM replies (§17): permanently-reset modes
+                    // 0→4, and shadowed modifiable modes to their tracked set/reset state.
+                    // Done on the outgoing bytes, keyed by the reply's own mode number.
+                    for r in replies.iter_mut() {
+                        if let Some(fixed) =
+                            decrqm_perm_reset(r).or_else(|| decrqm_modifiable(r, &g.decrqm_shadow))
+                        {
+                            *r = fixed;
+                        }
+                    }
                 }
                 if !image_adds.is_empty() {
                     if let Ok(mut store) = image_store.lock() {
@@ -1744,14 +1817,6 @@ fn pump(
                 if let Some((cols, rows)) = pty_resize {
                     if let Ok(p) = pty.lock() {
                         let _ = p.resize(cols, rows, 0, 0);
-                    }
-                }
-                // Correct alacritty's DECRQM "not recognized" (0) replies for modes
-                // that are actually permanently reset (4) — done on the outgoing bytes
-                // so the reply's own mode number keys the rewrite (§17 conformance).
-                for r in replies.iter_mut() {
-                    if let Some(fixed) = decrqm_perm_reset(r) {
-                        *r = fixed;
                     }
                 }
                 if !replies.is_empty() {
@@ -5986,6 +6051,35 @@ mod tests {
         assert_eq!(decrqss_reply(b"+q", &term), b"\x1bP1$r0+q\x1b\\".to_vec());
         // Unsupported query → invalid.
         assert_eq!(decrqss_reply(b"zz", &term), b"\x1bP0$r\x1b\\".to_vec());
+    }
+
+    #[test]
+    fn decrqm_modifiable_reports_shadow_state() {
+        use std::collections::HashMap;
+        let mut shadow: HashMap<(bool, u16), bool> = HashMap::new();
+        // Untracked / untoggled DEC mode 5 (DECSCNM) defaults to reset (2), overriding
+        // alacritty's "not recognized" (0).
+        assert_eq!(decrqm_modifiable(b"\x1b[?5;0$y", &shadow), Some(b"\x1b[?5;2$y".to_vec()));
+        // After DECSET(5): set (1).
+        shadow.insert((true, 5), true);
+        assert_eq!(decrqm_modifiable(b"\x1b[?5;0$y", &shadow), Some(b"\x1b[?5;1$y".to_vec()));
+        // ANSI KAM (mode 2) tracked in the ANSI namespace.
+        shadow.insert((false, 2), true);
+        assert_eq!(decrqm_modifiable(b"\x1b[2;0$y", &shadow), Some(b"\x1b[2;1$y".to_vec()));
+        // A mode we don't shadow is left alone.
+        assert_eq!(decrqm_modifiable(b"\x1b[?1;0$y", &shadow), None);
+    }
+
+    #[test]
+    fn scanner_detects_mode_set() {
+        // DECSET 5 (DECSCNM) → SetMode { dec, mode: 5, set: true }.
+        let ev = DecrqcraScanner::new().feed(b"\x1b[?5h");
+        assert!(matches!(ev[..], [(_, ScanEvent::SetMode { dec: true, mode: 5, set: true })]));
+        // ANSI RM 2 (KAM) → reset.
+        let ev = DecrqcraScanner::new().feed(b"\x1b[2l");
+        assert!(matches!(ev[..], [(_, ScanEvent::SetMode { dec: false, mode: 2, set: false })]));
+        // A mode we don't shadow emits nothing (left to the engine).
+        assert!(DecrqcraScanner::new().feed(b"\x1b[?25h").is_empty());
     }
 
     #[test]
