@@ -24,12 +24,21 @@ cells counted as space (0x20) — which is exactly what `compute_decrqcra` repli
 Native engine = `alacritty_terminal` 0.26:
 
 ```
-*** 295 tests passed, 43 known bugs, 230 TESTS FAILED ***
+*** 307 tests passed, 41 known bugs, 220 TESTS FAILED ***
 ```
 
 **Release gate:** the pass count must not drop below this baseline.
 
-### Fix log (45 → 49 → 251 → 256 → 267 → 280 → 295)
+### Fix log (45 → 49 → 251 → 256 → 267 → 280 → 295 → 307)
+
+- **Selective erase without protection (+12).** alacritty ignores the DEC-private erase
+  `CSI ? Ps J` (DECSED) / `CSI ? Ps K` (DECSEL). Since the engine tracks no DECSCA
+  protected attributes (every cell is unprotected), selective erase is equivalent to
+  plain ED/EL, so the scanner emits `ScanEvent::SelectiveErase` and the pump injects the
+  non-private `CSI Ps J` / `CSI Ps K` at the same cursor position. `DECSED` went 4→12,
+  `DECSEL` 3→8 — exactly the non-protection cases (Default/0/1/2[/3][/WithScrollRegion]).
+  The 16 remaining need real DECSCA protection tracking (a per-cell attribute alacritty
+  doesn't model) and are left for a protection subsystem.
 
 - **DECDSR device-status reports (+11).** vte dispatches only the non-private DSR
   (`CSI Ps n`), so every DEC-private query (`CSI ? Ps n`) went unanswered and timed out.
@@ -101,13 +110,17 @@ distinct piece of work:
 
 ```
 17 XtermWinops (WM ops / title read-back) · 17 DECSET (margins / 132-col / rev-wrap)
-15 DECSED · 11 DECRQSS · 11 DECRQM (modifiable modes) · 10 DECSEL · 8 DECCRA · 8 BS
-22 color edge-cases …
+11 DECRQSS · 11 DECRQM (modifiable modes) · 10 DECSED + 6 DECSEL (DECSCA protection)
+8 DECCRA · 8 BS · 22 color edge-cases …
 ```
 
 ## Follow-up (to raise the baseline) — roughly by leverage
 
-1. **Selective erase (DECSED/DECSEL, 25)** — DECSCA protected attributes.
+1. **Selective erase — protection half (16 left)** — the non-protection DECSED/DECSEL
+   cases now pass via ED/EL translation; the rest need **DECSCA protected attributes**,
+   which alacritty doesn't model. Would require a parallel per-cell protection layer
+   (track `CSI Ps " q`, mark cells written while protected, and erase only unprotected
+   cells on DECSED/DECSEL) — a real engine feature, not a reply-layer fix.
 2. **DECRQSS (11)** — remaining status-string replies (scroll-region/margins/cursor-style
    need private engine state the query path can't yet see).
 3. **DECRQM modifiable modes (11)** — modes esctest expects to toggle (KAM/SRM,

@@ -437,6 +437,10 @@ enum ScanEvent {
     /// the non-private DSR, so these go unanswered. Replied to at drain time (DECXCPR
     /// needs the live cursor; DECCKSR echoes the Pid).
     Decdsr { ps: u16, pid: Option<u16> },
+    /// Selective erase (`CSI ? Ps J` DECSED / `CSI ? Ps K` DECSEL) — the engine ignores
+    /// the private erase. With no DECSCA protection tracked (all cells unprotected), it
+    /// is equivalent to plain ED/EL, which we inject. `line` = DECSEL (`K`).
+    SelectiveErase { line: bool, ps: u16 },
 }
 
 impl DecrqcraScanner {
@@ -566,6 +570,16 @@ impl DecrqcraScanner {
                                     ScanEvent::Decdsr {
                                         ps: self.params.first().copied().unwrap_or(0),
                                         pid: self.params.get(1).copied(),
+                                    },
+                                ));
+                            } else if (b == b'J' || b == b'K') && self.private && !self.star && !self.bang {
+                                // DECSED (`? J`) / DECSEL (`? K`): no protection tracked,
+                                // so translate to plain ED/EL.
+                                out.push((
+                                    i + 1,
+                                    ScanEvent::SelectiveErase {
+                                        line: b == b'K',
+                                        ps: self.params.first().copied().unwrap_or(0),
                                     },
                                 ));
                             }
@@ -1623,6 +1637,11 @@ fn pump(
                             }
                             // alacritty ignores DECSTR — apply the soft reset ourselves.
                             ScanEvent::Decstr => g.parser.advance(&mut g.term, DECSTR_RESET),
+                            // Selective erase → plain ED/EL at the cursor (no protection).
+                            ScanEvent::SelectiveErase { line, ps } => {
+                                let fin = if line { 'K' } else { 'J' };
+                                g.parser.advance(&mut g.term, format!("\x1b[{ps}{fin}").as_bytes());
+                            }
                             // alacritty ignores XTWINOPS resize — resize the grid here,
                             // and remember to resize the PTY once we release the lock.
                             // `None` dimensions keep the current extent; values are
@@ -5967,6 +5986,21 @@ mod tests {
         assert_eq!(decrqss_reply(b"+q", &term), b"\x1bP1$r0+q\x1b\\".to_vec());
         // Unsupported query → invalid.
         assert_eq!(decrqss_reply(b"zz", &term), b"\x1bP0$r\x1b\\".to_vec());
+    }
+
+    #[test]
+    fn scanner_detects_selective_erase() {
+        // DECSED: CSI ? Ps J  → SelectiveErase { line: false }.
+        let ev = DecrqcraScanner::new().feed(b"\x1b[?0J");
+        assert!(matches!(ev[..], [(_, ScanEvent::SelectiveErase { line: false, ps: 0 })]));
+        // DECSEL: CSI ? Ps K  → SelectiveErase { line: true }.
+        let ev = DecrqcraScanner::new().feed(b"\x1b[?2K");
+        assert!(matches!(ev[..], [(_, ScanEvent::SelectiveErase { line: true, ps: 2 })]));
+        // Default (no param): CSI ? J → ps 0.
+        let ev = DecrqcraScanner::new().feed(b"\x1b[?J");
+        assert!(matches!(ev[..], [(_, ScanEvent::SelectiveErase { line: false, ps: 0 })]));
+        // The NON-private CSI Ps J (plain ED) is alacritty's job — not our event.
+        assert!(DecrqcraScanner::new().feed(b"\x1b[0J").is_empty());
     }
 
     #[test]
