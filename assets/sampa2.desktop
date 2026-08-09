@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Sampa2
+GenericName=Terminal
+Comment=Native GPU terminal (winit + wgpu)
+Exec=sampa2
+Icon=sampa2
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;prompt;console;command;
+StartupNotify=true
+StartupWMClass=sampa2
