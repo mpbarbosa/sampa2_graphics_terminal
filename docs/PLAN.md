@@ -157,7 +157,9 @@ interactive pass + wider program coverage outstanding.)*
   thin quad in the config cursor color) + **blink** (~530ms tick, resets on keypress,
   honors the config toggle). ✅ **visual bell** — `BEL` from the active tab flashes a
   bright (cursor-color) border frame for ~120 ms, self-clearing via a short redraw burst
-  (no audible bell). ⬜ still: ligatures toggle, fontconfig fallback;
+  (no audible bell). ✅ **ligatures toggle** — `font.ligatures` (default off, safest for
+  grid alignment) selects `cosmic-text` `Shaping::Advanced` vs `Basic` for the grid text;
+  applied live on config reload. ⬜ still: fontconfig fallback;
   scrollback change still needs a restart (fresh `Term`).
 - ✅ **Tabs** — multi-session: each tab owns its VT state/PTY/image-layer/pump; `App`
   keeps active-session pointers (re-pointed on switch). **Ctrl+Shift+T** new,
