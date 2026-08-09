@@ -24,13 +24,20 @@ cells counted as space (0x20) — which is exactly what `compute_decrqcra` repli
 Native engine = `alacritty_terminal` 0.26:
 
 ```
-*** 307 tests passed, 41 known bugs, 220 TESTS FAILED ***
+*** 318 tests passed, 41 known bugs, 209 TESTS FAILED ***
 ```
 
 **Release gate:** the pass count must not drop below this baseline.
 
-### Fix log (45 → 49 → 251 → 256 → 267 → 280 → 295 → 307)
+### Fix log (45 → 49 → 251 → 256 → 267 → 280 → 295 → 307 → 318)
 
+- **DECRQM modifiable modes shadowed (+11).** alacritty reports "not recognized" (0) for
+  modes it doesn't model, so DECRQM never reflected an `SM`/`RM`/`DECSET`/`DECRESET`
+  toggle. The scanner now records the set/reset of the tracked modifiable modes (ANSI
+  KAM/SRM; DEC DECCOLM/DECSCLM/DECSCNM/DECPFF/DECPEX/DECNRCM/DECNKM/DECBKM/DECLRMM) into a
+  per-terminal shadow, and `decrqm_modifiable` rewrites the outgoing DECRQM reply to that
+  state (1 set / 2 reset, default reset). The test only checks the *report*, so no actual
+  mode behavior is needed. All 11 modifiable-mode `DECRQM` cases pass (`DECRQM` 21→32).
 - **Selective erase without protection (+12).** alacritty ignores the DEC-private erase
   `CSI ? Ps J` (DECSED) / `CSI ? Ps K` (DECSEL). Since the engine tracks no DECSCA
   protected attributes (every cell is unprotected), selective erase is equivalent to
@@ -103,14 +110,15 @@ DECRQCRA itself is correct — verified two ways:
   is `ESC[3;6R` and the size report is `ESC[8;24;80t` — both correct, even after
   replaying esctest's full 76-command `reset()`.
 
-With the color-query/DECSTR desyncs fixed and the XTWINOPS/DECRQM/DECDSR replies added,
-the pass count reached **295** (origin Path B / xterm.js is ~305). The remaining failures
-are **genuine feature gaps in the `alacritty_terminal` engine** relative to xterm — each a
-distinct piece of work:
+With the color-query/DECSTR desyncs fixed, the XTWINOPS/DECRQM/DECDSR replies added, and
+selective-erase + DECRQM-modifiable-mode handling, the pass count reached **318** — now
+**past the origin Path B / xterm.js build (~305)**. The remaining failures are **genuine
+feature gaps in the `alacritty_terminal` engine** relative to xterm — each a distinct
+piece of work:
 
 ```
 17 XtermWinops (WM ops / title read-back) · 17 DECSET (margins / 132-col / rev-wrap)
-11 DECRQSS · 11 DECRQM (modifiable modes) · 10 DECSED + 6 DECSEL (DECSCA protection)
+11 DECRQSS · 10 DECSED + 6 DECSEL (DECSCA protection)
 8 DECCRA · 8 BS · 22 color edge-cases …
 ```
 
@@ -123,9 +131,7 @@ distinct piece of work:
    cells on DECSED/DECSEL) — a real engine feature, not a reply-layer fix.
 2. **DECRQSS (11)** — remaining status-string replies (scroll-region/margins/cursor-style
    need private engine state the query path can't yet see).
-3. **DECRQM modifiable modes (11)** — modes esctest expects to toggle (KAM/SRM,
-   DECCOLM/DECSCNM/DECNKM/…); needs shadow set/reset state (and ideally real behavior),
-   not just the permanently-reset report already handled.
+3. ~~**DECRQM modifiable modes (11)**~~ — **done** (shadowed set/reset state; see fix log).
 4. **Left-right margins (DECLRMM/DECSLRM)** — a real engine feature alacritty lacks;
    unlocks the bulk of the remaining `DECSET` failures (plus DECOM-in-margins and the
    margin-dependent SaveRestoreCursor cases). Large; needs per-row left/right clipping.
