@@ -1583,6 +1583,7 @@ fn main() -> Result<()> {
         font_size_base: font_size,
         font_family,
         cursor_style,
+        ligatures: cfg.font.ligatures,
         cursor_on: true,
         blink,
         help_on: false,
@@ -1874,6 +1875,7 @@ struct App {
     font_size_base: f32,
     font_family: String,
     cursor_style: CursorStyle,
+    ligatures: bool,
     cursor_on: bool,
     blink: bool,
     /// Keyboard-shortcut help overlay (Ctrl+Shift+?).
@@ -1931,6 +1933,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.font_size,
             self.font_family.clone(),
             self.cursor_style,
+            self.ligatures,
         ));
         self.window = Some(window);
         self.gfx = Some(gfx);
@@ -3277,6 +3280,7 @@ impl App {
         self.font_size = cfg.font.size.clamp(6.0, 72.0);
         self.font_size_base = self.font_size; // zoom resets to the configured size
         self.keys = Keybindings::load(); // pick up any [keybindings] changes
+        self.ligatures = cfg.font.ligatures;
         self.font_family = primary_family(&cfg.font.family);
         self.cursor_style = cfg.cursor.style;
         self.blink = cfg.cursor.blink;
@@ -3300,6 +3304,7 @@ impl App {
                 self.font_size,
                 self.font_family.clone(),
                 self.cursor_style,
+                self.ligatures,
             );
         }
         // New cell metrics → recompute grid geometry and resize the term/PTY.
@@ -3326,7 +3331,7 @@ impl App {
         }
         self.font_size = size;
         if let Some(gfx) = &mut self.gfx {
-            gfx.r.apply_config(self.theme, self.font_size, self.font_family.clone(), self.cursor_style);
+            gfx.r.apply_config(self.theme, self.font_size, self.font_family.clone(), self.cursor_style, self.ligatures);
         }
         if let Some(sz) = self.window.as_ref().map(|w| w.inner_size()) {
             self.resize(sz.width.max(1), sz.height.max(1));
@@ -3974,9 +3979,11 @@ struct Renderer {
     theme: Theme,
     font_family: String,
     cursor_style: CursorStyle,
+    ligatures: bool, // grid text uses Advanced shaping when on, Basic (no ligatures) off
 }
 
 impl Renderer {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         device: wgpu::Device,
         queue: wgpu::Queue,
@@ -3986,6 +3993,7 @@ impl Renderer {
         font_size: f32,
         font_family: String,
         cursor_style: CursorStyle,
+        ligatures: bool,
     ) -> Self {
         let srgb = format.is_srgb();
         let line_h = (font_size * 1.2).ceil();
@@ -4178,6 +4186,7 @@ impl Renderer {
             theme,
             font_family,
             cursor_style,
+            ligatures,
         }
     }
 
@@ -4259,10 +4268,12 @@ impl Renderer {
         font_size: f32,
         font_family: String,
         cursor_style: CursorStyle,
+        ligatures: bool,
     ) {
         self.theme = theme;
         self.font_family = font_family;
         self.cursor_style = cursor_style;
+        self.ligatures = ligatures;
         self.line_h = (font_size * 1.2).ceil();
         self.cell_w = measure_cell_w(&mut self.font_system, font_size, self.line_h, &self.font_family);
         self.buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
@@ -4613,7 +4624,7 @@ impl Renderer {
                 (s.as_str(), a)
             }),
             &base,
-            Shaping::Advanced,
+            if self.ligatures { Shaping::Advanced } else { Shaping::Basic },
             None,
         );
         self.buffer.shape_until_scroll(&mut self.font_system, false);
@@ -4925,6 +4936,7 @@ struct Gfx {
 }
 
 impl Gfx {
+    #[allow(clippy::too_many_arguments)]
     async fn new(
         window: Arc<Window>,
         images: Arc<Mutex<ImageStore>>,
@@ -4932,6 +4944,7 @@ impl Gfx {
         font_size: f32,
         font_family: String,
         cursor_style: CursorStyle,
+        ligatures: bool,
     ) -> Self {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
@@ -4960,6 +4973,7 @@ impl Gfx {
             config,
             r: Renderer::new(
                 device, queue, format, images, theme, font_size, font_family, cursor_style,
+                ligatures,
             ),
         }
     }
@@ -5085,6 +5099,7 @@ fn capture(path: &str) -> Result<()> {
         cfg.font.size.clamp(6.0, 72.0),
         primary_family(&cfg.font.family),
         cfg.cursor.style,
+        std::env::var("SAMPA_CAPTURE_LIGATURES").is_ok() || cfg.font.ligatures,
     );
 
     // Optional visual check of the tab bar: SAMPA_CAPTURE_TABS="zsh,vim,htop".
