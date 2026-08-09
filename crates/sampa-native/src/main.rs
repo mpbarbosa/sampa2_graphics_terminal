@@ -226,9 +226,20 @@ fn family_of(name: &str) -> Family<'_> {
     }
 }
 
-/// Load config from the default XDG path if present, else built-in defaults (§11).
+/// The native build's config file: `$XDG_CONFIG_HOME/sampa2/config.toml` (falling back
+/// to `$HOME/.config/sampa2/config.toml`). Deliberately separate from the shared
+/// `sampa-config` path (`…/sampa/…`) so this build's config is independent of the origin.
+fn config_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("sampa2").join("config.toml"))
+}
+
+/// Load config from the native XDG path if present, else built-in defaults (§11).
 fn load_config() -> sampa_config::Config {
-    if let Some(path) = sampa_config::default_config_path() {
+    if let Some(path) = config_path() {
         if path.exists() {
             match sampa_config::Config::load(&path) {
                 Ok(c) => return c,
@@ -1523,7 +1534,7 @@ fn main() -> Result<()> {
     let sessions = vec![session];
 
     // Watch the config file (mtime poll) and wake the loop on change → live reload.
-    if let Some(path) = sampa_config::default_config_path() {
+    if let Some(path) = config_path() {
         let watch_proxy = proxy.clone();
         thread::spawn(move || {
             let mtime = || std::fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -2405,7 +2416,7 @@ impl Keybindings {
 /// yields no overrides, so the defaults stand.
 fn read_keybinding_overrides() -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    let Some(path) = sampa_config::default_config_path() else {
+    let Some(path) = config_path() else {
         return out;
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
