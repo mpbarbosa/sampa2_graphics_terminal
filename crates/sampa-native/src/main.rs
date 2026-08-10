@@ -50,7 +50,7 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 // --- Fixed metrics (N1: single monospace font) -------------------------------
 const FONT_SIZE: f32 = 15.0;
@@ -265,6 +265,20 @@ fn strip_native_keys(text: &str) -> String {
 /// Background opacity from the config (clamped 0..1), defaulting to 1.0 (opaque).
 fn load_opacity() -> f32 {
     config_text().and_then(|t| parse_opacity(&t)).unwrap_or(1.0).clamp(0.0, 1.0)
+}
+
+/// Set the window's app id / `WM_CLASS` to `sampa2` (X11 and Wayland) so the desktop
+/// entry and its icon bind to the window in launchers/taskbars.
+#[cfg(target_os = "linux")]
+fn with_app_id(attrs: WindowAttributes) -> WindowAttributes {
+    use winit::platform::wayland::WindowAttributesExtWayland;
+    use winit::platform::x11::WindowAttributesExtX11;
+    let attrs = WindowAttributesExtX11::with_name(attrs, "sampa2", "sampa2");
+    WindowAttributesExtWayland::with_name(attrs, "sampa2", "sampa2")
+}
+#[cfg(not(target_os = "linux"))]
+fn with_app_id(attrs: WindowAttributes) -> WindowAttributes {
+    attrs
 }
 
 /// Load config from the native XDG path if present, else built-in defaults (§11).
@@ -1967,10 +1981,12 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // The AccessKit adapter must be created before the window is first shown, so
         // start hidden, attach the adapter, then reveal.
-        let attrs = Window::default_attributes()
-            .with_title(&self.title)
-            .with_transparent(self.opacity < 1.0)
-            .with_visible(false);
+        let attrs = with_app_id(
+            Window::default_attributes()
+                .with_title(&self.title)
+                .with_transparent(self.opacity < 1.0)
+                .with_visible(false),
+        );
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let a11y = accesskit_winit::Adapter::with_event_loop_proxy(&window, self.proxy.clone());
         window.set_ime_allowed(true); // enable IME (compose / CJK input)
