@@ -11,3 +11,12 @@ Categories=System;TerminalEmulator;
 Keywords=terminal;shell;prompt;console;command;
 StartupNotify=true
 StartupWMClass=sampa2
+Actions=new-window;edit-config;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=sampa2
+
+[Desktop Action edit-config]
+Name=Edit Config
+Exec=sampa2 --title "Sampa2 Config" -e sh -c "\${EDITOR:-nano} \$HOME/.config/sampa2/config.toml"
