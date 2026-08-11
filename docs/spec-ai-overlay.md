@@ -13,7 +13,8 @@
 - **Status:** implemented through Phase 3. Phase 0–1 (deps, config surface, keybinding,
   background call, gating) + Phase 2 chrome (accent header, **highlighted command**,
   italic explanation, muted hints, **`c` copies**) + Phase 3 (`send_context` **redaction**
-  in `sampa-ai`, applied to context before egress). See [PLAN.md](PLAN.md).
+  in `sampa-ai`, applied to context before egress). See [PLAN.md](PLAN.md). Manual
+  verification: [ai-overlay-manual-checklist.md](ai-overlay-manual-checklist.md).
 - **A note on "centered box":** the renderer clips the grid behind an overlay with a
   single bounds rect, so every overlay is a **full-width top/bottom band** — a floating
   centered card would need a grid clip with a hole (a larger renderer change). The AI
