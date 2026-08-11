@@ -343,11 +343,19 @@ struct PaletteView<'a> {
     selected: usize,
 }
 
+/// One colored run of overlay body text: `(text, rgb, bold, italic)`.
+type BodySpan = (String, [u8; 3], bool, bool);
+
 /// A bottom overlay panel (man page or command preview): a header line and the visible
 /// body (already sliced to what fits, lines joined by `\n`).
 struct PanelView<'a> {
     title: &'a str,
     body: &'a str,
+    /// Optional per-span colors for the body (the AI overlay highlights its command).
+    /// When `None`, the body renders in a single foreground color. When `Some`, the
+    /// spans replace it — their concatenated text should match `body` so the panel
+    /// height (computed from `body`'s line count) still lines up.
+    body_spans: Option<&'a [BodySpan]>,
 }
 
 /// Side effects the VT engine raises during parsing, forwarded from the parser
@@ -3206,6 +3214,16 @@ impl App {
                 self.request_redraw();
             }
             _ => {
+                // In the result state, 'c' copies the suggested command to the clipboard.
+                if let AiState::Result { command, .. } = &self.ai_state {
+                    if text == Some("c") {
+                        let cmd = command.clone();
+                        if let Some(clip) = self.clipboard.as_mut() {
+                            let _ = clip.set_text(cmd);
+                        }
+                        return;
+                    }
+                }
                 if editable {
                     if let Some(t) = text {
                         let add: String = t.chars().filter(|c| !c.is_control()).collect();
@@ -3627,6 +3645,7 @@ impl App {
         // Both slice their body to the lines that fit the window.
         let panel_title;
         let panel_body;
+        let ai_body_spans: Vec<BodySpan>;
         let (_, lh) = self.cell_metrics();
         let win_h = self.window.as_ref().map(|w| w.inner_size().height as f32).unwrap_or(0.0);
         let ptop = top_offset(self.sessions.len());
@@ -3635,25 +3654,48 @@ impl App {
             ((avail / lh).floor() as usize).clamp(1, max)
         };
         let panel = if self.ai_on {
-            // The AI overlay reuses the bottom panel primitive (Phase 1); the header
-            // carries the egress warning and the state, the body the reply/error.
-            panel_title = match &self.ai_state {
+            // Bespoke chrome (Phase 2): an accent header + a rich body. On a result the
+            // command is highlighted (accent, bold) and offered for copy ('c'); the
+            // egress warning / hints stay visible. The body renders as colored spans
+            // (PanelView.body_spans); `panel_body` mirrors their text to size the panel.
+            let accent = self.theme.cursor;
+            let fg = self.theme.fg;
+            let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+            const WARN: [u8; 3] = [0xe0, 0x6c, 0x75];
+            let mut spans: Vec<BodySpan> = Vec::new();
+            match &self.ai_state {
                 AiState::Editing => {
-                    format!("Ask AI ▸ {}\u{2588}   ·  Enter sends your text to the Claude API · Esc", self.ai_query)
+                    panel_title = "Ask AI".to_string();
+                    spans.push((format!("▸ {}\u{2588}", self.ai_query), fg, false, false));
+                    spans.push((
+                        "\n\nEnter sends your text to the Claude API · Esc cancels".into(),
+                        muted, false, false,
+                    ));
                 }
-                AiState::Pending => "Ask AI — contacting the Claude API…   ·  Esc".into(),
-                AiState::Result { .. } => {
-                    "Ask AI — suggestion   ·  Enter inserts it at the prompt (never runs it) · Esc".into()
+                AiState::Pending => {
+                    panel_title = "Ask AI".to_string();
+                    spans.push((format!("▸ {}", self.ai_query), muted, false, false));
+                    spans.push(("\n\nContacting the Claude API…".into(), fg, false, true));
                 }
-                AiState::Error(_) => "Ask AI — error   ·  edit and Enter to retry · Esc".into(),
-            };
-            panel_body = match &self.ai_state {
-                AiState::Editing => String::new(),
-                AiState::Pending => "…".into(),
-                AiState::Result { command, explanation } => format!("$ {command}\n\n{explanation}"),
-                AiState::Error(e) => e.clone(),
-            };
-            Some(PanelView { title: &panel_title, body: &panel_body })
+                AiState::Result { command, explanation } => {
+                    panel_title = "Ask AI — suggestion".to_string();
+                    spans.push((explanation.clone(), fg, false, true));
+                    spans.push(("\n\n$ ".into(), muted, false, false));
+                    spans.push((command.clone(), accent, true, false));
+                    spans.push((
+                        "\n\nEnter inserts it at the prompt (never runs it) · c copies · Esc".into(),
+                        muted, false, false,
+                    ));
+                }
+                AiState::Error(e) => {
+                    panel_title = "Ask AI — error".to_string();
+                    spans.push((e.clone(), WARN, false, false));
+                    spans.push(("\n\nEdit and press Enter to retry · Esc cancels".into(), muted, false, false));
+                }
+            }
+            panel_body = spans.iter().map(|(s, ..)| s.as_str()).collect::<String>();
+            ai_body_spans = spans;
+            Some(PanelView { title: &panel_title, body: &panel_body, body_spans: Some(&ai_body_spans) })
         } else if self.man_on {
             let visible = fit(MAN_VISIBLE);
             let total = self.man_lines.len();
@@ -3669,7 +3711,7 @@ impl App {
                     if total > 0 { format!("{}–{}/{}", start + 1, end, total) } else { "0/0".into() }
                 )
             };
-            Some(PanelView { title: &panel_title, body: &panel_body })
+            Some(PanelView { title: &panel_title, body: &panel_body, body_spans: None })
         } else if self.preview_on {
             let visible = fit(PREVIEW_VISIBLE);
             // The body is the command output (only when it actually ran); a rejection's
@@ -3680,7 +3722,7 @@ impl App {
             panel_body = lines[..shown].join("\n");
             let more = if lines.len() > shown { format!("  (+{} lines)", lines.len() - shown) } else { String::new() };
             panel_title = format!("{}{}   ·  Ctrl+Shift+E hides", self.preview_status(), more);
-            Some(PanelView { title: &panel_title, body: &panel_body })
+            Some(PanelView { title: &panel_title, body: &panel_body, body_spans: None })
         } else {
             None
         };
@@ -4942,12 +4984,32 @@ impl Renderer {
             );
             self.panel_title_buffer.shape_until_scroll(&mut self.font_system, false);
             self.panel_body_buffer.set_size(Some(width), Some(body_h));
-            self.panel_body_buffer.set_rich_text(
-                [(pv.body, Attrs::new().family(fam).color(Color::rgb(fg[0], fg[1], fg[2])))],
-                &Attrs::new(),
-                Shaping::Advanced,
-                None,
-            );
+            // A plain body renders in one fg color; the AI overlay supplies colored
+            // spans (highlighted command, muted hints) via `body_spans`.
+            if let Some(spans) = pv.body_spans {
+                self.panel_body_buffer.set_rich_text(
+                    spans.iter().map(|(s, c, bold, italic)| {
+                        let mut a = Attrs::new().family(fam).color(Color::rgb(c[0], c[1], c[2]));
+                        if *bold {
+                            a = a.weight(Weight::BOLD);
+                        }
+                        if *italic {
+                            a = a.style(Style::Italic);
+                        }
+                        (s.as_str(), a)
+                    }),
+                    &Attrs::new(),
+                    Shaping::Advanced,
+                    None,
+                );
+            } else {
+                self.panel_body_buffer.set_rich_text(
+                    [(pv.body, Attrs::new().family(fam).color(Color::rgb(fg[0], fg[1], fg[2])))],
+                    &Attrs::new(),
+                    Shaping::Advanced,
+                    None,
+                );
+            }
             self.panel_body_buffer.shape_until_scroll(&mut self.font_system, false);
         }
         if let Some(rows) = help {
@@ -5481,7 +5543,7 @@ fn capture(path: &str) -> Result<()> {
             format!("man {}   1–{}/{}   ·  ↑/↓ PgUp/PgDn · Esc", demo_man[0], demo_man.len() - 1, demo_man.len() - 1)
         };
         man_body = demo_man[1..].join("\n");
-        Some(PanelView { title: &man_title, body: &man_body })
+        Some(PanelView { title: &man_title, body: &man_body, body_spans: None })
     };
     r.paint(
         &snap,
