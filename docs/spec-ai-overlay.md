@@ -10,9 +10,14 @@
 > headless [`sampa-ai`](https://github.com/mpbarbosa/sampa_graphics_terminal) crate and
 > the `[ai]` config block are **reused unchanged** from the shared core (ADR 0002).
 
-- **Status:** partial — Phase 0–1 wired on `feat-ai-overlay` (deps, config surface,
-  keybinding, background call, `PanelView` render). Phase 2 (bespoke overlay chrome) and
-  Phase 3 (`send_context` redaction) deferred; see [PLAN.md](PLAN.md).
+- **Status:** implemented through Phase 2. Phase 0–1 (deps, config surface, keybinding,
+  background call, gating) + Phase 2 chrome (accent header, **highlighted command**,
+  italic explanation, muted hints, **`c` copies**). Phase 3 (`send_context` redaction)
+  deferred; see [PLAN.md](PLAN.md).
+- **A note on "centered box":** the renderer clips the grid behind an overlay with a
+  single bounds rect, so every overlay is a **full-width top/bottom band** — a floating
+  centered card would need a grid clip with a hole (a larger renderer change). The AI
+  overlay is therefore a styled bottom band, not a centered modal. Deferred, not lost.
 - **Applies to:** a `Ctrl+Shift+A` overlay that turns a natural-language request into a
   **suggested** shell command, inserted at the prompt and **never auto-run**.
 
@@ -49,6 +54,7 @@ The overlay is a small state machine (`AiState`):
 | **Error** | a safe, key-free message (§5) | return to **Editing** to retry |
 
 - **Backspace/text** edit the prompt only in **Editing**.
+- In **Result**, **`c`** copies the suggested command to the clipboard (no execution).
 - A **generation counter** (`ai_gen`) guards against stale responses: a response whose
   gen ≠ the current gen is dropped (same idiom as the command preview).
 
@@ -86,15 +92,21 @@ constructed to never echo the key.
 
 ## 6. Rendering
 
-Phase 1 reuses the existing bottom **`PanelView { title, body }`** primitive (shared with
-man/preview) so no new GPU code is needed:
+Renders through the bottom **`PanelView`** band (shared with man/preview) — no new GPU
+pass. `PanelView.body_spans` lets the AI overlay supply **colored spans** while man/preview
+keep their single-color body:
 
-- **title** = the state's header line (prompt + warning, or a status), truncated to width.
-- **body** = state-dependent: empty (Editing) · "Contacting…" (Pending) · `explanation`
-  then `command` (Result) · the error (Error).
+- **header** (accent) = "Ask AI", "Ask AI — suggestion", or "Ask AI — error".
+- **body**, state-dependent:
+  - *Editing* — `▸ {query}▉` then the egress warning (muted).
+  - *Pending* — "Contacting the Claude API…" (italic).
+  - *Result* — the `explanation` (italic), then the **`command` in the accent color,
+    bold**, then "Enter inserts it (never runs it) · c copies · Esc" (muted).
+  - *Error* — the message (warn color) + a retry hint (muted).
 
-Phase 2 may replace this with bespoke overlay chrome (a centered box, syntax-highlighted
-command, a copy affordance), but the contract in §2–§5 is unchanged by that.
+The `command`/`explanation` colors and the copy affordance are the Phase 2 upgrade; the
+contract in §2–§5 is unchanged. A future centered-card treatment stays possible (see the
+status note) but needs a renderer change, not just this overlay.
 
 ## 7. Config
 
