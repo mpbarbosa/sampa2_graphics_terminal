@@ -22,6 +22,11 @@ sampa-shellint = { path = "../../../sampa_graphics_terminal/crates/shellint" }
 sampa-palette  = { path = "../../../sampa_graphics_terminal/crates/palette" }
 sampa-man      = { path = "../../../sampa_graphics_terminal/crates/man" }
 sampa-preview  = { path = "../../../sampa_graphics_terminal/crates/preview" }
+# Opt-in Claude-API command suggester (spec-ai-overlay.md). Headless like the rest;
+# it is the only crate that can open a socket, and only when `[ai] enabled = true`.
+# Pinned to a git rev (ADR 0002): this feature's dep is CI-reproducible rather than
+# resolved from a sibling checkout. The other seven remain local path deps for N0.
+sampa-ai       = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "7e3e4ad9efe403bda204c722cd2464af9fd9efa1" }
 
 anyhow = "1"
 winit = "0.30.13"
