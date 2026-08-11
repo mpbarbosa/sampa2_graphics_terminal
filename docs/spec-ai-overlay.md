@@ -10,10 +10,10 @@
 > headless [`sampa-ai`](https://github.com/mpbarbosa/sampa_graphics_terminal) crate and
 > the `[ai]` config block are **reused unchanged** from the shared core (ADR 0002).
 
-- **Status:** implemented through Phase 2. Phase 0–1 (deps, config surface, keybinding,
+- **Status:** implemented through Phase 3. Phase 0–1 (deps, config surface, keybinding,
   background call, gating) + Phase 2 chrome (accent header, **highlighted command**,
-  italic explanation, muted hints, **`c` copies**). Phase 3 (`send_context` redaction)
-  deferred; see [PLAN.md](PLAN.md).
+  italic explanation, muted hints, **`c` copies**) + Phase 3 (`send_context` **redaction**
+  in `sampa-ai`, applied to context before egress). See [PLAN.md](PLAN.md).
 - **A note on "centered box":** the renderer clips the grid behind an overlay with a
   single bounds rect, so every overlay is a **full-width top/bottom band** — a floating
   centered card would need a grid clip with a hole (a larger renderer change). The AI
@@ -69,6 +69,12 @@ that changes, so the consent must be explicit and per-send:
 - **Least-data default.** Only the typed prompt is sent. Recent output/cwd is attached
   **only** when `[ai] send_context = true` (off by default), because terminal content can
   contain secrets and this is the one place data leaves the machine.
+- **Redaction (defense in depth).** When context *is* attached, `sampa-ai::redact` masks
+  obvious secret shapes before egress — secret-named assignments (`TOKEN`/`SECRET`/
+  `PASSWORD`/…, `Authorization:` headers), known credential prefixes (`sk-`, `ghp_`,
+  `AKIA…`, `xox…`, …), PEM private-key blocks, and long high-entropy tokens. It is
+  conservative (ordinary output, hex digests, and git SHAs are left intact) and is a
+  safety net, not a substitute for `send_context` defaulting off.
 - **Advisory only.** The result is inserted, never run. Any subsequent run still passes
   the existing preview/classify gate.
 
