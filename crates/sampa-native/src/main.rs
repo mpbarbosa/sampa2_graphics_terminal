@@ -93,6 +93,7 @@ enum Action {
     Palette,
     ToggleMan,
     TogglePreview,
+    Ai,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -113,6 +114,7 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     (Action::Palette, "palette", "Command palette", "Ctrl+Shift+P"),
     (Action::ToggleMan, "toggle_man", "Toggle man-page panel", "Ctrl+Shift+M"),
     (Action::TogglePreview, "toggle_preview", "Toggle command preview", "Ctrl+Shift+E"),
+    (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
     (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
     (Action::ZoomOut, "zoom_out", "Zoom out", "Ctrl+Minus"),
     (Action::ZoomReset, "zoom_reset", "Reset zoom", "Ctrl+0"),
@@ -1491,8 +1493,23 @@ enum UserEvent {
     ManReady { cmd: String, lines: Option<Vec<String>> },
     /// A debounced command preview finished; `gen` guards against stale results.
     PreviewReady { gen: u64, line: String, ran: bool, text: String },
+    /// A background AI command-suggestion call finished; `gen` drops stale replies.
+    AiReady { gen: u64, result: Result<sampa_ai::Suggestion, String> },
     /// An AccessKit adapter event (tree request / action / deactivation).
     AccessKit(accesskit_winit::Event),
+}
+
+/// The AI overlay's state machine (spec-ai-overlay.md §3). Only one is live at a time.
+#[derive(Clone, Debug)]
+enum AiState {
+    /// Typing the natural-language prompt; Enter submits (gated).
+    Editing,
+    /// A request is in flight on a background thread.
+    Pending,
+    /// A suggestion came back; Enter inserts `command` at the prompt.
+    Result { command: String, explanation: String },
+    /// The call was gated off, missing a key, or failed. Enter returns to Editing.
+    Error(String),
 }
 
 impl From<accesskit_winit::Event> for UserEvent {
@@ -1666,6 +1683,10 @@ fn main() -> Result<()> {
         preview_ran: false,
         preview_line: String::new(),
         preview_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ai_on: false,
+        ai_query: String::new(),
+        ai_state: AiState::Editing,
+        ai_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -1972,6 +1993,12 @@ struct App {
     preview_line: String, // the command the current preview_text is for
     /// Debounce/supersede token: only the newest scheduled preview runs + is accepted.
     preview_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
+    ai_on: bool,
+    ai_query: String,
+    ai_state: AiState,
+    /// Supersede token: a reply whose gen ≠ this is stale and dropped.
+    ai_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -2030,6 +2057,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ConfigReload => self.reload_config(),
             UserEvent::ManReady { cmd, lines } => self.man_ready(cmd, lines),
             UserEvent::PreviewReady { gen, line, ran, text } => self.preview_ready(gen, line, ran, text),
+            UserEvent::AiReady { gen, result } => self.ai_ready(gen, result),
             UserEvent::AccessKit(e) => {
                 // A screen reader attached / requested the tree — push the current one.
                 if matches!(e.window_event, accesskit_winit::WindowEvent::InitialTreeRequested) {
@@ -2121,6 +2149,14 @@ impl ApplicationHandler<UserEvent> for App {
                         self.palette_close();
                     } else {
                         self.palette_key(&event.logical_key, event.text.as_deref());
+                    }
+                    return;
+                }
+                if self.ai_on {
+                    if action == Some(Action::Ai) {
+                        self.ai_close();
+                    } else {
+                        self.ai_key(&event.logical_key, event.text.as_deref());
                     }
                     return;
                 }
@@ -2883,6 +2919,7 @@ impl App {
             Action::Palette => self.palette_open(),
             Action::ToggleMan => self.man_open(),
             Action::TogglePreview => self.preview_toggle(),
+            Action::Ai => self.ai_open(),
             Action::ZoomIn => self.zoom_by(1.0),
             Action::ZoomOut => self.zoom_by(-1.0),
             Action::ZoomReset => self.zoom_reset(),
@@ -3125,6 +3162,140 @@ impl App {
             self.scroll(Scroll::Bottom);
         }
         self.palette_close();
+    }
+
+    // --- AI command suggester (opt-in; Sampa's only network surface) -------------
+    // spec-ai-overlay.md. Opening the overlay sends nothing; a request is made only
+    // when the user types a prompt and presses Enter, and only when `[ai] enabled`.
+
+    /// Open the overlay in the editing state. No network call happens here.
+    fn ai_open(&mut self) {
+        self.ai_on = true;
+        self.ai_query.clear();
+        self.ai_state = AiState::Editing;
+        self.request_redraw();
+    }
+
+    /// Close the overlay and invalidate any in-flight reply (gen bump).
+    fn ai_close(&mut self) {
+        self.ai_on = false;
+        self.ai_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.request_redraw();
+    }
+
+    /// Keys while the overlay owns input. Enter's meaning is state-dependent: submit
+    /// (Editing/Error), insert-at-prompt (Result), ignored (Pending). Esc closes.
+    fn ai_key(&mut self, key: &Key, text: Option<&str>) {
+        let editable = matches!(self.ai_state, AiState::Editing | AiState::Error(_));
+        match key {
+            Key::Named(NamedKey::Escape) => self.ai_close(),
+            Key::Named(NamedKey::Enter) => match &self.ai_state {
+                // Insert the suggestion at the prompt (trailing space, never a newline —
+                // the user reviews/edits and runs it). Same rule as the palette.
+                AiState::Result { command, .. } => {
+                    let bytes = format!("{command} ").into_bytes();
+                    self.pty_write(&bytes);
+                    self.scroll(Scroll::Bottom);
+                    self.ai_close();
+                }
+                AiState::Pending => {} // in flight — ignore
+                _ => self.ai_submit(),
+            },
+            Key::Named(NamedKey::Backspace) if editable && !self.ai_query.is_empty() => {
+                self.ai_query.pop();
+                self.request_redraw();
+            }
+            _ => {
+                if editable {
+                    if let Some(t) = text {
+                        let add: String = t.chars().filter(|c| !c.is_control()).collect();
+                        if !add.is_empty() {
+                            self.ai_query.push_str(&add);
+                            self.ai_state = AiState::Editing; // typing clears a prior error
+                            self.request_redraw();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gate on `[ai] enabled` + the env key, then fire the blocking `ureq` POST on a
+    /// background thread (never the winit thread), posting `AiReady` back via the proxy.
+    fn ai_submit(&mut self) {
+        let prompt = self.ai_query.trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        let cfg = load_config();
+        if !cfg.ai.enabled {
+            self.ai_state =
+                AiState::Error("AI suggester is off — set [ai] enabled = true in config.toml.".into());
+            self.request_redraw();
+            return;
+        }
+        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                self.ai_state = AiState::Error(
+                    "Set ANTHROPIC_API_KEY in your shell and relaunch Sampa.".into(),
+                );
+                self.request_redraw();
+                return;
+            }
+        };
+        // Least-data default (spec §4): the typed prompt only, unless send_context is on.
+        let context = cfg.ai.send_context.then(|| self.ai_context());
+        let shell = std::env::var("SHELL")
+            .ok()
+            .and_then(|s| s.rsplit('/').next().map(str::to_string))
+            .unwrap_or_else(|| "sh".into());
+        let gen = self.ai_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.ai_state = AiState::Pending;
+        self.request_redraw();
+        let proxy = self.proxy.clone();
+        let params = sampa_ai::Params {
+            model: cfg.ai.model,
+            endpoint: cfg.ai.endpoint,
+            api_key,
+            max_tokens: 2048, // headroom for thinking-on models (feasibility §2)
+        };
+        std::thread::spawn(move || {
+            let req = sampa_ai::Request {
+                prompt: &prompt,
+                context: context.as_deref(),
+                os: std::env::consts::OS,
+                shell: &shell,
+            };
+            let result = sampa_ai::suggest_over_network(&params, &req).map_err(|e| e.to_string());
+            let _ = proxy.send_event(UserEvent::AiReady { gen, result });
+        });
+    }
+
+    /// Terminal context for `send_context` (opt-in only): the last visible lines of the
+    /// grid, capped. This is the data that would leave the machine — keep it bounded.
+    fn ai_context(&self) -> String {
+        let Ok(g) = self.state.lock() else {
+            return String::new();
+        };
+        let snap = build_snapshot(&g.term, &self.theme, self.cursor_style, false);
+        drop(g);
+        let text = snap.to_text();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let start = lines.len().saturating_sub(40);
+        lines[start..].join("\n")
+    }
+
+    /// Deliver a background reply, unless it's stale (gen bumped) or the overlay closed.
+    fn ai_ready(&mut self, gen: u64, result: Result<sampa_ai::Suggestion, String>) {
+        if !self.ai_on || gen != self.ai_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.ai_state = match result {
+            Ok(s) => AiState::Result { command: s.command, explanation: s.explanation },
+            Err(e) => AiState::Error(e),
+        };
+        self.request_redraw();
     }
 
     /// Track the current command line from keystrokes sent to the shell (best-effort:
@@ -3463,7 +3634,27 @@ impl App {
             let avail = (win_h - ptop - (lh + 6.0) - 6.0).max(lh);
             ((avail / lh).floor() as usize).clamp(1, max)
         };
-        let panel = if self.man_on {
+        let panel = if self.ai_on {
+            // The AI overlay reuses the bottom panel primitive (Phase 1); the header
+            // carries the egress warning and the state, the body the reply/error.
+            panel_title = match &self.ai_state {
+                AiState::Editing => {
+                    format!("Ask AI ▸ {}\u{2588}   ·  Enter sends your text to the Claude API · Esc", self.ai_query)
+                }
+                AiState::Pending => "Ask AI — contacting the Claude API…   ·  Esc".into(),
+                AiState::Result { .. } => {
+                    "Ask AI — suggestion   ·  Enter inserts it at the prompt (never runs it) · Esc".into()
+                }
+                AiState::Error(_) => "Ask AI — error   ·  edit and Enter to retry · Esc".into(),
+            };
+            panel_body = match &self.ai_state {
+                AiState::Editing => String::new(),
+                AiState::Pending => "…".into(),
+                AiState::Result { command, explanation } => format!("$ {command}\n\n{explanation}"),
+                AiState::Error(e) => e.clone(),
+            };
+            Some(PanelView { title: &panel_title, body: &panel_body })
+        } else if self.man_on {
             let visible = fit(MAN_VISIBLE);
             let total = self.man_lines.len();
             let start = self.man_scroll.min(total.saturating_sub(1));

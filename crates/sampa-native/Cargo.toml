@@ -22,6 +22,9 @@ sampa-shellint = { path = "../../../sampa_graphics_terminal/crates/shellint" }
 sampa-palette  = { path = "../../../sampa_graphics_terminal/crates/palette" }
 sampa-man      = { path = "../../../sampa_graphics_terminal/crates/man" }
 sampa-preview  = { path = "../../../sampa_graphics_terminal/crates/preview" }
+# Opt-in Claude-API command suggester (spec-ai-overlay.md). Headless like the rest;
+# it is the only crate that can open a socket, and only when `[ai] enabled = true`.
+sampa-ai       = { path = "../../../sampa_graphics_terminal/crates/ai" }
 
 anyhow = "1"
 winit = "0.30.13"

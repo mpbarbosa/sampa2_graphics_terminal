@@ -66,3 +66,28 @@ preserves history); it is premature **now**.
 - New Path-C-only core logic (e.g. a native VT/grid layer, escape-hardening +
   DECRQCRA) lives in *this* repo's crates, **not** the shared set — it has no Path B
   consumer.
+
+## Addendum (2026-08-11) — the AI feature validated the deferral
+
+Wiring the native AI command-suggester (`feat-ai-overlay`,
+[spec-ai-overlay.md](../spec-ai-overlay.md)) was the first real test of this ADR's
+extraction trigger — "extract only if both repos co-edit the shared crates" — and it
+came out **decisively on the side of deferring**:
+
+- **The feature is consume-only.** Shipping it natively required editing **zero** shared
+  crates: `sampa-ai` was already headless-complete in the origin repo, and `Config.ai`
+  already parsed here (`strip_native_keys` only drops `opacity`). The native build just
+  added a path dep and wrote front-end code. That is exactly the single-editor,
+  pure-consumption world this ADR bet on.
+- **One premise slipped, the conclusion held.** "Why" argument #1 said *the shared set
+  will not grow*; it grew from **seven to eight** crates (`sampa-ai` was added in the
+  origin repo after this ADR). But it grew under **one editor** in the origin repo, so
+  the *co-edit* trigger — the one that actually matters — still isn't met.
+- **The trigger to watch, sharpened.** Extract `sampa-core` when **either** ≥2
+  native-driven changes to shared crates land in one cycle, **or** cross-repo rev-bumps
+  become more than ~monthly friction. The most likely first co-edit is `send_context`
+  redaction / prompt-shaping: if that logic belongs *in* `sampa-ai` **and** the two
+  builds need different shapes of it, that is the moment to pull the trigger. Until then,
+  put AI-shared logic in `sampa-ai` in the origin repo and consume it here.
+
+Decision unchanged: **keep the git-rev-pinned dependency; do not extract yet.**
