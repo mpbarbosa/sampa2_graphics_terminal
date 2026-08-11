@@ -358,6 +358,14 @@ struct PanelView<'a> {
     body_spans: Option<&'a [BodySpan]>,
 }
 
+/// The AI suggester rendered as a centered floating card (not a bottom band): an accent
+/// header and a rich body, drawn over the terminal with the grid clipped into a hole
+/// behind it. `body_lines` sizes the card height.
+struct AiCard<'a> {
+    title: &'a str,
+    body_spans: &'a [BodySpan],
+}
+
 /// Side effects the VT engine raises during parsing, forwarded from the parser
 /// thread to the main loop (which owns the PTY, window, and clipboard).
 enum AppEvent {
@@ -3645,6 +3653,7 @@ impl App {
         // Both slice their body to the lines that fit the window.
         let panel_title;
         let panel_body;
+        let ai_title;
         let ai_body_spans: Vec<BodySpan>;
         let (_, lh) = self.cell_metrics();
         let win_h = self.window.as_ref().map(|w| w.inner_size().height as f32).unwrap_or(0.0);
@@ -3653,11 +3662,9 @@ impl App {
             let avail = (win_h - ptop - (lh + 6.0) - 6.0).max(lh);
             ((avail / lh).floor() as usize).clamp(1, max)
         };
-        let panel = if self.ai_on {
-            // Bespoke chrome (Phase 2): an accent header + a rich body. On a result the
-            // command is highlighted (accent, bold) and offered for copy ('c'); the
-            // egress warning / hints stay visible. The body renders as colored spans
-            // (PanelView.body_spans); `panel_body` mirrors their text to size the panel.
+        // The AI suggester is a centered floating card (its own render channel), not a
+        // bottom band: an accent header + a rich body (command highlighted, 'c' copies).
+        let ai = if self.ai_on {
             let accent = self.theme.cursor;
             let fg = self.theme.fg;
             let muted = blend(self.theme.bg, self.theme.fg, 0.55);
@@ -3665,7 +3672,7 @@ impl App {
             let mut spans: Vec<BodySpan> = Vec::new();
             match &self.ai_state {
                 AiState::Editing => {
-                    panel_title = "Ask AI".to_string();
+                    ai_title = "Ask AI".to_string();
                     spans.push((format!("▸ {}\u{2588}", self.ai_query), fg, false, false));
                     spans.push((
                         "\n\nEnter sends your text to the Claude API · Esc cancels".into(),
@@ -3673,12 +3680,12 @@ impl App {
                     ));
                 }
                 AiState::Pending => {
-                    panel_title = "Ask AI".to_string();
+                    ai_title = "Ask AI".to_string();
                     spans.push((format!("▸ {}", self.ai_query), muted, false, false));
                     spans.push(("\n\nContacting the Claude API…".into(), fg, false, true));
                 }
                 AiState::Result { command, explanation } => {
-                    panel_title = "Ask AI — suggestion".to_string();
+                    ai_title = "Ask AI — suggestion".to_string();
                     spans.push((explanation.clone(), fg, false, true));
                     spans.push(("\n\n$ ".into(), muted, false, false));
                     spans.push((command.clone(), accent, true, false));
@@ -3688,15 +3695,17 @@ impl App {
                     ));
                 }
                 AiState::Error(e) => {
-                    panel_title = "Ask AI — error".to_string();
+                    ai_title = "Ask AI — error".to_string();
                     spans.push((e.clone(), WARN, false, false));
                     spans.push(("\n\nEdit and press Enter to retry · Esc cancels".into(), muted, false, false));
                 }
             }
-            panel_body = spans.iter().map(|(s, ..)| s.as_str()).collect::<String>();
             ai_body_spans = spans;
-            Some(PanelView { title: &panel_title, body: &panel_body, body_spans: Some(&ai_body_spans) })
-        } else if self.man_on {
+            Some(AiCard { title: &ai_title, body_spans: &ai_body_spans })
+        } else {
+            None
+        };
+        let panel = if self.man_on {
             let visible = fit(MAN_VISIBLE);
             let total = self.man_lines.len();
             let start = self.man_scroll.min(total.saturating_sub(1));
@@ -3747,7 +3756,7 @@ impl App {
         // until it lapses (then one final frame clears it).
         let bell = self.bell_until.is_some_and(|t| std::time::Instant::now() < t);
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), preedit, bell);
+            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), ai.as_ref(), preedit, bell);
         }
         if bell {
             self.request_redraw();
@@ -4633,6 +4642,12 @@ impl Renderer {
         [self.chan(rgb[0]), self.chan(rgb[1]), self.chan(rgb[2]), 1.0]
     }
 
+    /// Like [`color4`] but with an explicit alpha (the quad pipeline is ALPHA_BLENDING),
+    /// for the AI card's soft drop-shadow.
+    fn color4a(&self, rgb: [u8; 3], a: f32) -> [f32; 4] {
+        [self.chan(rgb[0]), self.chan(rgb[1]), self.chan(rgb[2]), a]
+    }
+
     /// Draw `snap` into `view` (size `w`×`h`). Submits its own command buffer; does
     /// not present or read back — the caller owns the target's lifecycle.
     /// Tab-bar background/segment quads (no-op with ≤1 tab): a dim strip, the active
@@ -4750,7 +4765,7 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
         // search bar and the bottom panel (man page / command preview) each overlay a
         // strip/panel at the bottom.
@@ -4786,6 +4801,58 @@ impl Renderer {
         } else {
             top
         };
+        // AI centered card: geometry as (x, y, w, h). The body is shaped **now** (into the
+        // idle panel buffers) so the card height matches the WRAPPED line count, not the
+        // raw newline count — then the grid is hole-punched behind it and its decorations
+        // suppressed, so it floats cleanly. (Only one overlay is open at a time, so reusing
+        // the panel buffers is safe.)
+        let ai_inner_pad = 16.0;
+        let ai_header_h = self.line_h + 12.0;
+        let ai_card = if let Some(c) = ai {
+            let cw = (w as f32 * 0.62).clamp(420.0, (w as f32 - 64.0).max(220.0));
+            let width = (cw - 2.0 * ai_inner_pad).max(1.0);
+            let fam = family_of(&self.font_family);
+            let hi = self.theme.cursor;
+            self.panel_title_buffer.set_size(Some(width), Some(ai_header_h));
+            self.panel_title_buffer.set_rich_text(
+                [(c.title, Attrs::new().family(fam).color(Color::rgb(hi[0], hi[1], hi[2])).weight(Weight::BOLD))],
+                &Attrs::new(),
+                Shaping::Advanced,
+                None,
+            );
+            self.panel_title_buffer.shape_until_scroll(&mut self.font_system, false);
+            self.panel_body_buffer.set_size(Some(width), Some(h as f32));
+            self.panel_body_buffer.set_rich_text(
+                c.body_spans.iter().map(|(s, col, bold, italic)| {
+                    let mut a = Attrs::new().family(fam).color(Color::rgb(col[0], col[1], col[2]));
+                    if *bold {
+                        a = a.weight(Weight::BOLD);
+                    }
+                    if *italic {
+                        a = a.style(Style::Italic);
+                    }
+                    (s.as_str(), a)
+                }),
+                &Attrs::new(),
+                Shaping::Advanced,
+                None,
+            );
+            self.panel_body_buffer.shape_until_scroll(&mut self.font_system, false);
+            let body_lines = self.panel_body_buffer.layout_runs().count().max(1);
+            let ch = ai_inner_pad * 2.0 + ai_header_h + body_lines as f32 * self.line_h;
+            let cx = ((w as f32 - cw) / 2.0).max(0.0);
+            let cy = ((h as f32 - ch) / 2.0).max(top + 12.0);
+            Some((cx, cy, cw, ch))
+        } else {
+            None
+        };
+        let (cellw, lineh) = (self.cell_w, self.line_h);
+        // True when a cell at (x, y) overlaps the card (so its glyph/deco is hidden).
+        let hits_card = |x: f32, y: f32| {
+            ai_card.is_some_and(|(cx, cy, cw, ch)| {
+                x + cellw > cx && x < cx + cw && y + lineh > cy && y < cy + ch
+            })
+        };
         // Background/cursor quads (drawn under the text) and decoration quads
         // (underline/strikethrough, drawn over it).
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
@@ -4806,13 +4873,13 @@ impl Renderer {
                         color: self.color4(cell.bg),
                     });
                 }
-                if row_visible && (cell.underline || cell.hyperlink) {
+                if row_visible && !hits_card(x, y) && (cell.underline || cell.hyperlink) {
                     deco_quads.push(QuadInstance {
                         rect: [x, y + self.line_h - 2.0, self.cell_w, 1.5],
                         color: self.color4(cell.fg),
                     });
                 }
-                if row_visible && cell.strike {
+                if row_visible && !hits_card(x, y) && cell.strike {
                     deco_quads.push(QuadInstance {
                         rect: [x, y + self.line_h * 0.45, self.cell_w, 1.5],
                         color: self.color4(cell.fg),
@@ -4831,7 +4898,7 @@ impl Renderer {
                 CursorStyle::Underline => Some([x, y + self.line_h - 2.0, self.cell_w, 2.0]),
                 CursorStyle::Block => None,
             };
-            if let Some(rect) = rect {
+            if let (Some(rect), false) = (rect, hits_card(x, y)) {
                 deco_quads.push(QuadInstance { rect, color: self.color4(self.theme.cursor) });
             }
         }
@@ -4885,6 +4952,21 @@ impl Renderer {
             let wf = w as f32;
             bg_quads.push(QuadInstance { rect: [0.0, help_top, wf, help_bottom - help_top], color: body_bg });
             bg_quads.push(QuadInstance { rect: [0.0, help_bottom - 1.0, wf, 1.0], color: rule });
+        }
+        // AI centered card: a soft shadow, an accent border, the opaque card body, and a
+        // header strip. Pushed after the grid cells so it sits on top; the grid text is
+        // hole-punched around it (text-area bounds below) and its decorations suppressed.
+        if let Some((cx, cy, cw, ch)) = ai_card {
+            let shadow = self.color4a([0, 0, 0], 0.30);
+            let border = self.color4(self.theme.cursor);
+            let body_bg = self.color4(blend(self.theme.bg, self.theme.fg, 0.10));
+            let header = self.color4(blend(self.theme.bg, self.theme.fg, 0.17));
+            let rule = self.color4(blend(self.theme.bg, self.theme.fg, 0.30));
+            bg_quads.push(QuadInstance { rect: [cx + 5.0, cy + 7.0, cw, ch], color: shadow });
+            bg_quads.push(QuadInstance { rect: [cx - 1.5, cy - 1.5, cw + 3.0, ch + 3.0], color: border });
+            bg_quads.push(QuadInstance { rect: [cx, cy, cw, ch], color: body_bg });
+            bg_quads.push(QuadInstance { rect: [cx, cy, cw, ai_header_h], color: header });
+            bg_quads.push(QuadInstance { rect: [cx, cy + ai_header_h, cw, 1.0], color: rule });
         }
         // IME preedit: an opaque cell-strip + underline at the cursor (text added below),
         // plus a bright caret bar at the IME cursor position within the composition.
@@ -5055,15 +5137,42 @@ impl Renderer {
         self.viewport
             .update(&self.queue, Resolution { width: w, height: h });
         let mut text_areas: Vec<TextArea> = Vec::with_capacity(2 + tabs.len());
-        text_areas.push(TextArea {
-            buffer: &self.buffer,
-            left: PAD,
-            top,
-            scale: 1.0,
-            bounds: TextBounds { left: 0, top: grid_top as i32, right: w as i32, bottom: grid_bottom as i32 },
-            default_color: Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]),
-            custom_glyphs: &[],
-        });
+        // Grid text. Normally one clipped area; with the AI card open, the grid is split
+        // into up to four regions tiling everything except the card rect (a rectangular
+        // hole), so terminal text stays visible around the floating card.
+        let gfg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
+        let grid_bounds: Vec<TextBounds> = match ai_card {
+            Some((cx, cy, cw, ch)) => {
+                let (gt, gb) = (grid_top, grid_bottom);
+                let (bt, bb) = (cy.max(gt), (cy + ch).min(gb)); // card band, clamped to grid
+                let mut v = Vec::with_capacity(4);
+                if cy > gt {
+                    v.push(TextBounds { left: 0, top: gt as i32, right: w as i32, bottom: cy.min(gb) as i32 });
+                }
+                if cy + ch < gb {
+                    v.push(TextBounds { left: 0, top: (cy + ch).max(gt) as i32, right: w as i32, bottom: gb as i32 });
+                }
+                if bt < bb {
+                    if cx > 0.0 {
+                        v.push(TextBounds { left: 0, top: bt as i32, right: cx as i32, bottom: bb as i32 });
+                    }
+                    v.push(TextBounds { left: (cx + cw) as i32, top: bt as i32, right: w as i32, bottom: bb as i32 });
+                }
+                v
+            }
+            None => vec![TextBounds { left: 0, top: grid_top as i32, right: w as i32, bottom: grid_bottom as i32 }],
+        };
+        for bounds in grid_bounds {
+            text_areas.push(TextArea {
+                buffer: &self.buffer,
+                left: PAD,
+                top,
+                scale: 1.0,
+                bounds,
+                default_color: gfg,
+                custom_glyphs: &[],
+            });
+        }
         if search.is_some() {
             let ltop = grid_bottom + ((SEARCH_H - self.line_h) / 2.0).max(0.0);
             text_areas.push(TextArea {
@@ -5107,6 +5216,31 @@ impl Renderer {
                 top: help_top + 8.0,
                 scale: 1.0,
                 bounds: TextBounds { left: 0, top: help_top as i32, right: w as i32, bottom: help_bottom as i32 },
+                default_color: fg,
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((cx, cy, cw, ch)) = ai_card {
+            let fg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
+            let lx = cx + ai_inner_pad;
+            let right = (cx + cw) as i32;
+            let title_top = cy + ((ai_header_h - self.line_h) / 2.0).max(0.0);
+            text_areas.push(TextArea {
+                buffer: &self.panel_title_buffer,
+                left: lx,
+                top: title_top,
+                scale: 1.0,
+                bounds: TextBounds { left: cx as i32, top: cy as i32, right, bottom: (cy + ai_header_h) as i32 },
+                default_color: fg,
+                custom_glyphs: &[],
+            });
+            let body_top = cy + ai_header_h + ai_inner_pad * 0.5;
+            text_areas.push(TextArea {
+                buffer: &self.panel_body_buffer,
+                left: lx,
+                top: body_top,
+                scale: 1.0,
+                bounds: TextBounds { left: cx as i32, top: body_top as i32, right, bottom: (cy + ch) as i32 },
                 default_color: fg,
                 custom_glyphs: &[],
             });
@@ -5347,7 +5481,7 @@ impl Gfx {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -5366,6 +5500,7 @@ impl Gfx {
             palette,
             panel,
             help,
+            ai,
             preedit,
             bell,
         );
@@ -5556,6 +5691,7 @@ fn capture(path: &str) -> Result<()> {
         demo_palette.as_ref(),
         demo_manview.as_ref(),
         demo_help.as_deref(),
+        None, // ai card (not exercised by the capture path)
         std::env::var("SAMPA_CAPTURE_PREEDIT")
             .ok()
             .as_deref()

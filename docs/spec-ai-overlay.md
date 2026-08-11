@@ -15,10 +15,12 @@
   italic explanation, muted hints, **`c` copies**) + Phase 3 (`send_context` **redaction**
   in `sampa-ai`, applied to context before egress). See [PLAN.md](PLAN.md). Manual
   verification: [ai-overlay-manual-checklist.md](ai-overlay-manual-checklist.md).
-- **A note on "centered box":** the renderer clips the grid behind an overlay with a
-  single bounds rect, so every overlay is a **full-width top/bottom band** — a floating
-  centered card would need a grid clip with a hole (a larger renderer change). The AI
-  overlay is therefore a styled bottom band, not a centered modal. Deferred, not lost.
+- **Centered card:** the AI overlay renders as a **centered floating card** (unlike the
+  other overlays, which are full-width top/bottom bands). The renderer normally clips the
+  grid with a single bounds rect; the card instead splits the grid text into up to four
+  regions that tile everything except the card rectangle (a rectangular hole), suppresses
+  decorations under the card, and draws a shadow + accent border + header. The card height
+  is measured from the **wrapped** line count so nothing clips.
 - **Applies to:** a `Ctrl+Shift+A` overlay that turns a natural-language request into a
   **suggested** shell command, inserted at the prompt and **never auto-run**.
 
@@ -99,9 +101,9 @@ constructed to never echo the key.
 
 ## 6. Rendering
 
-Renders through the bottom **`PanelView`** band (shared with man/preview) — no new GPU
-pass. `PanelView.body_spans` lets the AI overlay supply **colored spans** while man/preview
-keep their single-color body:
+Renders as a **centered floating card** (its own render channel, `AiCard`), sized to its
+wrapped content, drawn over the terminal with the grid hole-punched around it (see the
+status note). The body is a list of **colored spans**:
 
 - **header** (accent) = "Ask AI", "Ask AI — suggestion", or "Ask AI — error".
 - **body**, state-dependent:
@@ -111,9 +113,9 @@ keep their single-color body:
     bold**, then "Enter inserts it (never runs it) · c copies · Esc" (muted).
   - *Error* — the message (warn color) + a retry hint (muted).
 
-The `command`/`explanation` colors and the copy affordance are the Phase 2 upgrade; the
-contract in §2–§5 is unchanged. A future centered-card treatment stays possible (see the
-status note) but needs a renderer change, not just this overlay.
+The `command`/`explanation` colors and the copy affordance came in Phase 2; the centered
+card replaced the earlier bottom-band chrome. The behavioral contract in §2–§5 is unchanged
+by the rendering.
 
 ## 7. Config
 
