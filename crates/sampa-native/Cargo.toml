@@ -26,7 +26,7 @@ sampa-preview  = { path = "../../../sampa_graphics_terminal/crates/preview" }
 # it is the only crate that can open a socket, and only when `[ai] enabled = true`.
 # Pinned to a git rev (ADR 0002): this feature's dep is CI-reproducible rather than
 # resolved from a sibling checkout. The other seven remain local path deps for N0.
-sampa-ai       = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "1c0ad2df24f384f06b225eb6870ff7f94767a709" }
+sampa-ai       = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "38f35ae78fdcccac5a7e50edb65d9b62cb39ea8e" }
 
 anyhow = "1"
 winit = "0.30.13"

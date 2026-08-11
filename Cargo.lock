@@ -2737,7 +2737,7 @@ dependencies = [
 [[package]]
 name = "sampa-ai"
 version = "0.1.0"
-source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=1c0ad2df24f384f06b225eb6870ff7f94767a709#1c0ad2df24f384f06b225eb6870ff7f94767a709"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=38f35ae78fdcccac5a7e50edb65d9b62cb39ea8e#38f35ae78fdcccac5a7e50edb65d9b62cb39ea8e"
 dependencies = [
  "serde",
  "serde_json",
