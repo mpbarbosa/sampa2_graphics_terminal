@@ -14,3 +14,10 @@ license = "MIT"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# Dev profile: keep line tables (file:line for backtraces / breakpoints) but drop the
+# full DWARF variable/type info. For this graphics stack (wgpu/naga/glyphon/cosmic-text)
+# full debuginfo dominates `target/` — each debug binary is ~300+ MB; line-tables-only
+# shrinks the deps artifacts and speeds links, at the cost of variable inspection in gdb.
+[profile.dev]
+debug = "line-tables-only"
