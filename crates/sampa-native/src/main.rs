@@ -1693,7 +1693,6 @@ fn main() -> Result<()> {
         man_lines: Vec::new(),
         man_scroll: 0,
         man_loading: false,
-        input_line: String::new(),
         preview_on: false,
         preview_text: String::new(),
         preview_ran: false,
@@ -2000,8 +1999,6 @@ struct App {
     man_lines: Vec<String>,
     man_scroll: usize,
     man_loading: bool,
-    /// Best-effort current command line, accumulated from keystrokes (reset on Enter).
-    input_line: String,
     // command preview (safe auto-run, gated by sampa-preview)
     preview_on: bool,
     preview_text: String,
@@ -2116,9 +2113,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.preedit_cursor = None;
                     if !text.is_empty() {
                         self.pty_write(text.as_bytes());
-                        for c in text.chars() {
-                            self.input_line.push(c);
-                        }
                         self.schedule_preview();
                         self.scroll(Scroll::Bottom);
                         self.cursor_on = true;
@@ -2217,7 +2211,6 @@ impl ApplicationHandler<UserEvent> for App {
                     app_cursor,
                 );
                 if !bytes.is_empty() {
-                    self.track_input(&event.logical_key, event.text.as_deref());
                     self.schedule_preview(); // debounced safe auto-run (no-op if off)
                     self.pty_write(&bytes);
                     self.scroll(Scroll::Bottom); // typing snaps to the live prompt
@@ -2572,6 +2565,45 @@ fn first_command_token(line: &str) -> &str {
     }
 }
 
+/// Extract the command at the shell prompt directly from the grid `snap`: the text on the
+/// cursor's row up to the cursor column, with the prompt stripped. Reading up to the cursor
+/// (not the whole row) yields exactly what pressing Enter would run — it captures paste,
+/// history recall, and an *accepted* autosuggestion (all leave the cursor at the command's
+/// end), while excluding an unaccepted grey autosuggestion (drawn after the cursor).
+///
+/// Prototype limitation: single-row only (a command that wraps is read from its last row),
+/// and mid-line edits read only up to the cursor. The robust version keys off OSC 133
+/// shell-integration markers instead of a prompt heuristic.
+fn command_from_grid(snap: &Snapshot) -> String {
+    let Some((r, c)) = snap.cursor_rc else {
+        return String::new();
+    };
+    if r >= snap.rows {
+        return String::new();
+    }
+    let end = c.min(snap.cols);
+    let row: String = (0..end).map(|x| snap.cell(r, x).c).collect();
+    strip_prompt(&row)
+}
+
+/// Strip a shell prompt prefix, returning the command that follows it. Tries dedicated
+/// prompt glyphs first (they almost never appear inside a command), then the classic
+/// `$`/`#`/`%` sigils; falls back to the whole (trimmed) row. Heuristic — a proper fix
+/// reads OSC 133 markers.
+fn strip_prompt(row: &str) -> String {
+    for m in ["❯ ", "➜ ", "» ", "▶ "] {
+        if let Some(i) = row.rfind(m) {
+            return row[i + m.len()..].trim().to_string();
+        }
+    }
+    for m in ["$ ", "# ", "% "] {
+        if let Some(i) = row.rfind(m) {
+            return row[i + m.len()..].trim().to_string();
+        }
+    }
+    row.trim().to_string()
+}
+
 /// Start index of the visible window so `idx` stays on screen (centered when possible).
 fn palette_window(idx: usize, total: usize, visible: usize) -> usize {
     if total <= visible {
@@ -2843,6 +2875,7 @@ impl App {
             out.extend_from_slice(b"\x1b[201~");
         }
         self.pty_write(&out);
+        self.schedule_preview(); // pasted commands preview too (grid-read after debounce)
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -3324,32 +3357,11 @@ impl App {
         self.request_redraw();
     }
 
-    /// Track the current command line from keystrokes sent to the shell (best-effort:
-    /// printable text appends, Backspace pops, Enter/^C/^U reset). Feeds the man panel.
-    fn track_input(&mut self, key: &Key, text: Option<&str>) {
-        match key {
-            Key::Named(NamedKey::Enter) => self.input_line.clear(),
-            Key::Named(NamedKey::Backspace) => {
-                self.input_line.pop();
-            }
-            _ => {
-                if let Some(t) = text {
-                    for c in t.chars() {
-                        match c {
-                            '\r' | '\n' | '\u{3}' | '\u{15}' => self.input_line.clear(), // Enter/^C/^U
-                            c if !c.is_control() => self.input_line.push(c),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Open the man panel for the first token of the current command line, rendering
     /// `man <cmd>` on a background thread (it spawns a process and can block).
     fn man_open(&mut self) {
-        let cmd = first_command_token(&self.input_line).to_string();
+        let line = self.grid_command_line();
+        let cmd = first_command_token(&line).to_string();
         self.man_on = true;
         self.man_scroll = 0;
         self.man_cmd = cmd.clone();
@@ -3445,15 +3457,6 @@ impl App {
         if !self.preview_on {
             return;
         }
-        let line = self.input_line.trim().to_string();
-        // An empty line (e.g. right after Enter) clears the panel — don't run anything.
-        if line.is_empty() {
-            self.preview_text.clear();
-            self.preview_line.clear();
-            self.preview_ran = false;
-            self.request_redraw();
-            return;
-        }
         let gen = self
             .preview_gen
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -3461,10 +3464,30 @@ impl App {
         let gen_arc = std::sync::Arc::clone(&self.preview_gen);
         let proxy = self.proxy.clone();
         let cwd = self.session_cwd();
+        let state = std::sync::Arc::clone(&self.state);
+        let (theme, cstyle) = (self.theme, self.cursor_style);
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(PREVIEW_DEBOUNCE_MS));
             // Superseded by newer input → don't even run the (possibly costly) command.
             if gen_arc.load(std::sync::atomic::Ordering::SeqCst) != gen {
+                return;
+            }
+            // Read the command straight off the grid — now that the shell's echo (and any
+            // completion / autosuggestion redraw) has settled — rather than reconstructing
+            // it from keystrokes. This is what makes paste, history recall, and accepted
+            // autosuggestions preview correctly.
+            let snap = state.lock().ok().and_then(|g| {
+                // cursor_on=true so the snapshot carries the cursor position (cursor_rc),
+                // which command_from_grid needs to find where the command ends.
+                (!g.term.mode().contains(TermMode::ALT_SCREEN))
+                    .then(|| build_snapshot(&g.term, &theme, cstyle, true))
+            });
+            let line = snap.as_ref().map(command_from_grid).unwrap_or_default();
+            if line.is_empty() {
+                // Clears the panel back to idle (e.g. an empty prompt after Enter).
+                let _ = proxy.send_event(UserEvent::PreviewReady {
+                    gen, line, ran: false, text: String::new(),
+                });
                 return;
             }
             let (ran, text) = match sampa_preview::run_preview(&line, cwd.as_deref()) {
@@ -3473,6 +3496,22 @@ impl App {
             };
             let _ = proxy.send_event(UserEvent::PreviewReady { gen, line, ran, text });
         });
+    }
+
+    /// The command at the prompt right now, read from the grid (see [`command_from_grid`]).
+    /// Synchronous — used by the man panel, which fires on a keypress when the grid is
+    /// already current (no pending echo).
+    fn grid_command_line(&self) -> String {
+        let Ok(g) = self.state.lock() else {
+            return String::new();
+        };
+        if g.term.mode().contains(TermMode::ALT_SCREEN) {
+            return String::new();
+        }
+        // cursor_on=true so cursor_rc is populated (command_from_grid needs it).
+        let snap = build_snapshot(&g.term, &self.theme, self.cursor_style, true);
+        drop(g);
+        command_from_grid(&snap)
     }
 
     /// Accept a completed preview if it's still the newest and the panel is open.
@@ -6514,6 +6553,20 @@ mod tests {
             Side::Left,
         ));
         assert_eq!(term.selection_to_string().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn strip_prompt_extracts_the_command() {
+        // Powerlevel10k-style glyph prompt.
+        assert_eq!(strip_prompt("❯ du -sh bin"), "du -sh bin");
+        assert_eq!(strip_prompt("~/repo ❯ git status"), "git status");
+        // Classic sigils.
+        assert_eq!(strip_prompt("user@host:~$ ls -la"), "ls -la");
+        assert_eq!(strip_prompt("root# whoami"), "whoami");
+        // No recognizable prompt → whole (trimmed) row.
+        assert_eq!(strip_prompt("   just text  "), "just text");
+        // Empty prompt (nothing typed) → empty command.
+        assert_eq!(strip_prompt("❯ "), "");
     }
 
     // --- escape hardening (§13) ---
