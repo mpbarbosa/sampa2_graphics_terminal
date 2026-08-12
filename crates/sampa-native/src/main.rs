@@ -4134,7 +4134,10 @@ fn cell_vis(
             | Flags::DASHED_UNDERLINE,
     );
     CellVis {
-        c: if cell.c == '\0' { ' ' } else { cell.c },
+        // Never hand a control character to the glyph shaper — it renders as a tofu box.
+        // Cells can carry `\0` (empty) or a raw `\t` (the column a tab advanced over); both
+        // must display as blank, like the rest of the cells the tab skipped.
+        c: if cell.c.is_control() { ' ' } else { cell.c },
         fg,
         bg,
         bold,
@@ -6292,6 +6295,21 @@ mod tests {
         // blink off (cursor_on=false) hides the cursor entirely.
         let off = build_snapshot(&term, &Theme::default(), CursorStyle::Underline, false);
         assert!(off.cursor.is_none());
+    }
+
+    #[test]
+    fn tab_skipped_cell_renders_blank_not_control() {
+        // `du`-style output: a value, a TAB, then a name. The columns the tab advanced
+        // over must display as spaces — never a raw control char, which the glyph shaper
+        // would draw as a tofu box (regression: `3.1M<box>bin`).
+        let (mut term, _r, _a) = proxy_term(20, 2);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"3.1M\tbin");
+        let colors = term.renderable_content().colors;
+        for col in 4..8 {
+            let cell = cell_vis(&term.grid()[Line(0)][Column(col)], colors, false, false, SELECTION_BG);
+            assert!(!cell.c.is_control(), "tab-region col {col} must not be a control char, got {:?}", cell.c);
+        }
     }
 
     #[test]
