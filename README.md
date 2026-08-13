@@ -25,6 +25,19 @@ cargo test                      # unit tests (VT seam, colors, keyboard, mouse, 
 cargo test -- --ignored         # app-matrix + ^C/resize smokes against real programs (PTY→VT)
 ```
 
+## Install
+
+Build a self-contained `.deb` and install it as a normal terminal (on `$PATH`, in the app
+menu, registered as an `x-terminal-emulator` alternative):
+
+```bash
+./packaging/build-deb.sh
+sudo apt install ./target/sampa2_*.deb
+```
+
+See [packaging/README.md](packaging/README.md) for details (icons, man page, deps). AppImage
+and `.rpm` are pending (rest of N3).
+
 ## Docs
 
 - [docs/PLAN.md](docs/PLAN.md) — the phased development plan (N0–N6, v1).

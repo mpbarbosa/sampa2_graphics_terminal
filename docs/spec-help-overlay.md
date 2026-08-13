@@ -2,14 +2,15 @@
 
 > **Provenance.** Copied from the reference
 > [`sampa_graphics_terminal`](https://github.com/mpbarbosa/sampa_graphics_terminal)
-> build (implemented there in `src/main.ts` + `index.html` + `src/style.css`). It is a
-> **target for this Rust build** (`crates/sampa-native`). Note this repo's actual
+> build (implemented there in `src/main.ts` + `index.html` + `src/style.css`). It is now
+> **realized natively in this Rust build** (`crates/sampa-native`). Note this repo's actual
 > keybindings may differ from the reference's (e.g. preview is `Ctrl+Shift+E` here vs
 > `Ctrl+Shift+R` there) — the §3a table lists the **actions** to include; bind and
 > label them to *this* build's real keys, driven from its own config.
 
-- **Status:** to implement — the native build has the individual shortcuts (tabs,
-  search, palette, man, preview) but not yet a single overlay that lists them.
+- **Status:** implemented — the native build renders this overlay (`Ctrl+Shift+?`,
+  `Action::Help`), generated live from the `[keybindings]` config + `ACTIONS` defaults so
+  it never drifts from the real keys.
 - **Applies to:** a `Ctrl+Shift+?` (or chosen) help overlay. This spec is the
   language-agnostic behavioral contract so any frontend (webview or native Rust)
   behaves identically.
