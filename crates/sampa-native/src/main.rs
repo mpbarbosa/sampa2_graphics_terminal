@@ -388,6 +388,27 @@ enum PsView {
     Message(String),
 }
 
+/// Live sort order for the ps panel (spec §5, level 1b). `Order` keeps the printed `ps`
+/// sequence; `c`/`m`/`p` switch to CPU/MEM descending or PID ascending.
+#[derive(Clone, Copy, PartialEq)]
+enum PsSort {
+    Order,
+    Cpu,
+    Mem,
+    Pid,
+}
+
+impl PsSort {
+    fn label(self) -> &'static str {
+        match self {
+            PsSort::Order => "ps order",
+            PsSort::Cpu => "cpu↓",
+            PsSort::Mem => "mem↓",
+            PsSort::Pid => "pid↑",
+        }
+    }
+}
+
 /// The AI suggester rendered as a centered floating card (not a bottom band): an accent
 /// header and a rich body, drawn over the terminal with the grid clipped into a hole
 /// behind it. `body_lines` sizes the card height.
@@ -1784,6 +1805,8 @@ fn main() -> Result<()> {
         ps_on: false,
         ps_view: None,
         ps_scroll: 0,
+        ps_level: Level::Quiet,
+        ps_sort: PsSort::Order,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2114,6 +2137,8 @@ struct App {
     ps_on: bool,
     ps_view: Option<PsView>,
     ps_scroll: usize,
+    ps_level: Level, // resolved level (1a quiet / 1b bars); gates bars + live sort
+    ps_sort: PsSort,
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -2785,6 +2810,24 @@ fn heat_band(value: f32, elided: bool, no_color: bool, fg: [u8; 3], muted: [u8; 
     } else {
         HEAT_RED
     }
+}
+
+/// Row indices in display order for the live sort (spec §5): the printed `ps` sequence, or
+/// CPU/MEM descending / PID ascending. Ties break on the original position so a re-sort is
+/// stable and reversible back to `Order`.
+fn ps_sort_order(rows: &[sampa_ps_decorate::QuietRow], sort: PsSort) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    match sort {
+        PsSort::Order => {}
+        PsSort::Cpu => {
+            order.sort_by(|&a, &b| rows[b].cpu_val.total_cmp(&rows[a].cpu_val).then(a.cmp(&b)))
+        }
+        PsSort::Mem => {
+            order.sort_by(|&a, &b| rows[b].mem_val.total_cmp(&rows[a].mem_val).then(a.cmp(&b)))
+        }
+        PsSort::Pid => order.sort_by_key(|&i| rows[i].pid.parse::<u64>().unwrap_or(0)),
+    }
+    order
 }
 
 /// Map the config's `[enhance] ps` level to the decorator's [`Level`].
@@ -3684,6 +3727,7 @@ impl App {
         self.man_on = false;
         self.preview_on = false;
         self.ps_scroll = 0;
+        self.ps_sort = PsSort::Order;
         self.ps_on = true;
 
         let cfg = load_config();
@@ -3692,7 +3736,8 @@ impl App {
             min_width_bars: cfg.enhance.min_width_bars,
             min_width_inspector: cfg.enhance.min_width_inspector,
         };
-        if resolve_level(ps_level(cfg.enhance.ps), self.cols, &thresholds) == Level::Off {
+        self.ps_level = resolve_level(ps_level(cfg.enhance.ps), self.cols, &thresholds);
+        if self.ps_level == Level::Off {
             self.ps_view = Some(PsView::Message(
                 if cfg.enhance.ps == sampa_config::PsEnhance::Off {
                     "ps enhancement is off — set `ps` under [enhance] to quiet.".into()
@@ -3755,6 +3800,12 @@ impl App {
         self.request_redraw();
     }
 
+    /// Bars + live sort are the 1b features — active only when the resolved level cleared
+    /// the `min_width_bars` gate (spec §5).
+    fn ps_has_bars(&self) -> bool {
+        matches!(self.ps_level, Level::Bars | Level::Inspector)
+    }
+
     fn ps_key(&mut self, key: &Key) {
         let page = PS_VISIBLE.saturating_sub(1).max(1);
         match key {
@@ -3764,6 +3815,19 @@ impl App {
             Key::Named(NamedKey::PageDown) => self.ps_scroll_by(page, true),
             Key::Named(NamedKey::PageUp) => self.ps_scroll_by(page, false),
             Key::Named(NamedKey::Home) => {
+                self.ps_scroll = 0;
+                self.request_redraw();
+            }
+            // Live sort (1b): re-order without re-running. Toggling a key back to itself
+            // restores the printed `ps` order.
+            Key::Character(s) if self.ps_has_bars() => {
+                let next = match s.as_str() {
+                    "c" | "C" => PsSort::Cpu,
+                    "m" | "M" => PsSort::Mem,
+                    "p" | "P" => PsSort::Pid,
+                    _ => return,
+                };
+                self.ps_sort = if self.ps_sort == next { PsSort::Order } else { next };
                 self.ps_scroll = 0;
                 self.request_redraw();
             }
@@ -3788,11 +3852,14 @@ impl App {
 
     /// Build the ps panel's `(title, body, spans)` from the decorated model: an aligned
     /// monospace table (pinned column header + the visible `ps_scroll` window of rows +
-    /// the folded-kernel summary), with `%CPU`/`%MEM` heat-coloured per spec §7.
+    /// the folded-kernel summary), with `%CPU`/`%MEM` heat-coloured per spec §7. At level
+    /// 1b (`ps_has_bars`) each percentage carries an 8-cell signal bar (spec §5) and the
+    /// rows follow the live `ps_sort` order.
     fn ps_render(&self, q: &Quiet, visible: usize) -> (String, String, Vec<BodySpan>) {
         let fg = self.theme.fg;
         let muted = blend(self.theme.bg, self.theme.fg, 0.55);
         let no_color = std::env::var_os("NO_COLOR").is_some();
+        let bars = self.ps_has_bars();
 
         // Column widths from the data (header labels set the floor); USER is capped.
         let (mut w_pid, mut w_user, mut w_cpu, mut w_mem, mut w_rss, mut w_start) =
@@ -3806,33 +3873,53 @@ impl App {
             w_start = w_start.max(r.start.chars().count());
         }
         w_user = w_user.min(12);
-        let fixed = w_pid + 1 + w_user + 1 + w_cpu + 1 + w_mem + 1 + w_rss + 1 + w_start + 1;
+        // Each bar (level 1b) adds its 8 cells + a leading space after the percentage.
+        let bar_w = if bars { sampa_ps_decorate::BAR_CELLS + 1 } else { 0 };
+        let fixed =
+            w_pid + 1 + w_user + 1 + w_cpu + bar_w + 1 + w_mem + bar_w + 1 + w_rss + 1 + w_start + 1;
         let cmd_budget = (self.cols as usize).saturating_sub(fixed).max(8);
 
-        // Pinned column header (muted, bold).
+        // Pinned column header (muted, bold). The bar columns are unlabelled spacers.
+        let gap = |on: bool| if on { format!(" {:bw$}", "", bw = sampa_ps_decorate::BAR_CELLS) } else { String::new() };
         let header = format!(
-            "{:>wp$} {:<wu$} {:>wc$} {:>wm$} {:>wr$} {:<ws$} COMMAND",
+            "{:>wp$} {:<wu$} {:>wc$}{cb} {:>wm$}{mb} {:>wr$} {:<ws$} COMMAND",
             "PID", "USER", "%CPU", "%MEM", "RSS", "START",
             wp = w_pid, wu = w_user, wc = w_cpu, wm = w_mem, wr = w_rss, ws = w_start,
+            cb = gap(bars), mb = gap(bars),
         );
 
-        // One `Vec<BodySpan>` per data line (rows, then the optional summary).
+        // Per-row bars scaled to the column max across the whole set (spec §5), computed on
+        // the printed order so the scale is stable regardless of the live sort.
+        let bar_pairs = bars.then(|| sampa_ps_decorate::bars_for(q));
+
+        // Display order: printed `ps` sequence, or the live sort (spec §5).
+        let order = ps_sort_order(&q.rows, self.ps_sort);
+
+        // One `Vec<BodySpan>` per data line (rows in display order, then the summary).
         let mut rows: Vec<Vec<BodySpan>> = Vec::with_capacity(q.rows.len() + 1);
-        for r in &q.rows {
+        for &i in &order {
+            let r = &q.rows[i];
             let user = truncate_chars(&r.user, w_user);
             let cmd = truncate_chars(&r.command, cmd_budget);
             let cpu_c = heat_band(r.cpu_val, r.cpu == "–", no_color, fg, muted);
             let mem_c = heat_band(r.mem_val, r.mem == "–", no_color, fg, muted);
-            rows.push(vec![
+            let mut line: Vec<BodySpan> = vec![
                 (format!("{:>wp$} {:<wu$} ", r.pid, user, wp = w_pid, wu = w_user), fg, false, false),
                 (format!("{:>wc$}", r.cpu, wc = w_cpu), cpu_c, false, false),
-                (" ".to_string(), fg, false, false),
-                (format!("{:>wm$}", r.mem, wm = w_mem), mem_c, false, false),
-                (
-                    format!(" {:>wr$} {:<ws$} {}", r.rss, r.start, cmd, wr = w_rss, ws = w_start),
-                    fg, false, false,
-                ),
-            ]);
+            ];
+            if let Some(bp) = &bar_pairs {
+                line.push((format!(" {}", bp[i].0), cpu_c, false, false));
+            }
+            line.push((" ".to_string(), fg, false, false));
+            line.push((format!("{:>wm$}", r.mem, wm = w_mem), mem_c, false, false));
+            if let Some(bp) = &bar_pairs {
+                line.push((format!(" {}", bp[i].1), mem_c, false, false));
+            }
+            line.push((
+                format!(" {:>wr$} {:<ws$} {}", r.rss, r.start, cmd, wr = w_rss, ws = w_start),
+                fg, false, false,
+            ));
+            rows.push(line);
         }
         if let Some(sum) = q.kernel_summary() {
             rows.push(vec![(sum, muted, false, true)]);
@@ -3850,18 +3937,28 @@ impl App {
         }
         let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
 
+        // Header line: process/kernel counts, then (1b) the CPU denominator + sort + keys.
         let n = q.rows.len();
-        let title = format!(
-            "ps aux — {} process{}{}   {}   ·  ↑/↓ PgUp/PgDn · Esc",
-            n,
-            if n == 1 { "" } else { "es" },
-            if q.kernel_count > 0 {
-                format!(" · {} kernel folded", q.kernel_count)
-            } else {
-                String::new()
-            },
-            if total > 0 { format!("{}–{}/{}", start + 1, end, total) } else { "0/0".into() },
-        );
+        let kernel = if q.kernel_count > 0 {
+            format!(" · {} kernel folded", q.kernel_count)
+        } else {
+            String::new()
+        };
+        let readout = if total > 0 { format!("{}–{}/{}", start + 1, end, total) } else { "0/0".into() };
+        let title = if bars {
+            // Denominator: %CPU is per-core-summed, so N cores means a 100·N ceiling.
+            let cpu_sum: f32 = q.rows.iter().map(|r| r.cpu_val).sum();
+            let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1);
+            format!(
+                "ps aux — {} proc{} · CPU {:.1}% of {}%   {}   ·  c/m/p sort ({}) · Esc",
+                n, kernel, cpu_sum, cores * 100, readout, self.ps_sort.label(),
+            )
+        } else {
+            format!(
+                "ps aux — {} process{}{}   {}   ·  ↑/↓ PgUp/PgDn · Esc",
+                n, if n == 1 { "" } else { "es" }, kernel, readout,
+            )
+        };
         (title, body, spans)
     }
 
@@ -7081,6 +7178,28 @@ mod tests {
         // NO_COLOR suppresses the band (keeps fg) but not the elided-zero muting.
         assert_eq!(heat_band(42.0, false, true, fg, muted), fg);
         assert_eq!(heat_band(0.0, true, true, fg, muted), muted);
+    }
+
+    #[test]
+    fn ps_sort_orders_by_key() {
+        let row = |pid: &str, cpu: f32, mem: f32| sampa_ps_decorate::QuietRow {
+            pid: pid.to_string(),
+            user: "u".into(),
+            cpu: "–".into(),
+            mem: "–".into(),
+            rss: "–".into(),
+            rss_kb: 0,
+            start: "12:03".into(),
+            command: "c".into(),
+            cpu_val: cpu,
+            mem_val: mem,
+        };
+        // printed order: pid 30 (cpu 5), pid 10 (cpu 9), pid 20 (cpu 1).
+        let rows = vec![row("30", 5.0, 2.0), row("10", 9.0, 1.0), row("20", 1.0, 8.0)];
+        assert_eq!(ps_sort_order(&rows, PsSort::Order), vec![0, 1, 2]);
+        assert_eq!(ps_sort_order(&rows, PsSort::Cpu), vec![1, 0, 2]); // 9,5,1
+        assert_eq!(ps_sort_order(&rows, PsSort::Mem), vec![2, 0, 1]); // 8,2,1
+        assert_eq!(ps_sort_order(&rows, PsSort::Pid), vec![1, 2, 0]); // 10,20,30
     }
 
     #[test]

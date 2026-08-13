@@ -6,10 +6,12 @@
 > slice** — how the wgpu build triggers, scrapes, decorates, and draws it. Levels **1b**
 > (bars + live sort) and **1c** (inspector) are explicitly out of scope here (§8).
 
-- **Status:** implemented. `Action::EnhancePs` on `Ctrl+Shift+D` scrapes the buffer and
-  renders the decorated `Quiet` model as a bottom overlay panel. The headless core
-  (`sampa-ps-decorate`, pinned in `sampa-native/Cargo.toml` per ADR 0002) provides the
-  parse + decorate; the native side adds the trigger, scrape, and render.
+- **Status:** implemented (1a **and** 1b). `Action::EnhancePs` on `Ctrl+Shift+D` scrapes the
+  buffer and renders the decorated `Quiet` model as a bottom overlay panel. The headless
+  core (`sampa-ps-decorate`, pinned in `sampa-native/Cargo.toml` per ADR 0002) provides the
+  parse + decorate + bars; the native side adds the trigger, scrape, render, and live sort.
+  With `[enhance] ps = "bars"` at ≥ 100 cols the panel adds §5 signal bars + `c`/`m`/`p`
+  sort (see §9.2); below that width it falls back to 1a quiet columns.
 - **Reuses:** the overlay-panel machinery of the man/preview panels (`PanelView` + rich
   body spans), the keybinding `Action`/`ACTIONS` table, and — for precise block bounds —
   the OSC 133 scanner recovered in the preview work.
@@ -132,8 +134,10 @@ and fast (string parsing of a few hundred lines).
 
 - **In-place** decoration of the scrollback region — this slice renders a panel; replacing
   the actual `ps` output cells and freezing back is §9 follow-up work.
-- **1b** signal bars, denominators, live `c`/`m`/`p` sort, page readout.
 - **1c** grouping, two-pane inspector, `/` filter, `k` → `kill` insert-never-run.
+
+(1b — signal bars, denominators, live `c`/`m`/`p` sort — was originally out of scope here but
+has since been implemented in the same panel; see §9.2.)
 - `ps -ef` decoration (core recognises `HeaderKind::Ef` but 1a only decorates `Aux`).
 
 ## 9. Follow-ups
@@ -141,8 +145,11 @@ and fast (string parsing of a few hundred lines).
 1. **True in-place render** — replace the `ps` block's grid rows with the decorated model
    (fold hides rows, summary line inserted), bounded by OSC 133, freezing back to static
    text at the next prompt. This is the harder renderer change the parent spec §6 describes.
-2. **1b bars** — `ps_decorate::bars_for(&quiet)` already yields the block-glyph bars; add the
-   sort keys + page readout.
+2. **1b bars — done.** `bars_for` block-glyph bars on `%CPU`/`%MEM` (heat-coloured, scaled to
+   the column max), a `CPU x% of N×100%` denominator, a position readout, and live `c`/`m`/`p`
+   sort (CPU↓ / MEM↓ / PID↑, toggling back to printed order). Gated to the resolved `Bars`
+   level (≥ `min_width_bars`). Not yet: the proportional scrollbar glyph, and the kernel-fold
+   toggle (the core folds in `build_quiet`, so revealing threads inline needs a core option).
 3. **1c inspector** — `group_rows` / `parse_enrich` are ready; add the two-pane overlay and
    the `k` → `kill <pid>` insert-never-run action.
 
