@@ -208,10 +208,11 @@ renders; tabs run independent shells; search highlights scrollback matches.
   origin's `tao` limitation) — verified via `xprop`.
 - ✅ `.desktop` (`TerminalEmulator` category) + `update-alternatives` for
   `x-terminal-emulator` in the `.deb` `postinst`. `xdg-terminal-exec` ⬜.
-- ✅ Packaging: **`.deb`** (`lintian`-clean, `packaging/build-deb.sh`) and **AppImage**
-  (single no-install file, `packaging/build-appimage.sh`) — a **single self-contained
-  binary** with **no webkit runtime dependency** (a real gain over Path B's SONAME deps).
-  `.rpm` ⬜. No Flatpak (origin [ADR 0001] applies — sandbox fights a host-shell terminal).
+- ✅ Packaging: **`.deb`** (`lintian`-clean, `packaging/build-deb.sh`), **AppImage**
+  (single no-install file, `packaging/build-appimage.sh`), and **`.rpm`**
+  (`packaging/build-rpm.sh`) — a **single self-contained binary** with **no webkit runtime
+  dependency** (a real gain over Path B's SONAME deps). `xdg-terminal-exec` ⬜. No Flatpak
+  (origin [ADR 0001] applies — sandbox fights a host-shell terminal).
 
 **Exit:** a clean-VM `.deb` install launches, registers as a terminal alternative,
 runs the host shell; AppImage runs with no install; WM_CLASS verified via `xprop`.
