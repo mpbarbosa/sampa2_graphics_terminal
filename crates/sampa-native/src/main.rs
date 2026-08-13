@@ -44,6 +44,9 @@ use glyphon::{
 };
 use pty_core::pty::{spawn, PtyEvent, PtyHandle, SpawnConfig};
 use sampa_config::CursorStyle;
+use sampa_ps_decorate::{
+    decorate_scrollback, header_kind, resolve_level, HeaderKind, Level, Quiet, WidthThresholds,
+};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -75,6 +78,13 @@ const BELL_FLASH: std::time::Duration = std::time::Duration::from_millis(120);
 /// Preview panel: max body lines shown, and the debounce before a settled line runs.
 const PREVIEW_VISIBLE: usize = 12;
 const PREVIEW_DEBOUNCE_MS: u64 = 550;
+/// `ps` enhancement panel (spec-ps-native-1a.md): max decorated rows shown at once.
+const PS_VISIBLE: usize = 18;
+/// Heat bands for the `%CPU`/`%MEM` columns (spec §7): 1–5 % green, 5–10 % yellow, >10 % red.
+/// Below 1 % uses the theme foreground; an elided zero (`–`) renders muted.
+const HEAT_GREEN: [u8; 3] = [0x98, 0xc3, 0x79];
+const HEAT_YELLOW: [u8; 3] = [0xe5, 0xc0, 0x7b];
+const HEAT_RED: [u8; 3] = [0xe0, 0x6c, 0x75];
 /// Font-size bounds for zoom (Ctrl +/−/0).
 const FONT_SIZE_MIN: f32 = 6.0;
 const FONT_SIZE_MAX: f32 = 48.0;
@@ -93,6 +103,7 @@ enum Action {
     Palette,
     ToggleMan,
     TogglePreview,
+    EnhancePs,
     Ai,
     ZoomIn,
     ZoomOut,
@@ -114,6 +125,9 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     (Action::Palette, "palette", "Command palette", "Ctrl+Shift+P"),
     (Action::ToggleMan, "toggle_man", "Toggle man-page panel", "Ctrl+Shift+M"),
     (Action::TogglePreview, "toggle_preview", "Toggle command preview", "Ctrl+Shift+E"),
+    // Not Ctrl+Shift+E — sampa-config defaults `enhance_ps` there, but that chord is
+    // toggle_preview here; the native default lives on Ctrl+Shift+D ("decorate").
+    (Action::EnhancePs, "enhance_ps", "Enhance last ps output", "Ctrl+Shift+D"),
     (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
     (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
     (Action::ZoomOut, "zoom_out", "Zoom out", "Ctrl+Minus"),
@@ -365,6 +379,13 @@ struct PanelView<'a> {
     /// spans replace it — their concatenated text should match `body` so the panel
     /// height (computed from `body`'s line count) still lines up.
     body_spans: Option<&'a [BodySpan]>,
+}
+
+/// What the `ps` enhancement panel is showing: the decorated table, or a one-line reason
+/// it isn't (config `off`, terminal too narrow, or no `ps aux` block in the buffer).
+enum PsView {
+    Table(Box<Quiet>),
+    Message(String),
 }
 
 /// The AI suggester rendered as a centered floating card (not a bottom band): an accent
@@ -1760,6 +1781,9 @@ fn main() -> Result<()> {
         preview_ran: false,
         preview_line: String::new(),
         preview_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ps_on: false,
+        ps_view: None,
+        ps_scroll: 0,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2086,6 +2110,10 @@ struct App {
     preview_line: String, // the command the current preview_text is for
     /// Debounce/supersede token: only the newest scheduled preview runs + is accepted.
     preview_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    // ps enhancement panel (spec-ps-native-1a.md) — decorate the last `ps aux` output.
+    ps_on: bool,
+    ps_view: Option<PsView>,
+    ps_scroll: usize,
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -2241,6 +2269,14 @@ impl ApplicationHandler<UserEvent> for App {
                         self.man_close();
                     } else {
                         self.man_key(&event.logical_key);
+                    }
+                    return;
+                }
+                if self.ps_on {
+                    if action == Some(Action::EnhancePs) {
+                        self.ps_close();
+                    } else {
+                        self.ps_key(&event.logical_key);
                     }
                     return;
                 }
@@ -2690,6 +2726,90 @@ fn command_at_prompt(snap: &Snapshot, cmd_start: Option<(i32, usize)>) -> String
     command_from_grid(snap)
 }
 
+/// Read the whole terminal buffer — scrollback history *and* the active screen — as plain
+/// text, one grid line per output line, control cells collapsed to spaces and trailing
+/// pad-space trimmed. Feeds [`decorate_scrollback`], which finds the `ps` header itself, so
+/// we hand it everything above the cursor: a `ps aux` header sits ~300 rows up, off the
+/// visible screen, so a visible-only read would miss it (spec-ps-native-1a.md §4).
+fn scrape_scrollback<L: EventListener>(term: &Term<L>) -> String {
+    let grid = term.grid();
+    let cols = grid.columns();
+    let top = grid.topmost_line().0;
+    let bottom = grid.screen_lines() as i32 - 1;
+    let mut out = String::new();
+    for line in top..=bottom {
+        let row = &grid[Line(line)];
+        let mut s = String::with_capacity(cols);
+        for c in 0..cols {
+            let ch = row[Column(c)].c;
+            s.push(if ch == '\0' || ch.is_control() { ' ' } else { ch });
+        }
+        out.push_str(s.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// Restore the closing `]` that the tty cut off a kernel thread's COMMAND.
+///
+/// `ps aux` truncates COMMAND to the terminal width when writing to a tty, so a long kernel
+/// thread (`[kworker/R-rcu_gp]`) loses its `]` in the scrape — defeating the decorator's
+/// `[...]` bracket test and leaving hundreds of kernel threads unfolded (on a width-80 tty,
+/// only ~1 in 4 keep their `]`). When a row's COMMAND (field 11) opens with `[` but the
+/// line doesn't close it, append `]` so the decorator folds it. Only a bracketed COMMAND
+/// triggers this — userland argv[0] never starts with `[` — and a folded row is never
+/// displayed, so the mid-name cut never shows.
+fn repair_truncated_kernel(line: &str) -> std::borrow::Cow<'_, str> {
+    let t = line.trim_end();
+    if t.ends_with(']') {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    if t.split_whitespace().nth(10).is_some_and(|c| c.starts_with('[')) {
+        std::borrow::Cow::Owned(format!("{t}]"))
+    } else {
+        std::borrow::Cow::Borrowed(line)
+    }
+}
+
+/// Colour for a `%CPU`/`%MEM` cell (spec §7). An elided zero (`–`) is muted; otherwise the
+/// value picks a band, falling back to `fg` under 1 % or when colour is suppressed.
+fn heat_band(value: f32, elided: bool, no_color: bool, fg: [u8; 3], muted: [u8; 3]) -> [u8; 3] {
+    if elided {
+        muted
+    } else if no_color || value < 1.0 {
+        fg
+    } else if value < 5.0 {
+        HEAT_GREEN
+    } else if value < 10.0 {
+        HEAT_YELLOW
+    } else {
+        HEAT_RED
+    }
+}
+
+/// Map the config's `[enhance] ps` level to the decorator's [`Level`].
+fn ps_level(p: sampa_config::PsEnhance) -> Level {
+    match p {
+        sampa_config::PsEnhance::Off => Level::Off,
+        sampa_config::PsEnhance::Quiet => Level::Quiet,
+        sampa_config::PsEnhance::Bars => Level::Bars,
+        sampa_config::PsEnhance::Inspector => Level::Inspector,
+    }
+}
+
+/// Truncate to `max` characters, marking a cut with a trailing `…` (never mid-grapheme by
+/// byte). Returns the string unchanged when it already fits.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let keep: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{keep}…")
+}
+
 /// Concatenate grid text from `(start_row, start_col)` up to `(end_row, end_col)`,
 /// spanning full-width intermediate rows (a wrapped command). Trailing pad-spaces trimmed.
 fn grid_text_between(snap: &Snapshot, start: (usize, usize), end: (usize, usize)) -> String {
@@ -3092,6 +3212,7 @@ impl App {
             Action::Palette => self.palette_open(),
             Action::ToggleMan => self.man_open(),
             Action::TogglePreview => self.preview_toggle(),
+            Action::EnhancePs => self.ps_open(),
             Action::Ai => self.ai_open(),
             Action::ZoomIn => self.zoom_by(1.0),
             Action::ZoomOut => self.zoom_by(-1.0),
@@ -3553,6 +3674,197 @@ impl App {
         self.request_redraw();
     }
 
+    /// Decorate the last `ps aux` output into a panel (spec-ps-native-1a.md). Scrapes the
+    /// buffer, hands the last `ps aux` block to the headless decorator, and shows the quiet
+    /// model — or a one-line reason when it's off / too narrow / not found. Read-only: it
+    /// never runs anything and never mutates the scrollback.
+    fn ps_open(&mut self) {
+        // A live overlay is never open here (modal ones capture keys first); close the
+        // other bottom panels so the ps panel owns the band.
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_scroll = 0;
+        self.ps_on = true;
+
+        let cfg = load_config();
+        let thresholds = WidthThresholds {
+            min_width: cfg.enhance.min_width,
+            min_width_bars: cfg.enhance.min_width_bars,
+            min_width_inspector: cfg.enhance.min_width_inspector,
+        };
+        if resolve_level(ps_level(cfg.enhance.ps), self.cols, &thresholds) == Level::Off {
+            self.ps_view = Some(PsView::Message(
+                if cfg.enhance.ps == sampa_config::PsEnhance::Off {
+                    "ps enhancement is off — set `ps` under [enhance] to quiet.".into()
+                } else {
+                    format!(
+                        "Terminal too narrow for ps enhancement (need ≥ {} cols, have {}).",
+                        cfg.enhance.min_width, self.cols
+                    )
+                },
+            ));
+            self.request_redraw();
+            return;
+        }
+
+        // Scrape history + screen, then isolate the *last* `ps aux` block (the decorator
+        // reads top-down from the first header it sees, so trim to the most recent one).
+        let block = {
+            let Ok(g) = self.state.lock() else {
+                self.ps_view = None;
+                self.ps_on = false;
+                return;
+            };
+            if g.term.mode().contains(TermMode::ALT_SCREEN) {
+                // A full-screen app (pager, htop…) owns the screen — no scrollback to read.
+                self.ps_view = Some(PsView::Message(
+                    "Not available while a full-screen app is running.".into(),
+                ));
+                self.request_redraw();
+                return;
+            }
+            let full = scrape_scrollback(&g.term);
+            drop(g);
+            let lines: Vec<&str> = full.lines().collect();
+            lines
+                .iter()
+                .rposition(|l| matches!(header_kind(l), Some(HeaderKind::Aux)))
+                .map(|i| {
+                    // Restore tty-truncated kernel brackets so the decorator folds them.
+                    let mut b = String::new();
+                    for l in &lines[i..] {
+                        b.push_str(&repair_truncated_kernel(l));
+                        b.push('\n');
+                    }
+                    b
+                })
+        };
+
+        self.ps_view = Some(match block.as_deref().and_then(decorate_scrollback) {
+            Some(quiet) => PsView::Table(Box::new(quiet)),
+            None => PsView::Message(
+                "No `ps aux` output found in the buffer — run `ps aux`, then press the key again.".into(),
+            ),
+        });
+        self.request_redraw();
+    }
+
+    fn ps_close(&mut self) {
+        self.ps_on = false;
+        self.ps_view = None;
+        self.request_redraw();
+    }
+
+    fn ps_key(&mut self, key: &Key) {
+        let page = PS_VISIBLE.saturating_sub(1).max(1);
+        match key {
+            Key::Named(NamedKey::Escape) => self.ps_close(),
+            Key::Named(NamedKey::ArrowDown) => self.ps_scroll_by(1, true),
+            Key::Named(NamedKey::ArrowUp) => self.ps_scroll_by(1, false),
+            Key::Named(NamedKey::PageDown) => self.ps_scroll_by(page, true),
+            Key::Named(NamedKey::PageUp) => self.ps_scroll_by(page, false),
+            Key::Named(NamedKey::Home) => {
+                self.ps_scroll = 0;
+                self.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
+    fn ps_scroll_by(&mut self, delta: usize, down: bool) {
+        // Scroll span = data rows + the optional kernel-summary line (the header is pinned).
+        let scrollable = match self.ps_view.as_ref() {
+            Some(PsView::Table(q)) => q.rows.len() + usize::from(q.kernel_summary().is_some()),
+            _ => 0,
+        };
+        let max = scrollable.saturating_sub(1);
+        self.ps_scroll = if down {
+            (self.ps_scroll + delta).min(max)
+        } else {
+            self.ps_scroll.saturating_sub(delta)
+        };
+        self.request_redraw();
+    }
+
+    /// Build the ps panel's `(title, body, spans)` from the decorated model: an aligned
+    /// monospace table (pinned column header + the visible `ps_scroll` window of rows +
+    /// the folded-kernel summary), with `%CPU`/`%MEM` heat-coloured per spec §7.
+    fn ps_render(&self, q: &Quiet, visible: usize) -> (String, String, Vec<BodySpan>) {
+        let fg = self.theme.fg;
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        let no_color = std::env::var_os("NO_COLOR").is_some();
+
+        // Column widths from the data (header labels set the floor); USER is capped.
+        let (mut w_pid, mut w_user, mut w_cpu, mut w_mem, mut w_rss, mut w_start) =
+            (3usize, 4usize, 4usize, 4usize, 3usize, 5usize);
+        for r in &q.rows {
+            w_pid = w_pid.max(r.pid.chars().count());
+            w_user = w_user.max(r.user.chars().count());
+            w_cpu = w_cpu.max(r.cpu.chars().count());
+            w_mem = w_mem.max(r.mem.chars().count());
+            w_rss = w_rss.max(r.rss.chars().count());
+            w_start = w_start.max(r.start.chars().count());
+        }
+        w_user = w_user.min(12);
+        let fixed = w_pid + 1 + w_user + 1 + w_cpu + 1 + w_mem + 1 + w_rss + 1 + w_start + 1;
+        let cmd_budget = (self.cols as usize).saturating_sub(fixed).max(8);
+
+        // Pinned column header (muted, bold).
+        let header = format!(
+            "{:>wp$} {:<wu$} {:>wc$} {:>wm$} {:>wr$} {:<ws$} COMMAND",
+            "PID", "USER", "%CPU", "%MEM", "RSS", "START",
+            wp = w_pid, wu = w_user, wc = w_cpu, wm = w_mem, wr = w_rss, ws = w_start,
+        );
+
+        // One `Vec<BodySpan>` per data line (rows, then the optional summary).
+        let mut rows: Vec<Vec<BodySpan>> = Vec::with_capacity(q.rows.len() + 1);
+        for r in &q.rows {
+            let user = truncate_chars(&r.user, w_user);
+            let cmd = truncate_chars(&r.command, cmd_budget);
+            let cpu_c = heat_band(r.cpu_val, r.cpu == "–", no_color, fg, muted);
+            let mem_c = heat_band(r.mem_val, r.mem == "–", no_color, fg, muted);
+            rows.push(vec![
+                (format!("{:>wp$} {:<wu$} ", r.pid, user, wp = w_pid, wu = w_user), fg, false, false),
+                (format!("{:>wc$}", r.cpu, wc = w_cpu), cpu_c, false, false),
+                (" ".to_string(), fg, false, false),
+                (format!("{:>wm$}", r.mem, wm = w_mem), mem_c, false, false),
+                (
+                    format!(" {:>wr$} {:<ws$} {}", r.rss, r.start, cmd, wr = w_rss, ws = w_start),
+                    fg, false, false,
+                ),
+            ]);
+        }
+        if let Some(sum) = q.kernel_summary() {
+            rows.push(vec![(sum, muted, false, true)]);
+        }
+
+        // Scroll window over the data rows; the header line is always shown on top.
+        let total = rows.len();
+        let start = self.ps_scroll.min(total.saturating_sub(1));
+        let end = (start + visible.saturating_sub(1)).min(total);
+
+        let mut spans: Vec<BodySpan> = vec![(header, muted, true, false)];
+        for line in &rows[start..end] {
+            spans.push(("\n".to_string(), fg, false, false));
+            spans.extend(line.iter().cloned());
+        }
+        let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
+
+        let n = q.rows.len();
+        let title = format!(
+            "ps aux — {} process{}{}   {}   ·  ↑/↓ PgUp/PgDn · Esc",
+            n,
+            if n == 1 { "" } else { "es" },
+            if q.kernel_count > 0 {
+                format!(" · {} kernel folded", q.kernel_count)
+            } else {
+                String::new()
+            },
+            if total > 0 { format!("{}–{}/{}", start + 1, end, total) } else { "0/0".into() },
+        );
+        (title, body, spans)
+    }
+
     /// Toggle the live command-preview panel; enabling it previews the current line.
     fn preview_toggle(&mut self) {
         self.preview_on = !self.preview_on;
@@ -3822,6 +4134,9 @@ impl App {
         // Both slice their body to the lines that fit the window.
         let panel_title;
         let panel_body;
+        let ps_title;
+        let ps_body;
+        let ps_spans: Vec<BodySpan>;
         let ai_title;
         let ai_body_spans: Vec<BodySpan>;
         let (_, lh) = self.cell_metrics();
@@ -3901,6 +4216,22 @@ impl App {
             let more = if lines.len() > shown { format!("  (+{} lines)", lines.len() - shown) } else { String::new() };
             panel_title = format!("{}{}   ·  Ctrl+Shift+E hides", self.preview_status(), more);
             Some(PanelView { title: &panel_title, body: &panel_body, body_spans: None })
+        } else if self.ps_on {
+            match self.ps_view.as_ref() {
+                Some(PsView::Table(q)) => {
+                    let (t, b, spans) = self.ps_render(q, fit(PS_VISIBLE));
+                    ps_title = t;
+                    ps_body = b;
+                    ps_spans = spans;
+                    Some(PanelView { title: &ps_title, body: &ps_body, body_spans: Some(&ps_spans) })
+                }
+                Some(PsView::Message(m)) => {
+                    ps_title = "ps enhancement   ·  Esc".to_string();
+                    ps_body = m.clone();
+                    Some(PanelView { title: &ps_title, body: &ps_body, body_spans: None })
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -6715,6 +7046,49 @@ mod tests {
         assert_eq!(strip_prompt("   just text  "), "just text");
         // Empty prompt (nothing typed) → empty command.
         assert_eq!(strip_prompt("❯ "), "");
+    }
+
+    // --- ps enhancement 1a (spec-ps-native-1a.md) ---
+    #[test]
+    fn repair_restores_tty_truncated_kernel_bracket() {
+        // A long kernel thread the tty cut mid-name (no closing `]`) → `]` restored so the
+        // decorator's `is_kernel_command` folds it.
+        let cut = "root  3  0.0  0.0  0  0  ?  I<  12:03  0:00 [kworker/R-rcu_g";
+        let repaired = repair_truncated_kernel(cut);
+        assert!(repaired.ends_with(']'));
+        assert!(sampa_ps_decorate::is_kernel_command(
+            repaired.rsplit("0:00 ").next().unwrap()
+        ));
+        // Already-closed kernel thread → untouched (borrowed, no realloc).
+        let ok = "root  2  0.0  0.0  0  0  ?  S  12:03  0:00 [kthreadd]";
+        assert!(matches!(repair_truncated_kernel(ok), std::borrow::Cow::Borrowed(_)));
+        // A normal (non-bracketed) command that happens to be cut → never gets a stray `]`.
+        let user = "mpb  99  1.0  0.5  1000  500  pts/0  S  12:03  0:00 /usr/bin/some-long-pa";
+        assert!(matches!(repair_truncated_kernel(user), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn heat_band_follows_spec_7() {
+        let fg = [10, 20, 30];
+        let muted = [1, 2, 3];
+        // Elided zero → muted, regardless of value.
+        assert_eq!(heat_band(0.0, true, false, fg, muted), muted);
+        // Bands: <1 fg · 1–5 green · 5–10 yellow · >10 red.
+        assert_eq!(heat_band(0.4, false, false, fg, muted), fg);
+        assert_eq!(heat_band(2.2, false, false, fg, muted), HEAT_GREEN);
+        assert_eq!(heat_band(8.7, false, false, fg, muted), HEAT_YELLOW);
+        assert_eq!(heat_band(42.0, false, false, fg, muted), HEAT_RED);
+        // NO_COLOR suppresses the band (keeps fg) but not the elided-zero muting.
+        assert_eq!(heat_band(42.0, false, true, fg, muted), fg);
+        assert_eq!(heat_band(0.0, true, true, fg, muted), muted);
+    }
+
+    #[test]
+    fn truncate_marks_cuts_and_leaves_fits() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("exactfit!!", 10), "exactfit!!");
+        assert_eq!(truncate_chars("way too long here", 8), "way too…");
+        assert_eq!(truncate_chars("x", 0), "");
     }
 
     // --- escape hardening (§13) ---

@@ -6,9 +6,10 @@
 > slice** — how the wgpu build triggers, scrapes, decorates, and draws it. Levels **1b**
 > (bars + live sort) and **1c** (inspector) are explicitly out of scope here (§8).
 
-- **Status:** to implement. The headless core (`sampa-ps-decorate`, pinned in
-  `sampa-native/Cargo.toml` per ADR 0002) already provides everything this slice consumes;
-  `main.rs` has no references yet.
+- **Status:** implemented. `Action::EnhancePs` on `Ctrl+Shift+D` scrapes the buffer and
+  renders the decorated `Quiet` model as a bottom overlay panel. The headless core
+  (`sampa-ps-decorate`, pinned in `sampa-native/Cargo.toml` per ADR 0002) provides the
+  parse + decorate; the native side adds the trigger, scrape, and render.
 - **Reuses:** the overlay-panel machinery of the man/preview panels (`PanelView` + rich
   body spans), the keybinding `Action`/`ACTIONS` table, and — for precise block bounds —
   the OSC 133 scanner recovered in the preview work.
@@ -63,6 +64,16 @@ next prompt) and locates the `USER PID %CPU …` header itself — so the scrape
   Read it from the alacritty grid including history lines, joined by `\n` (the existing
   `Snapshot::to_text` reads only the visible rows — this slice adds a history-inclusive
   read).
+- **Last-block selection:** `decorate_scrollback` reads top-down from the *first* header it
+  sees, so the scrape is trimmed to the last `ps aux` header (scan bottom-up for the most
+  recent `HeaderKind::Aux`) before decoding — otherwise an older `ps` in history would win.
+- **tty-truncation repair (found in implementation):** `ps aux` truncates COMMAND to the
+  terminal width when writing to a tty, so a long kernel thread (`[kworker/R-rcu_gp]`) loses
+  its closing `]` in the scrape — and the core's `is_kernel_command` needs both brackets, so
+  hundreds of kernel threads would stay unfolded (at width 80, only ~1 in 4 keep their `]`).
+  `repair_truncated_kernel` restores the `]` the terminal cut on any row whose COMMAND opens
+  with `[`, so folding is correct (217 vs 57 on a test box). Kept native-side (no core
+  re-pin); safe because only a bracketed COMMAND triggers it and folded rows aren't drawn.
 - **Enhancement (later, cheap):** bound the scrape with **OSC 133** — the last `133;C`
   (command output start) to `133;D`/cursor delimits exactly the last command's output, so
   the decorator sees only that block and never an earlier `ps`. The recovered OSC 133
