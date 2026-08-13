@@ -81,6 +81,18 @@ sampa2 -e CMD [ARGS…]      # or `-- CMD …` — run CMD instead of $SHELL
        -h/--help, -V/--version
 ```
 
+## Portability (glibc floor)
+
+The binary needs the glibc it was **built** against — building on Ubuntu 26.04 produces a
+binary that requires `GLIBC_2.43`, so it won't run on Ubuntu 24.04 (2.39) / Debian 13
+(2.41). `build-deb.sh` pins `Depends: libc6 (>= <detected>)` from the binary's max
+`GLIBC_*` symbol, so **apt refuses to install on too-old systems** rather than installing a
+binary that dies with `GLIBC_x.y not found` (verified in a clean 24.04 container). The
+`.rpm` gets this automatically (rpm's find-requires emits versioned `libc.so.6(GLIBC_x.y)`).
+The **AppImage can't declare deps**, so it simply requires that glibc at runtime.
+
+**For wide reach, build on an older base** (e.g. Ubuntu 22.04 in CI) to get a lower floor.
+
 ## Default-terminal integration
 
 - **Debian/Ubuntu:** the `.deb` `postinst` registers an `x-terminal-emulator` alternative.

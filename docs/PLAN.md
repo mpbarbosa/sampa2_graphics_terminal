@@ -202,7 +202,7 @@ interactive pass + wider program coverage outstanding.)*
 **Exit:** a config edit hot-reloads theme/font/cursor; a Powerline + truecolor prompt
 renders; tabs run independent shells; search highlights scrollback matches.
 
-### N3 — Linux citizen (§12, §16) 🔨  *(all items shipped; exit gate = clean-VM install test)*
+### N3 — Linux citizen (§12, §16) ✅
 - ✅ Wire `sampa-cli`: `-e`/`--`, `--working-directory`, `--title`, `--hold`, `--login`,
   `--config`, `-h`/`-V`, and **`--class`/WM_CLASS set at runtime** (native win, unlike the
   origin's `tao` limitation) — verified via `xprop`.
@@ -216,8 +216,13 @@ renders; tabs run independent shells; search highlights scrollback matches.
   dependency** (a real gain over Path B's SONAME deps). No Flatpak (origin [ADR 0001]
   applies — sandbox fights a host-shell terminal).
 
-**Exit:** a clean-VM `.deb` install launches, registers as a terminal alternative,
-runs the host shell; AppImage runs with no install; WM_CLASS verified via `xprop`.
+**Exit:** ✅ verified in a clean `ubuntu:26.04` container — `apt install ./sampa2.deb`
+resolves deps, `sampa2 --version`/`--smoke` run with no build toolchain, the
+`x-terminal-emulator` alternative registers, `man sampa2` installs, purge deregisters
+cleanly; the AppImage runs standalone (`--appimage-extract-and-run`); WM_CLASS verified via
+`xprop`. The test also caught + fixed a real bug: the `.deb` `Depends: libc6` had no version
+floor, so it "installed" on 24.04 then died with `GLIBC_2.43 not found` — now pinned
+`libc6 (>= <detected>)`, so apt refuses too-old systems gracefully (see packaging/README).
 
 ### N4 — Signature features, natively drawn (§10) ✅  *(palette · man · preview all shipped)*
 Services already exist; only the UI is new. Draw panels/overlays in the wgpu scene.

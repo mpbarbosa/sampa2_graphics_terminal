@@ -44,7 +44,15 @@ chmod 644 "$STAGE/usr/share/man/man1/sampa2.1.gz"
 echo "==> control + maintainer scripts"
 mkdir -p "$STAGE/DEBIAN"
 INSTALLED_KB=$(du -sk "$STAGE/usr" | cut -f1)
-# libc6/libgcc-s1 are hard-linked; the display + Vulkan stack is dlopened at runtime, so
+# Pin libc6 to the glibc the binary was built against (the max GLIBC_* symbol version it
+# references) so apt refuses to install on too-old systems instead of installing a binary
+# that fails at runtime with "GLIBC_x.y not found". (Build on an older base for a lower
+# floor / wider reach.) The strip above leaves the dynamic version table intact.
+GLIBC_MAX=$(objdump -T "$STAGE/usr/bin/sampa2" 2>/dev/null \
+    | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1 | sed 's/GLIBC_//')
+LIBC_DEP="libc6"
+[ -n "$GLIBC_MAX" ] && LIBC_DEP="libc6 (>= $GLIBC_MAX)"
+# libgcc-s1 is hard-linked too; the display + Vulkan stack is dlopened at runtime, so
 # libvulkan1 is required to init wgpu, and the window-system client libs + GPU driver are
 # Recommends (present on any desktop; the exact one depends on the session).
 cat > "$STAGE/DEBIAN/control" <<EOF
@@ -53,7 +61,7 @@ Version: $VERSION
 Architecture: $ARCH
 Maintainer: Marcelo Pereira Barbosa <mpbarbosa@gmail.com>
 Installed-Size: $INSTALLED_KB
-Depends: libc6, libgcc-s1, libvulkan1
+Depends: $LIBC_DEP, libgcc-s1, libvulkan1
 Recommends: mesa-vulkan-drivers, libwayland-client0, libxkbcommon0, libx11-6, libxcb1, fonts-hack
 Section: x11
 Priority: optional
