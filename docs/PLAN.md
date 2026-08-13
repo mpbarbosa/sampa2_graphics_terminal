@@ -202,15 +202,16 @@ interactive pass + wider program coverage outstanding.)*
 **Exit:** a config edit hot-reloads theme/font/cursor; a Powerline + truecolor prompt
 renders; tabs run independent shells; search highlights scrollback matches.
 
-### N3 — Linux citizen (§12, §16) ⬜
-- Wire `sampa-cli`: `-e`/`--`, `--working-directory`, `--title`, `--hold`, `--login`,
-  `--config`, and **`--class`/WM_CLASS set at runtime** (native win, unlike the origin's
-  `tao` limitation).
-- `.desktop` (`TerminalEmulator` category), `update-alternatives` for
-  `x-terminal-emulator`, `xdg-terminal-exec`.
-- Packaging: AppImage + `.deb` + `.rpm` — now a **single self-contained ~5 MB binary**
-  with **no webkit runtime dependency** (a real gain over Path B's SONAME deps). No
-  Flatpak (origin [ADR 0001] applies — sandbox fights a host-shell terminal).
+### N3 — Linux citizen (§12, §16) 🔨
+- ✅ Wire `sampa-cli`: `-e`/`--`, `--working-directory`, `--title`, `--hold`, `--login`,
+  `--config`, `-h`/`-V`, and **`--class`/WM_CLASS set at runtime** (native win, unlike the
+  origin's `tao` limitation) — verified via `xprop`.
+- ✅ `.desktop` (`TerminalEmulator` category) + `update-alternatives` for
+  `x-terminal-emulator` in the `.deb` `postinst`. `xdg-terminal-exec` ⬜.
+- ✅ Packaging: **`.deb`** — a **single self-contained ~6 MB binary** with **no webkit
+  runtime dependency** (a real gain over Path B's SONAME deps), `lintian`-clean
+  (`packaging/build-deb.sh`). AppImage + `.rpm` ⬜. No Flatpak (origin [ADR 0001] applies —
+  sandbox fights a host-shell terminal).
 
 **Exit:** a clean-VM `.deb` install launches, registers as a terminal alternative,
 runs the host shell; AppImage runs with no install; WM_CLASS verified via `xprop`.

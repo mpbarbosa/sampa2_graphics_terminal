@@ -41,9 +41,23 @@ The `postinst` registers `sampa2` as an `x-terminal-emulator` alternative (prior
 - `deb/sampa2.1` — the man page source.
 - `deb/copyright` — Debian machine-readable MIT copyright.
 
+## CLI
+
+The launcher flags are wired (via the shared `sampa-cli` parser), so the `.desktop`'s
+*edit-config* action and `x-terminal-emulator` `-e` usage work:
+
+```
+sampa2 -e CMD [ARGS…]      # or `-- CMD …` — run CMD instead of $SHELL
+       -w, --working-directory DIR
+       -T, --title STR
+           --class STR      # WM_CLASS (X11 + Wayland app id)
+           --config FILE
+           --hold           # keep the window open after the command exits
+       -l, --login          # start $SHELL as a login shell
+       -h/--help, -V/--version
+```
+
 ## Not yet (rest of N3)
 
-- `--class`/`--title`/`-e`/`--hold`/`--login` CLI (via `sampa-cli`) — the `.desktop`'s
-  *edit-config* action already assumes `-e`; it lights up once the CLI lands.
 - AppImage and `.rpm` targets.
 - `xdg-terminal-exec` integration.

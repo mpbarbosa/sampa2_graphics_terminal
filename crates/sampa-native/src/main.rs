@@ -228,10 +228,18 @@ fn family_of(name: &str) -> Family<'_> {
     }
 }
 
-/// The native build's config file: `$XDG_CONFIG_HOME/sampa2/config.toml` (falling back
-/// to `$HOME/.config/sampa2/config.toml`). Deliberately separate from the shared
-/// `sampa-config` path (`…/sampa/…`) so this build's config is independent of the origin.
+/// `--config FILE` override, set once at startup. When present it wins over the XDG path
+/// for every reader (initial load, live-reload watcher, new tabs).
+static CONFIG_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The native build's config file: the `--config` override if given, else
+/// `$XDG_CONFIG_HOME/sampa2/config.toml` (falling back to `$HOME/.config/sampa2/config.toml`).
+/// Deliberately separate from the shared `sampa-config` path (`…/sampa/…`) so this build's
+/// config is independent of the origin.
 fn config_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = CONFIG_OVERRIDE.get() {
+        return Some(p.clone());
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
@@ -269,17 +277,18 @@ fn load_opacity() -> f32 {
     config_text().and_then(|t| parse_opacity(&t)).unwrap_or(1.0).clamp(0.0, 1.0)
 }
 
-/// Set the window's app id / `WM_CLASS` to `sampa2` (X11 and Wayland) so the desktop
-/// entry and its icon bind to the window in launchers/taskbars.
+/// Set the window's app id / `WM_CLASS` (X11 and Wayland) so the desktop entry and its
+/// icon bind to the window in launchers/taskbars. `class` is `sampa2` by default, or the
+/// `--class` argument.
 #[cfg(target_os = "linux")]
-fn with_app_id(attrs: WindowAttributes) -> WindowAttributes {
+fn with_app_id(attrs: WindowAttributes, class: &str) -> WindowAttributes {
     use winit::platform::wayland::WindowAttributesExtWayland;
     use winit::platform::x11::WindowAttributesExtX11;
-    let attrs = WindowAttributesExtX11::with_name(attrs, "sampa2", "sampa2");
-    WindowAttributesExtWayland::with_name(attrs, "sampa2", "sampa2")
+    let attrs = WindowAttributesExtX11::with_name(attrs, class, class);
+    WindowAttributesExtWayland::with_name(attrs, class, class)
 }
 #[cfg(not(target_os = "linux"))]
-fn with_app_id(attrs: WindowAttributes) -> WindowAttributes {
+fn with_app_id(attrs: WindowAttributes, _class: &str) -> WindowAttributes {
     attrs
 }
 
@@ -1556,37 +1565,34 @@ fn main() -> Result<()> {
         return capture(path);
     }
 
-    // CLI subset (§12.2), enough for launchers and the esctest runner:
-    //   -e/-- CMD…   run CMD instead of $SHELL
-    //   --working-directory DIR / -w DIR
-    //   --title STR / -T STR
-    let mut run_cmd: Option<Vec<String>> = None;
-    let mut cwd: Option<String> = None;
-    let mut win_title = "Sampa (native)".to_string();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-e" | "--" => {
-                run_cmd = Some(args[i + 1..].to_vec());
-                break;
-            }
-            "--working-directory" | "-w" => {
-                cwd = args.get(i + 1).cloned();
-                i += 1;
-            }
-            "--title" | "-T" => {
-                if let Some(t) = args.get(i + 1) {
-                    win_title = t.clone();
-                }
-                i += 1;
-            }
-            _ => {}
-        }
-        i += 1;
+    // Full CLI (§12.2) via the shared, tested `sampa-cli` parser: -e/-- CMD…,
+    // --working-directory/-w, --title/-T, --class, --config, --hold, --login/-l.
+    let cli = sampa_cli::parse(&args[1..]);
+    if cli.help {
+        print!("{}", sampa_cli::HELP);
+        return Ok(());
     }
-    let (shell, shell_args) = match run_cmd {
+    if cli.version {
+        println!("sampa2 {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    for w in &cli.warnings {
+        eprintln!("sampa2: {w}");
+    }
+    if let Some(path) = &cli.config {
+        let _ = CONFIG_OVERRIDE.set(std::path::PathBuf::from(path));
+    }
+    let win_title = cli.title.clone().unwrap_or_else(|| "Sampa (native)".to_string());
+    let wm_class = cli.class.clone().unwrap_or_else(|| "sampa2".to_string());
+    let cwd = cli.working_directory.clone();
+    let hold = cli.hold;
+    // Run the given command instead of the shell; else $SHELL, with `-l` for --login.
+    let (shell, shell_args) = match cli.exec.clone() {
         Some(mut c) if !c.is_empty() => (c.remove(0), c),
-        _ => (std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()), vec![]),
+        _ => {
+            let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            (sh, if cli.login { vec!["-l".to_string()] } else { vec![] })
+        }
     };
 
     // Load config (default path if present, else built-in defaults) — drives fonts,
@@ -1664,6 +1670,9 @@ fn main() -> Result<()> {
         clipboard: arboard::Clipboard::new().ok(),
         osc52_allow: std::env::var("SAMPA_OSC52").map(|v| v == "allow").unwrap_or(false),
         title: win_title,
+        class: wm_class,
+        hold,
+        held: false,
         images,
         theme,
         font_size,
@@ -1960,6 +1969,12 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     osc52_allow: bool,
     title: String,
+    /// WM_CLASS / app id (`--class`, default `sampa2`).
+    class: String,
+    /// `--hold`: keep the window open after the (last) session's process exits.
+    hold: bool,
+    /// Runtime flag set once a held session has exited — the next keypress closes.
+    held: bool,
     images: Arc<Mutex<ImageStore>>,
     theme: Theme,
     font_size: f32,
@@ -2026,6 +2041,7 @@ impl ApplicationHandler<UserEvent> for App {
                 .with_title(&self.title)
                 .with_transparent(self.opacity < 1.0)
                 .with_visible(false),
+            &self.class,
         );
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let a11y = accesskit_winit::Adapter::with_event_loop_proxy(&window, self.proxy.clone());
@@ -2060,9 +2076,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             UserEvent::SessionExit { id, detail } => {
-                let _ = detail; // (v1: close the tab; --hold could keep it open)
+                let _ = detail;
                 if let Some(idx) = self.sessions.iter().position(|s| s.id == id) {
-                    if self.close_session(idx) {
+                    if self.hold && self.sessions.len() == 1 {
+                        // --hold: freeze the final output on screen; a keypress closes.
+                        self.held = true;
+                        self.request_redraw();
+                    } else if self.close_session(idx) {
                         event_loop.exit(); // last tab closed
                     }
                 }
@@ -2133,6 +2153,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             },
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                // --hold: the process has exited and the window is frozen; any key closes.
+                if self.held {
+                    event_loop.exit();
+                    return;
+                }
                 let m = self.modifiers;
                 let action = self.keys.action_for(&event.logical_key, m);
                 let is_esc = matches!(&event.logical_key, Key::Named(NamedKey::Escape));
