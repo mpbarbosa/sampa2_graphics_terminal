@@ -35,8 +35,15 @@ menu, registered as an `x-terminal-emulator` alternative):
 sudo apt install ./target/sampa2_*.deb
 ```
 
-See [packaging/README.md](packaging/README.md) for details (icons, man page, deps). AppImage
-and `.rpm` are pending (rest of N3).
+Or grab a single-file, no-install **AppImage**:
+
+```bash
+./packaging/build-appimage.sh
+./target/sampa2-*-x86_64.AppImage
+```
+
+See [packaging/README.md](packaging/README.md) for details (icons, man page, deps). `.rpm`
+is pending (rest of N3).
 
 ## Docs
 

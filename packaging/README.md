@@ -32,6 +32,18 @@ This places:
 
 The `postinst` registers `sampa2` as an `x-terminal-emulator` alternative (priority 40).
 
+## AppImage (single file, no install)
+
+```bash
+./packaging/build-appimage.sh          # → target/sampa2-<version>-x86_64.AppImage
+./target/sampa2-*-x86_64.AppImage      # runs anywhere; --version / --help / any flag
+```
+
+Auto-fetches `appimagetool` (cached in `target/`) if it isn't on `$PATH`. The binary
+hard-links only `libc6`/`libgcc-s1`; the Wayland/X11 + Vulkan stack is dlopened from the
+host, so libs are **deliberately not bundled** — the image stays ~8 MB and uses the host's
+display/GPU drivers (same expectation as the `.deb`).
+
 ## What's in the box
 
 - `deb/control` fields (Depends/Recommends) live in [`build-deb.sh`](build-deb.sh). Only
@@ -59,5 +71,5 @@ sampa2 -e CMD [ARGS…]      # or `-- CMD …` — run CMD instead of $SHELL
 
 ## Not yet (rest of N3)
 
-- AppImage and `.rpm` targets.
+- `.rpm` target.
 - `xdg-terminal-exec` integration.
