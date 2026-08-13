@@ -1,0 +1,15 @@
+#!/bin/sh
+# Register sampa2 as an x-terminal-emulator alternative so it shows up as a system
+# terminal choice (N3 — Linux citizen). Priority 40: available, not forced default.
+set -e
+if [ "$1" = "configure" ]; then
+    update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator \
+        /usr/bin/sampa2 40
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q /usr/share/applications || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+    fi
+fi
+exit 0

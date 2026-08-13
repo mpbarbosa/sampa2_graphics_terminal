@@ -1,0 +1,7 @@
+#!/bin/sh
+# Deregister the x-terminal-emulator alternative on removal.
+set -e
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+    update-alternatives --remove x-terminal-emulator /usr/bin/sampa2 || true
+fi
+exit 0

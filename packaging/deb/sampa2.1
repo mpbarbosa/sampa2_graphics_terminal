@@ -1,0 +1,47 @@
+.TH SAMPA2 1 "2026" "sampa2" "User Commands"
+.SH NAME
+sampa2 \- native GPU terminal emulator
+.SH SYNOPSIS
+.B sampa2
+.SH DESCRIPTION
+.B sampa2
+is a Rust\-only graphical terminal for Linux, rendered with winit + wgpu +
+cosmic\-text over an alacritty_terminal VT engine \(em a single self\-contained
+binary with no webview runtime.
+.PP
+It adds an in\-app command palette, a live man\-page panel, a safe
+preview\-as\-you\-type pane, and an opt\-in Claude command suggester.
+.SH KEY BINDINGS
+Defaults (all overridable in the config's \fB[keybindings]\fR table):
+.TP
+.B Ctrl+Shift+T / W
+New tab / close tab
+.TP
+.B Ctrl+Shift+P
+Command palette
+.TP
+.B Ctrl+Shift+M
+Man\-page panel for the current command
+.TP
+.B Ctrl+Shift+E
+Toggle the command preview
+.TP
+.B Ctrl+Shift+A
+Ask AI (opt\-in Claude command suggester; requires \fB[ai] enabled = true\fR and
+\fB$ANTHROPIC_API_KEY\fR)
+.TP
+.B Ctrl+Shift+F
+Find in the terminal
+.TP
+.B Ctrl+Shift+?
+This shortcut list
+.SH FILES
+.TP
+.I ~/.config/sampa2/config.toml
+Per\-user configuration (font, colors, keybindings, features, \fB[ai]\fR).
+.SH ENVIRONMENT
+.TP
+.B ANTHROPIC_API_KEY
+Read at launch for the opt\-in command suggester; never stored by the app.
+.SH SEE ALSO
+Project: https://github.com/mpbarbosa/sampa2_graphics_terminal
