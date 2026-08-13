@@ -81,6 +81,17 @@ sampa2 -e CMD [ARGS…]      # or `-- CMD …` — run CMD instead of $SHELL
        -h/--help, -V/--version
 ```
 
-## Not yet (rest of N3)
+## Default-terminal integration
 
-- `xdg-terminal-exec` integration.
+- **Debian/Ubuntu:** the `.deb` `postinst` registers an `x-terminal-emulator` alternative.
+- **freedesktop `xdg-terminal-exec`:** the `.desktop` carries `X-TerminalArg{Exec,Title,
+  AppId,Dir,Hold}` keys mapping each capability to the matching sampa-cli flag, so
+  `xdg-terminal-exec` drives sampa2 correctly (e.g. `--title=X -- htop` →
+  `sampa2 --title X -e htop`). Make it your preferred terminal with:
+
+  ```bash
+  echo sampa2.desktop > ~/.config/xdg-terminals.list
+  ```
+
+That's the full N3 packaging + terminal-integration set (`.deb` · AppImage · `.rpm` · CLI ·
+`x-terminal-emulator` · `xdg-terminal-exec`).
