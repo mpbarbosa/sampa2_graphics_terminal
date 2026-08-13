@@ -27,6 +27,11 @@ sampa-preview  = { path = "../../../sampa_graphics_terminal/crates/preview" }
 # Pinned to a git rev (ADR 0002): this feature's dep is CI-reproducible rather than
 # resolved from a sibling checkout. The other seven remain local path deps for N0.
 sampa-ai       = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "38f35ae78fdcccac5a7e50edb65d9b62cb39ea8e" }
+# ps(1) output-enhancement core (docs/spec-ps-output-enhancement.md). Headless
+# parse-and-decorate; fails safe to raw so a non-`ps` stream is never mangled. Git-pinned
+# per ADR 0002 (CI-reproducible), same as sampa-ai. The native renderer consumes the
+# decorated model to draw the level-1a panel (that UI is Path C's own follow-up).
+sampa-ps-decorate = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "4d94ea7c1a4a856b0c200d49730ec367be7e9a55" }
 
 anyhow = "1"
 winit = "0.30.13"

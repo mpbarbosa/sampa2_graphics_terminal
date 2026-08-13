@@ -2782,6 +2782,7 @@ dependencies = [
  "sampa-man",
  "sampa-palette",
  "sampa-preview",
+ "sampa-ps-decorate",
  "sampa-shellint",
  "wgpu",
  "winit",
@@ -2796,6 +2797,14 @@ name = "sampa-preview"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "sampa-ps-decorate"
+version = "0.1.0"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=4d94ea7c1a4a856b0c200d49730ec367be7e9a55#4d94ea7c1a4a856b0c200d49730ec367be7e9a55"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
