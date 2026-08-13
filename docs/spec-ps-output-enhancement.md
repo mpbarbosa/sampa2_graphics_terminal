@@ -3,9 +3,11 @@
 - **Status (this native/Path C build):** the headless **core is available** — the origin
   repo's `sampa-ps-decorate` crate is wired in as a git-pinned dependency of
   `sampa-native` (per ADR 0002), and the `[enhance]` config flows through the shared
-  `sampa-config`. Level 1a ships end-to-end in the origin (Tauri) build. The **native
-  panel that renders the decorated model in the wgpu/glyphon UI is Path C's follow-up** —
-  not built yet. This doc is mirrored from the origin repo as the behavioral contract; the
+  `sampa-config`. **All three levels (1a quiet columns, 1b signal bars + live sort, 1c
+  the two-pane inspector) ship end-to-end in the origin (Tauri) build**, and their headless
+  logic — the parser, `bar`/`bars_for`, `classify`/`group_rows`, `parse_enrich` — is
+  available here through the pinned dependency. The **native panel that renders the
+  decorated model in the wgpu/glyphon UI is Path C's follow-up** — not built yet. This doc is mirrored from the origin repo as the behavioral contract; the
   §9 "App shell" / frontend references describe that build.
 - **Applies to:** a TTY-only presentation layer that decorates unmodified `ps` output in
   place. Language-agnostic behavioral contract, so any frontend (webview or native Rust)
