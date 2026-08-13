@@ -11,6 +11,14 @@ Categories=System;TerminalEmulator;
 Keywords=terminal;shell;prompt;console;command;
 StartupNotify=true
 StartupWMClass=sampa2
+# xdg-terminal-exec (freedesktop default-terminal spec): how to drive sampa2 as the
+# user's terminal — each key names the flag for a capability. These match the sampa-cli
+# flags the native build wires up.
+X-TerminalArgExec=-e
+X-TerminalArgTitle=--title
+X-TerminalArgAppId=--class
+X-TerminalArgDir=--working-directory
+X-TerminalArgHold=--hold
 Actions=new-window;edit-config;
 
 [Desktop Action new-window]
