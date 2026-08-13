@@ -31,7 +31,7 @@ sampa-ai       = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal",
 # parse-and-decorate; fails safe to raw so a non-`ps` stream is never mangled. Git-pinned
 # per ADR 0002 (CI-reproducible), same as sampa-ai. The native renderer consumes the
 # decorated model to draw the level-1a panel (that UI is Path C's own follow-up).
-sampa-ps-decorate = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "4d94ea7c1a4a856b0c200d49730ec367be7e9a55" }
+sampa-ps-decorate = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "a126b9f739e00ff19f882960d90e4fbb89da9133" }
 
 anyhow = "1"
 winit = "0.30.13"
