@@ -1832,6 +1832,8 @@ fn main() -> Result<()> {
         ps_collapsed: Vec::new(),
         ps_sel: 0,
         ps_detail: None,
+        ps_filter: String::new(),
+        ps_filter_editing: false,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2169,6 +2171,8 @@ struct App {
     ps_collapsed: Vec<bool>, // parallel to ps_groups
     ps_sel: usize,           // index into the current visual-line list
     ps_detail: Option<(u32, PsDetail)>, // enrich for the selected row's pid (cached)
+    ps_filter: String,       // incremental filter on command/user (spec §6); empty = off
+    ps_filter_editing: bool, // true while `/` is capturing keystrokes into ps_filter
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -3834,6 +3838,8 @@ impl App {
         self.ps_collapsed = Vec::new();
         self.ps_sel = 0;
         self.ps_detail = None;
+        self.ps_filter.clear();
+        self.ps_filter_editing = false;
         self.ps_view = Some(match block.as_deref().and_then(decorate_scrollback) {
             Some(quiet) => {
                 // 1c inspector: bucket into provenance groups (spec §6) and seed selection.
@@ -3857,6 +3863,8 @@ impl App {
         self.ps_groups = Vec::new();
         self.ps_collapsed = Vec::new();
         self.ps_detail = None;
+        self.ps_filter.clear();
+        self.ps_filter_editing = false;
         self.request_redraw();
     }
 
@@ -3872,13 +3880,37 @@ impl App {
         self.ps_level == Level::Inspector && !self.ps_groups.is_empty()
     }
 
-    /// The rendered line list: each group's header, then its rows unless it's collapsed.
-    fn ps_vlines(&self) -> Vec<PsVLine> {
+    /// The rendered line list for the current view — fetches the `Quiet` from `ps_view`.
+    fn ps_current_vlines(&self) -> Vec<PsVLine> {
+        match self.ps_view.as_ref() {
+            Some(PsView::Table(q)) => self.ps_vlines_for(q),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The rendered line list: each group's header, then its rows unless collapsed. When a
+    /// `/` filter is active (spec §6) only rows matching command/user are kept, empty groups
+    /// are dropped, and collapse is ignored so matches are always visible.
+    fn ps_vlines_for(&self, q: &Quiet) -> Vec<PsVLine> {
+        let filter = (!self.ps_filter.is_empty()).then(|| self.ps_filter.to_lowercase());
+        let keep = |ri: usize| -> bool {
+            match &filter {
+                None => true,
+                Some(f) => q.rows.get(ri).is_some_and(|r| {
+                    r.command.to_lowercase().contains(f) || r.user.to_lowercase().contains(f)
+                }),
+            }
+        };
         let mut v = Vec::new();
         for (gi, g) in self.ps_groups.iter().enumerate() {
+            let rows: Vec<usize> = g.rows.iter().copied().filter(|&ri| keep(ri)).collect();
+            if filter.is_some() && rows.is_empty() {
+                continue; // hide groups with no match
+            }
             v.push(PsVLine::Header(gi));
-            if !self.ps_collapsed.get(gi).copied().unwrap_or(false) {
-                v.extend(g.rows.iter().map(|&ri| PsVLine::Row(gi, ri)));
+            let collapsed = filter.is_none() && self.ps_collapsed.get(gi).copied().unwrap_or(false);
+            if !collapsed {
+                v.extend(rows.into_iter().map(|ri| PsVLine::Row(gi, ri)));
             }
         }
         v
@@ -3889,7 +3921,7 @@ impl App {
     /// header, and cached while the selected pid is unchanged.
     fn ps_refresh_detail(&mut self) {
         let pid = if let Some(PsView::Table(q)) = self.ps_view.as_ref() {
-            match self.ps_vlines().get(self.ps_sel).copied() {
+            match self.ps_vlines_for(q).get(self.ps_sel).copied() {
                 Some(PsVLine::Row(_, ri)) => q.rows.get(ri).and_then(|r| r.pid.parse::<u32>().ok()),
                 _ => None,
             }
@@ -3914,7 +3946,12 @@ impl App {
     /// Keys for the 1c grouped inspector (spec §6): move/collapse selection, the detail
     /// pane follows, and `k`/`y`/`Y` compose an insert-never-run signal or copy.
     fn ps_inspector_key(&mut self, key: &Key) {
-        let vlines = self.ps_vlines();
+        // Filter-editing mode captures keystrokes into the `/` query (spec §6).
+        if self.ps_filter_editing {
+            self.ps_filter_key(key);
+            return;
+        }
+        let vlines = self.ps_current_vlines();
         let n = vlines.len();
         // Group index of the current line, for collapse/expand on either a header or a row.
         let cur_group = vlines.get(self.ps_sel).map(|v| match v {
@@ -3924,7 +3961,15 @@ impl App {
         let mut moved = false;
         match key {
             Key::Named(NamedKey::Escape) => {
-                self.ps_close();
+                // Esc clears an applied filter first, then closes the panel.
+                if self.ps_filter.is_empty() {
+                    self.ps_close();
+                } else {
+                    self.ps_filter.clear();
+                    self.ps_sel = 0;
+                    self.ps_refresh_detail();
+                    self.request_redraw();
+                }
                 return;
             }
             Key::Named(NamedKey::ArrowDown) => {
@@ -3962,6 +4007,12 @@ impl App {
                 "l" => self.ps_set_collapsed(cur_group, false),
                 "y" => self.ps_copy_selected(false),
                 "Y" => self.ps_copy_selected(true),
+                "/" => {
+                    // Enter filter-editing mode; keep any existing query to refine it.
+                    self.ps_filter_editing = true;
+                    self.request_redraw();
+                    return;
+                }
                 "q" => {
                     self.ps_close();
                     return;
@@ -3976,6 +4027,32 @@ impl App {
         self.request_redraw();
     }
 
+    /// Keystrokes while the `/` filter is being typed (spec §6): printable chars extend the
+    /// query, Backspace trims it, Enter applies it (back to navigation), Esc cancels it.
+    fn ps_filter_key(&mut self, key: &Key) {
+        match key {
+            Key::Named(NamedKey::Enter) => self.ps_filter_editing = false,
+            Key::Named(NamedKey::Escape) => {
+                self.ps_filter.clear();
+                self.ps_filter_editing = false;
+                self.ps_sel = 0;
+                self.ps_refresh_detail();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.ps_filter.pop();
+                self.ps_sel = 0;
+                self.ps_refresh_detail();
+            }
+            Key::Character(s) if !s.is_empty() && !s.chars().any(char::is_control) => {
+                self.ps_filter.push_str(s);
+                self.ps_sel = 0;
+                self.ps_refresh_detail();
+            }
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
     /// Collapse/expand a group and re-anchor the selection on its header line.
     fn ps_set_collapsed(&mut self, group: Option<usize>, collapsed: bool) {
         let Some(gi) = group else { return };
@@ -3984,7 +4061,7 @@ impl App {
         }
         // Land the selection on the group's header (its row window just changed).
         if let Some(pos) = self
-            .ps_vlines()
+            .ps_current_vlines()
             .iter()
             .position(|v| matches!(v, PsVLine::Header(g) if *g == gi))
         {
@@ -4007,7 +4084,7 @@ impl App {
     /// `y`/`Y` — copy the selected row's PID, or its full (untruncated) command line.
     fn ps_copy_selected(&mut self, full_command: bool) {
         let text = if let Some(PsView::Table(q)) = self.ps_view.as_ref() {
-            match self.ps_vlines().get(self.ps_sel).copied() {
+            match self.ps_vlines_for(q).get(self.ps_sel).copied() {
                 Some(PsVLine::Row(_, ri)) => q.rows.get(ri).map(|r| {
                     if full_command { r.command.clone() } else { r.pid.clone() }
                 }),
@@ -4024,7 +4101,7 @@ impl App {
     /// The selected row's pid, if the selection is a row (not a group header).
     fn ps_selected_pid(&self) -> Option<u32> {
         if let Some(PsView::Table(q)) = self.ps_view.as_ref() {
-            if let Some(PsVLine::Row(_, ri)) = self.ps_vlines().get(self.ps_sel).copied() {
+            if let Some(PsVLine::Row(_, ri)) = self.ps_vlines_for(q).get(self.ps_sel).copied() {
                 return q.rows.get(ri).and_then(|r| r.pid.parse::<u32>().ok());
             }
         }
@@ -4216,7 +4293,7 @@ impl App {
         let cmd_budget = (self.cols as usize).saturating_sub(fixed).max(8);
 
         // Window over the visual lines, keeping the selection in view (detail pane reserved).
-        let vlines = self.ps_vlines();
+        let vlines = self.ps_vlines_for(q);
         let len = vlines.len();
         let list_rows = visible.saturating_sub(3).max(1);
         let start = if len <= list_rows {
@@ -4283,22 +4360,34 @@ impl App {
         spans.push((self.ps_detail_line(q), muted, false, true));
 
         let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
-        let procs = q.rows.len();
-        let title = format!(
-            "ps · inspector — {} groups · {} proc{}{}   {}–{}/{}   ·  ↑↓ move · ←→ fold · k kill · y/Y copy · Esc",
-            self.ps_groups.len(),
-            procs,
-            if procs == 1 { "" } else { "s" },
-            if q.kernel_count > 0 { format!(" · {} kernel", q.kernel_count) } else { String::new() },
-            start + 1, end, len,
-        );
+        let matched = vlines.iter().filter(|v| matches!(v, PsVLine::Row(..))).count();
+        let title = if self.ps_filter_editing {
+            format!(
+                "ps · inspector — filter: /{}\u{2588}   {} match{}   ·  Enter applies · Esc cancels",
+                self.ps_filter, matched, if matched == 1 { "" } else { "es" },
+            )
+        } else {
+            let procs = q.rows.len();
+            format!(
+                "ps · inspector — {} proc{}{}{}   {}–{}/{}   ·  ↑↓ ←→ move/fold · / filter · k kill · y/Y copy · Esc",
+                procs,
+                if procs == 1 { "" } else { "s" },
+                if q.kernel_count > 0 { format!(" · {} kernel", q.kernel_count) } else { String::new() },
+                if self.ps_filter.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · filter “{}” ({} match)", self.ps_filter, matched)
+                },
+                start + 1, end, len,
+            )
+        };
         (title, body, spans)
     }
 
     /// The detail line for the current selection: enrich fields for a row (spec §6 detail
     /// pane), or the CPU/RSS subtotal for a group header.
     fn ps_detail_line(&self, q: &Quiet) -> String {
-        match self.ps_vlines().get(self.ps_sel).copied() {
+        match self.ps_vlines_for(q).get(self.ps_sel).copied() {
             Some(PsVLine::Row(_, ri)) => {
                 let Some(r) = q.rows.get(ri) else { return String::new() };
                 match &self.ps_detail {

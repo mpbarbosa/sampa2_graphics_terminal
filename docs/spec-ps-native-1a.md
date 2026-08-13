@@ -137,7 +137,7 @@ and fast (string parsing of a few hundred lines).
   the actual `ps` output cells and freezing back is §9 follow-up work.
 (1b and 1c were originally out of scope here but have since been implemented in the same
 panel — 1b signal bars + `c`/`m`/`p` sort (§9.2), 1c grouped inspector + detail pane +
-`k`→`kill` (§9.3). Still open: the true in-place render (§9.1), and 1c's `/` filter.)
+`k`→`kill` + `/` filter (§9.3). Still open: the true in-place render (§9.1).)
 - `ps -ef` decoration (core recognises `HeaderKind::Ef` but 1a only decorates `Aux`).
 
 ## 9. Follow-ups
@@ -155,11 +155,13 @@ panel — 1b signal bars + `c`/`m`/`p` sort (§9.2), 1c grouped inspector + deta
    `←`/`→`/Enter; a moving selection (`↑`/`↓`/`j`, PgUp/PgDn) drives a detail pane fed by a
    read-only `ps -o … -p <pid>` enrich query (`parse_enrich`: ppid, threads, full state,
    elapsed); `k` composes `kill <pid>` at the prompt (insert-never-run), `y`/`Y` copy the
-   pid / full command. (The spec's key table lists `k` for both move and kill — resolved
-   toward the kill signal: `↑`/`↓`/`j` move, `k` kills.) Fixing this surfaced a core
-   `classify` bug — keyword tables matched as unanchored substrings, so `ubuntu`→`bun` and
-   `nodev`→`node` misfiled desktop/system processes into Dev; fixed upstream with
-   word-boundary matching and re-pinned. Not yet: `/` incremental filter, within-group sort.
+   pid / full command, and `/` incrementally filters on command/user (hides non-matching
+   groups, ignores collapse so matches always show; Enter applies, Esc clears then closes).
+   (The spec's key table lists `k` for both move and kill — resolved toward the kill signal:
+   `↑`/`↓`/`j` move, `k` kills.) Fixing this surfaced a core `classify` bug — keyword tables
+   matched as unanchored substrings, so `ubuntu`→`bun` and `nodev`→`node` misfiled desktop/
+   system processes into Dev; fixed upstream with word-boundary matching and re-pinned. Not
+   yet: within-group sort.
 
 ## 10. Verification
 
