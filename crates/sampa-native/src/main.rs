@@ -480,6 +480,10 @@ enum DecrqcraState {
     Ground,
     Esc,
     Csi,
+    /// Inside an `OSC … (ST|BEL)` string — accumulated to detect OSC 133 prompt markers.
+    Osc,
+    /// Saw `ESC` while in an OSC string — a `\` next closes it (ST).
+    OscEsc,
 }
 
 /// Incremental watcher for DECRQCRA requests in the PTY output stream (survives chunk
@@ -496,6 +500,7 @@ struct DecrqcraScanner {
     bang: bool,     // saw '!' intermediate (DECSTR)
     private: bool,  // saw a leading '?' private marker (DEC private modes)
     bad: bool,      // saw a disqualifying intermediate / private marker
+    osc: Vec<u8>,   // OSC string head (capped) — enough to spot an `OSC 133 ; X` marker
 }
 
 /// Something the output-stream scanner extracts that alacritty leaves unhandled and
@@ -527,6 +532,10 @@ enum ScanEvent {
     /// A set/reset of a shadowed modifiable mode (SM/RM `CSI Ps h/l`, DECSET/DECRESET
     /// `CSI ? Ps h/l`) whose DECRQM state the engine can't report — recorded so we can.
     SetMode { dec: bool, mode: u16, set: bool },
+    /// An OSC 133 shell-integration (FinalTerm/FTCS) marker, `kind` = the sub-command
+    /// letter: `A` prompt-start, `B` command-start, `C` command-executed, `D` finished.
+    /// Used to locate the command on the prompt line exactly (no prompt-glyph guessing).
+    Osc133 { kind: u8 },
 }
 
 impl DecrqcraScanner {
@@ -544,6 +553,21 @@ impl DecrqcraScanner {
         self.bang = false;
         self.private = false;
         self.bad = false;
+    }
+
+    fn enter_osc(&mut self) {
+        self.state = DecrqcraState::Osc;
+        self.osc.clear();
+    }
+
+    /// If the just-closed OSC string was an `OSC 133 ; X` marker, its sub-command letter.
+    fn osc133_kind(&self) -> Option<u8> {
+        // Body looks like `133;B` (optionally `133;B;...`); we only need the letter.
+        let rest = self.osc.strip_prefix(b"133;")?;
+        match rest.first().copied() {
+            Some(k @ (b'A' | b'B' | b'C' | b'D')) => Some(k),
+            _ => None,
+        }
     }
 
     /// Finalize the parameter currently being accumulated into `params`/`seen`.
@@ -609,9 +633,34 @@ impl DecrqcraScanner {
                 }
                 DecrqcraState::Esc => match b {
                     b'[' => self.enter_csi(),
+                    b']' => self.enter_osc(),
                     0x1b => {}
                     _ => self.state = DecrqcraState::Ground,
                 },
+                // Accumulate the OSC head (capped); BEL or ST (ESC \) closes it. On close,
+                // an `OSC 133 ; X` marker is emitted so the pump can locate the command.
+                DecrqcraState::Osc => match b {
+                    0x07 => {
+                        if let Some(kind) = self.osc133_kind() {
+                            out.push((i + 1, ScanEvent::Osc133 { kind }));
+                        }
+                        self.state = DecrqcraState::Ground;
+                    }
+                    0x1b => self.state = DecrqcraState::OscEsc,
+                    _ => {
+                        if self.osc.len() < 8 {
+                            self.osc.push(b);
+                        }
+                    }
+                },
+                DecrqcraState::OscEsc => {
+                    if b == b'\\' {
+                        if let Some(kind) = self.osc133_kind() {
+                            out.push((i + 1, ScanEvent::Osc133 { kind }));
+                        }
+                    }
+                    self.state = DecrqcraState::Ground;
+                }
                 DecrqcraState::Csi => match b {
                     b'0'..=b'9' => {
                         self.cur = self.cur.saturating_mul(10).saturating_add((b - b'0') as u32);
@@ -1506,6 +1555,10 @@ struct TermState {
     dcs: DcsScanner,
     /// Shadow set/reset state for modifiable modes the engine can't report via DECRQM.
     decrqm_shadow: std::collections::HashMap<(bool, u16), bool>,
+    /// Cursor grid position captured at the last `OSC 133;B` (command-start): `(line, col)`
+    /// in alacritty grid coordinates. `None` when not at an integrated prompt. Lets the
+    /// preview/man read the exact command without a prompt-glyph heuristic.
+    cmd_start: Option<(i32, usize)>,
 }
 
 #[derive(Debug)]
@@ -1750,6 +1803,7 @@ fn spawn_session(
         kitty: KittyScanner::new(),
         dcs: DcsScanner::new(),
         decrqm_shadow: std::collections::HashMap::new(),
+        cmd_start: None,
     }));
     let images = Arc::new(Mutex::new(ImageStore::default()));
     let (tx, rx) = channel();
@@ -1809,6 +1863,17 @@ fn pump(
                             // Record a modifiable mode's set/reset for DECRQM reporting.
                             ScanEvent::SetMode { dec, mode, set } => {
                                 g.decrqm_shadow.insert((dec, mode), set);
+                            }
+                            // OSC 133 shell-integration marker. `B` (command-start) records
+                            // the cursor as the command's start; any other marker (prompt
+                            // start / executed / finished) means we're no longer editing a
+                            // command, so clear it. The parser has already consumed up to
+                            // here, so the cursor is exactly at the command's first column.
+                            ScanEvent::Osc133 { kind } => {
+                                g.cmd_start = (kind == b'B').then(|| {
+                                    let p = g.term.renderable_content().cursor.point;
+                                    (p.line.0, p.column.0)
+                                });
                             }
                             // alacritty ignores XTWINOPS resize — resize the grid here,
                             // and remember to resize the PTY once we release the lock.
@@ -2611,10 +2676,44 @@ fn command_from_grid(snap: &Snapshot) -> String {
     strip_prompt(&row)
 }
 
+/// The command at the prompt. Prefers the exact OSC 133 command-start (`cmd_start`, in
+/// grid coordinates) when the shell provides it — reading from there to the cursor across
+/// wrapped rows, no prompt guessing. Falls back to the [`command_from_grid`] heuristic when
+/// there's no shell integration or the marker is stale (e.g. output scrolled it off).
+fn command_at_prompt(snap: &Snapshot, cmd_start: Option<(i32, usize)>) -> String {
+    if let (Some((cr, cc)), Some((l0, c0))) = (snap.cursor_rc, cmd_start) {
+        let sr = l0 + snap.offset; // grid line → display row (see build_snapshot)
+        if sr >= 0 && (sr as usize) <= cr && cr < snap.rows {
+            return grid_text_between(snap, (sr as usize, c0), (cr, cc));
+        }
+    }
+    command_from_grid(snap)
+}
+
+/// Concatenate grid text from `(start_row, start_col)` up to `(end_row, end_col)`,
+/// spanning full-width intermediate rows (a wrapped command). Trailing pad-spaces trimmed.
+fn grid_text_between(snap: &Snapshot, start: (usize, usize), end: (usize, usize)) -> String {
+    let (sr, sc) = start;
+    let (er, ec) = end;
+    if sr > er || sr >= snap.rows {
+        return String::new();
+    }
+    let er = er.min(snap.rows - 1);
+    let mut s = String::new();
+    for r in sr..=er {
+        let c0 = if r == sr { sc } else { 0 };
+        let c1 = if r == er { ec } else { snap.cols };
+        for c in c0.min(snap.cols)..c1.min(snap.cols) {
+            s.push(snap.cell(r, c).c);
+        }
+    }
+    s.trim().to_string()
+}
+
 /// Strip a shell prompt prefix, returning the command that follows it. Tries dedicated
 /// prompt glyphs first (they almost never appear inside a command), then the classic
-/// `$`/`#`/`%` sigils; falls back to the whole (trimmed) row. Heuristic — a proper fix
-/// reads OSC 133 markers.
+/// `$`/`#`/`%` sigils; falls back to the whole (trimmed) row. Heuristic — the exact path
+/// is OSC 133 (see [`command_at_prompt`]).
 fn strip_prompt(row: &str) -> String {
     for m in ["❯ ", "➜ ", "» ", "▶ "] {
         if let Some(i) = row.rfind(m) {
@@ -3501,13 +3600,18 @@ impl App {
             // completion / autosuggestion redraw) has settled — rather than reconstructing
             // it from keystrokes. This is what makes paste, history recall, and accepted
             // autosuggestions preview correctly.
-            let snap = state.lock().ok().and_then(|g| {
-                // cursor_on=true so the snapshot carries the cursor position (cursor_rc),
-                // which command_from_grid needs to find where the command ends.
-                (!g.term.mode().contains(TermMode::ALT_SCREEN))
-                    .then(|| build_snapshot(&g.term, &theme, cstyle, true))
-            });
-            let line = snap.as_ref().map(command_from_grid).unwrap_or_default();
+            // cursor_on=true so the snapshot carries the cursor position (cursor_rc). Read
+            // the command via OSC 133 command-start when available, else the heuristic.
+            let line = state
+                .lock()
+                .ok()
+                .and_then(|g| {
+                    (!g.term.mode().contains(TermMode::ALT_SCREEN)).then(|| {
+                        let snap = build_snapshot(&g.term, &theme, cstyle, true);
+                        command_at_prompt(&snap, g.cmd_start)
+                    })
+                })
+                .unwrap_or_default();
             if line.is_empty() {
                 // Clears the panel back to idle (e.g. an empty prompt after Enter).
                 let _ = proxy.send_event(UserEvent::PreviewReady {
@@ -3533,10 +3637,11 @@ impl App {
         if g.term.mode().contains(TermMode::ALT_SCREEN) {
             return String::new();
         }
-        // cursor_on=true so cursor_rc is populated (command_from_grid needs it).
+        // cursor_on=true so cursor_rc is populated; prefer the OSC 133 command-start.
         let snap = build_snapshot(&g.term, &self.theme, self.cursor_style, true);
+        let cmd_start = g.cmd_start;
         drop(g);
-        command_from_grid(&snap)
+        command_at_prompt(&snap, cmd_start)
     }
 
     /// Accept a completed preview if it's still the newest and the panel is open.
@@ -6832,6 +6937,21 @@ mod tests {
         // The `CSI 14;2 t` (shell-window) variant still reports as op 14.
         let out = DecrqcraScanner::new().feed(b"\x1b[14;2t");
         assert!(matches!(out[0].1, ScanEvent::WinopReport(14)));
+    }
+
+    #[test]
+    fn scanner_detects_osc133_markers() {
+        // Both terminators: BEL and ST (ESC \).
+        let bel = DecrqcraScanner::new().feed(b"\x1b]133;B\x07");
+        assert!(matches!(bel.as_slice(), [(_, ScanEvent::Osc133 { kind: b'B' })]));
+        let st = DecrqcraScanner::new().feed(b"\x1b]133;A\x1b\\");
+        assert!(matches!(st.as_slice(), [(_, ScanEvent::Osc133 { kind: b'A' })]));
+        // `C` with a trailing exit code still reports as C.
+        let c = DecrqcraScanner::new().feed(b"\x1b]133;C;0\x07");
+        assert!(matches!(c.as_slice(), [(_, ScanEvent::Osc133 { kind: b'C' })]));
+        // Ordinary OSCs (title, clipboard) are ignored.
+        assert!(DecrqcraScanner::new().feed(b"\x1b]0;my title\x07").is_empty());
+        assert!(DecrqcraScanner::new().feed(b"\x1b]52;c;Zm9v\x07").is_empty());
     }
 
     #[test]
