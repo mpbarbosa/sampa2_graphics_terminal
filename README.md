@@ -42,8 +42,8 @@ Or grab a single-file, no-install **AppImage**:
 ./target/sampa2-*-x86_64.AppImage
 ```
 
-See [packaging/README.md](packaging/README.md) for details (icons, man page, deps). `.rpm`
-is pending (rest of N3).
+An `.rpm` (`./packaging/build-rpm.sh`) is available too. See
+[packaging/README.md](packaging/README.md) for details (icons, man page, deps).
 
 ## Docs
 

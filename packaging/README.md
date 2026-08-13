@@ -44,6 +44,18 @@ hard-links only `libc6`/`libgcc-s1`; the Wayland/X11 + Vulkan stack is dlopened 
 host, so libs are **deliberately not bundled** — the image stays ~8 MB and uses the host's
 display/GPU drivers (same expectation as the `.deb`).
 
+## RPM (Fedora / RHEL / openSUSE)
+
+```bash
+./packaging/build-rpm.sh               # → target/sampa2-<version>-1.<dist>.x86_64.rpm
+sudo dnf install ./target/sampa2-*.rpm
+```
+
+Packages the prebuilt binary via `rpmbuild` (`packaging/rpm/sampa2.spec`). On an RPM distro
+`rpmbuild` is stock; on Debian/Ubuntu install it with `sudo apt install rpm`. rpm's
+find-requires auto-detects the `libc`/`libgcc` deps; `mesa-vulkan-drivers` is a Recommends
+(the display/Vulkan stack is dlopened, like the other formats).
+
 ## What's in the box
 
 - `deb/control` fields (Depends/Recommends) live in [`build-deb.sh`](build-deb.sh). Only
@@ -71,5 +83,4 @@ sampa2 -e CMD [ARGS…]      # or `-- CMD …` — run CMD instead of $SHELL
 
 ## Not yet (rest of N3)
 
-- `.rpm` target.
 - `xdg-terminal-exec` integration.
