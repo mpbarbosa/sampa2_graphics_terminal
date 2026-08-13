@@ -6,12 +6,13 @@
 > slice** — how the wgpu build triggers, scrapes, decorates, and draws it. Levels **1b**
 > (bars + live sort) and **1c** (inspector) are explicitly out of scope here (§8).
 
-- **Status:** implemented (1a **and** 1b). `Action::EnhancePs` on `Ctrl+Shift+D` scrapes the
-  buffer and renders the decorated `Quiet` model as a bottom overlay panel. The headless
-  core (`sampa-ps-decorate`, pinned in `sampa-native/Cargo.toml` per ADR 0002) provides the
-  parse + decorate + bars; the native side adds the trigger, scrape, render, and live sort.
-  With `[enhance] ps = "bars"` at ≥ 100 cols the panel adds §5 signal bars + `c`/`m`/`p`
-  sort (see §9.2); below that width it falls back to 1a quiet columns.
+- **Status:** implemented (1a, 1b **and** 1c). `Action::EnhancePs` on `Ctrl+Shift+D` scrapes
+  the buffer and renders the decorated model as a bottom overlay panel. The headless core
+  (`sampa-ps-decorate`, pinned in `sampa-native/Cargo.toml` per ADR 0002) provides the parse
+  + decorate + bars + grouping/enrich; the native side adds the trigger, scrape, render,
+  live sort, and the interactive inspector. The resolved level (`resolve_level` on the
+  terminal width) picks the presentation: `quiet` columns (≥ 80), `bars` + `c`/`m`/`p` sort
+  (≥ 100, §9.2), or the grouped `inspector` with a detail pane + `k`→`kill` (≥ 120, §9.3).
 - **Reuses:** the overlay-panel machinery of the man/preview panels (`PanelView` + rich
   body spans), the keybinding `Action`/`ACTIONS` table, and — for precise block bounds —
   the OSC 133 scanner recovered in the preview work.
@@ -134,10 +135,9 @@ and fast (string parsing of a few hundred lines).
 
 - **In-place** decoration of the scrollback region — this slice renders a panel; replacing
   the actual `ps` output cells and freezing back is §9 follow-up work.
-- **1c** grouping, two-pane inspector, `/` filter, `k` → `kill` insert-never-run.
-
-(1b — signal bars, denominators, live `c`/`m`/`p` sort — was originally out of scope here but
-has since been implemented in the same panel; see §9.2.)
+(1b and 1c were originally out of scope here but have since been implemented in the same
+panel — 1b signal bars + `c`/`m`/`p` sort (§9.2), 1c grouped inspector + detail pane +
+`k`→`kill` (§9.3). Still open: the true in-place render (§9.1), and 1c's `/` filter.)
 - `ps -ef` decoration (core recognises `HeaderKind::Ef` but 1a only decorates `Aux`).
 
 ## 9. Follow-ups
@@ -150,8 +150,16 @@ has since been implemented in the same panel; see §9.2.)
    sort (CPU↓ / MEM↓ / PID↑, toggling back to printed order). Gated to the resolved `Bars`
    level (≥ `min_width_bars`). Not yet: the proportional scrollbar glyph, and the kernel-fold
    toggle (the core folds in `build_quiet`, so revealing threads inline needs a core option).
-3. **1c inspector** — `group_rows` / `parse_enrich` are ready; add the two-pane overlay and
-   the `k` → `kill <pid>` insert-never-run action.
+3. **1c inspector — done.** At the resolved `Inspector` level (≥ `min_width_inspector`) the
+   panel groups rows by provenance (`group_rows`) with CPU/RSS subtotals, collapsible with
+   `←`/`→`/Enter; a moving selection (`↑`/`↓`/`j`, PgUp/PgDn) drives a detail pane fed by a
+   read-only `ps -o … -p <pid>` enrich query (`parse_enrich`: ppid, threads, full state,
+   elapsed); `k` composes `kill <pid>` at the prompt (insert-never-run), `y`/`Y` copy the
+   pid / full command. (The spec's key table lists `k` for both move and kill — resolved
+   toward the kill signal: `↑`/`↓`/`j` move, `k` kills.) Fixing this surfaced a core
+   `classify` bug — keyword tables matched as unanchored substrings, so `ubuntu`→`bun` and
+   `nodev`→`node` misfiled desktop/system processes into Dev; fixed upstream with
+   word-boundary matching and re-pinned. Not yet: `/` incremental filter, within-group sort.
 
 ## 10. Verification
 
