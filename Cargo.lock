@@ -2802,7 +2802,7 @@ dependencies = [
 [[package]]
 name = "sampa-ps-decorate"
 version = "0.1.0"
-source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=a126b9f739e00ff19f882960d90e4fbb89da9133#a126b9f739e00ff19f882960d90e4fbb89da9133"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=f2e73c9252ed0bbbccff05d8eee1762d86b68915#f2e73c9252ed0bbbccff05d8eee1762d86b68915"
 dependencies = [
  "serde",
 ]

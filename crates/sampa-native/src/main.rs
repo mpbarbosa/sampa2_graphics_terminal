@@ -45,7 +45,8 @@ use glyphon::{
 use pty_core::pty::{spawn, PtyEvent, PtyHandle, SpawnConfig};
 use sampa_config::CursorStyle;
 use sampa_ps_decorate::{
-    decorate_scrollback, header_kind, resolve_level, HeaderKind, Level, Quiet, WidthThresholds,
+    decorate_scrollback, group_rows, header_kind, parse_enrich, resolve_level, Group, GroupView,
+    HeaderKind, Level, PsDetail, Quiet, WidthThresholds, ENRICH_FORMAT,
 };
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -406,6 +407,26 @@ impl PsSort {
             PsSort::Mem => "mem↓",
             PsSort::Pid => "pid↑",
         }
+    }
+}
+
+/// One rendered line of the 1c grouped inspector (spec §6): a group header, or a member
+/// row (carrying its group index so `←` can collapse the row's parent).
+#[derive(Clone, Copy)]
+enum PsVLine {
+    Header(usize),    // index into `ps_groups`
+    Row(usize, usize), // (group index, row index into the Quiet)
+}
+
+/// Display name for a provenance [`Group`] (spec §6 order).
+fn group_name(g: Group) -> &'static str {
+    match g {
+        Group::Dev => "Dev",
+        Group::Browser => "Browser",
+        Group::Desktop => "Desktop",
+        Group::System => "System",
+        Group::Shell => "Shell",
+        Group::Other => "Other",
     }
 }
 
@@ -1807,6 +1828,10 @@ fn main() -> Result<()> {
         ps_scroll: 0,
         ps_level: Level::Quiet,
         ps_sort: PsSort::Order,
+        ps_groups: Vec::new(),
+        ps_collapsed: Vec::new(),
+        ps_sel: 0,
+        ps_detail: None,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2137,8 +2162,13 @@ struct App {
     ps_on: bool,
     ps_view: Option<PsView>,
     ps_scroll: usize,
-    ps_level: Level, // resolved level (1a quiet / 1b bars); gates bars + live sort
+    ps_level: Level, // resolved level (1a quiet / 1b bars / 1c inspector)
     ps_sort: PsSort,
+    // 1c inspector (spec §6) — active at the resolved Inspector level.
+    ps_groups: Vec<GroupView>,
+    ps_collapsed: Vec<bool>, // parallel to ps_groups
+    ps_sel: usize,           // index into the current visual-line list
+    ps_detail: Option<(u32, PsDetail)>, // enrich for the selected row's pid (cached)
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -2828,6 +2858,21 @@ fn ps_sort_order(rows: &[sampa_ps_decorate::QuietRow], sort: PsSort) -> Vec<usiz
         PsSort::Pid => order.sort_by_key(|&i| rows[i].pid.parse::<u64>().unwrap_or(0)),
     }
     order
+}
+
+/// Format an elapsed-seconds count compactly for the inspector detail pane (spec §6):
+/// `45s` · `12m` · `3h07m` · `2d05h`.
+fn fmt_etime(secs: u64) -> String {
+    let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
+    if d > 0 {
+        format!("{d}d{h:02}h")
+    } else if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// Map the config's `[enhance] ps` level to the decorator's [`Level`].
@@ -3785,8 +3830,20 @@ impl App {
                 })
         };
 
+        self.ps_groups = Vec::new();
+        self.ps_collapsed = Vec::new();
+        self.ps_sel = 0;
+        self.ps_detail = None;
         self.ps_view = Some(match block.as_deref().and_then(decorate_scrollback) {
-            Some(quiet) => PsView::Table(Box::new(quiet)),
+            Some(quiet) => {
+                // 1c inspector: bucket into provenance groups (spec §6) and seed selection.
+                if self.ps_level == Level::Inspector {
+                    self.ps_groups = group_rows(&quiet.rows);
+                    self.ps_collapsed = vec![false; self.ps_groups.len()];
+                    // Selection starts on the first group header, so no row detail yet.
+                }
+                PsView::Table(Box::new(quiet))
+            }
             None => PsView::Message(
                 "No `ps aux` output found in the buffer — run `ps aux`, then press the key again.".into(),
             ),
@@ -3797,16 +3854,188 @@ impl App {
     fn ps_close(&mut self) {
         self.ps_on = false;
         self.ps_view = None;
+        self.ps_groups = Vec::new();
+        self.ps_collapsed = Vec::new();
+        self.ps_detail = None;
         self.request_redraw();
     }
 
-    /// Bars + live sort are the 1b features — active only when the resolved level cleared
-    /// the `min_width_bars` gate (spec §5).
+    /// Bars are a 1b feature — active from the resolved `Bars` level up (spec §5). At the
+    /// `Inspector` level the grouped view draws its own rows, so bars stay in the flat path.
     fn ps_has_bars(&self) -> bool {
-        matches!(self.ps_level, Level::Bars | Level::Inspector)
+        self.ps_level == Level::Bars
+    }
+
+    /// The 1c grouped inspector is active only at the resolved `Inspector` level with groups
+    /// (spec §6, ≥ `min_width_inspector`).
+    fn ps_is_inspector(&self) -> bool {
+        self.ps_level == Level::Inspector && !self.ps_groups.is_empty()
+    }
+
+    /// The rendered line list: each group's header, then its rows unless it's collapsed.
+    fn ps_vlines(&self) -> Vec<PsVLine> {
+        let mut v = Vec::new();
+        for (gi, g) in self.ps_groups.iter().enumerate() {
+            v.push(PsVLine::Header(gi));
+            if !self.ps_collapsed.get(gi).copied().unwrap_or(false) {
+                v.extend(g.rows.iter().map(|&ri| PsVLine::Row(gi, ri)));
+            }
+        }
+        v
+    }
+
+    /// Refresh the cached detail for the selected row via a read-only `ps -o … -p <pid>`
+    /// enrich query (spec §6 detail pane). No-op (and clears) when the selection is a group
+    /// header, and cached while the selected pid is unchanged.
+    fn ps_refresh_detail(&mut self) {
+        let pid = if let Some(PsView::Table(q)) = self.ps_view.as_ref() {
+            match self.ps_vlines().get(self.ps_sel).copied() {
+                Some(PsVLine::Row(_, ri)) => q.rows.get(ri).and_then(|r| r.pid.parse::<u32>().ok()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let Some(pid) = pid else {
+            self.ps_detail = None;
+            return;
+        };
+        if self.ps_detail.as_ref().map(|(p, _)| *p) == Some(pid) {
+            return; // already cached for this pid
+        }
+        let detail = std::process::Command::new("ps")
+            .args(["-o", ENRICH_FORMAT, "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .and_then(|o| parse_enrich(&String::from_utf8_lossy(&o.stdout)).into_iter().next());
+        self.ps_detail = detail.map(|d| (pid, d));
+    }
+
+    /// Keys for the 1c grouped inspector (spec §6): move/collapse selection, the detail
+    /// pane follows, and `k`/`y`/`Y` compose an insert-never-run signal or copy.
+    fn ps_inspector_key(&mut self, key: &Key) {
+        let vlines = self.ps_vlines();
+        let n = vlines.len();
+        // Group index of the current line, for collapse/expand on either a header or a row.
+        let cur_group = vlines.get(self.ps_sel).map(|v| match v {
+            PsVLine::Header(gi) | PsVLine::Row(gi, _) => *gi,
+        });
+        let page = PS_VISIBLE.saturating_sub(4).max(1);
+        let mut moved = false;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.ps_close();
+                return;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.ps_sel = (self.ps_sel + 1).min(n.saturating_sub(1));
+                moved = true;
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.ps_sel = self.ps_sel.saturating_sub(1);
+                moved = true;
+            }
+            Key::Named(NamedKey::PageDown) => {
+                self.ps_sel = (self.ps_sel + page).min(n.saturating_sub(1));
+                moved = true;
+            }
+            Key::Named(NamedKey::PageUp) => {
+                self.ps_sel = self.ps_sel.saturating_sub(page);
+                moved = true;
+            }
+            Key::Named(NamedKey::ArrowLeft) => self.ps_set_collapsed(cur_group, true),
+            Key::Named(NamedKey::ArrowRight) => self.ps_set_collapsed(cur_group, false),
+            Key::Named(NamedKey::Enter) => {
+                // Toggle collapse when on a header.
+                if let Some(PsVLine::Header(gi)) = vlines.get(self.ps_sel).copied() {
+                    let c = self.ps_collapsed.get(gi).copied().unwrap_or(false);
+                    self.ps_set_collapsed(Some(gi), !c);
+                }
+            }
+            Key::Character(s) => match s.as_str() {
+                "j" => {
+                    self.ps_sel = (self.ps_sel + 1).min(n.saturating_sub(1));
+                    moved = true;
+                }
+                "k" => self.ps_signal_kill(),
+                "h" => self.ps_set_collapsed(cur_group, true),
+                "l" => self.ps_set_collapsed(cur_group, false),
+                "y" => self.ps_copy_selected(false),
+                "Y" => self.ps_copy_selected(true),
+                "q" => {
+                    self.ps_close();
+                    return;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        if moved {
+            self.ps_refresh_detail();
+        }
+        self.request_redraw();
+    }
+
+    /// Collapse/expand a group and re-anchor the selection on its header line.
+    fn ps_set_collapsed(&mut self, group: Option<usize>, collapsed: bool) {
+        let Some(gi) = group else { return };
+        if let Some(slot) = self.ps_collapsed.get_mut(gi) {
+            *slot = collapsed;
+        }
+        // Land the selection on the group's header (its row window just changed).
+        if let Some(pos) = self
+            .ps_vlines()
+            .iter()
+            .position(|v| matches!(v, PsVLine::Header(g) if *g == gi))
+        {
+            self.ps_sel = pos;
+        }
+        self.ps_refresh_detail();
+    }
+
+    /// `k` — compose `kill <pid>` at the prompt without running it (spec §6; the exact
+    /// insert-never-run boundary the palette and AI honour). Closes the panel so the user
+    /// sees the composed command in their own shell.
+    fn ps_signal_kill(&mut self) {
+        if let Some(pid) = self.ps_selected_pid() {
+            self.pty_write(format!("kill {pid} ").as_bytes());
+            self.scroll(Scroll::Bottom);
+            self.ps_close();
+        }
+    }
+
+    /// `y`/`Y` — copy the selected row's PID, or its full (untruncated) command line.
+    fn ps_copy_selected(&mut self, full_command: bool) {
+        let text = if let Some(PsView::Table(q)) = self.ps_view.as_ref() {
+            match self.ps_vlines().get(self.ps_sel).copied() {
+                Some(PsVLine::Row(_, ri)) => q.rows.get(ri).map(|r| {
+                    if full_command { r.command.clone() } else { r.pid.clone() }
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let (Some(text), Some(clip)) = (text, self.clipboard.as_mut()) {
+            let _ = clip.set_text(text);
+        }
+    }
+
+    /// The selected row's pid, if the selection is a row (not a group header).
+    fn ps_selected_pid(&self) -> Option<u32> {
+        if let Some(PsView::Table(q)) = self.ps_view.as_ref() {
+            if let Some(PsVLine::Row(_, ri)) = self.ps_vlines().get(self.ps_sel).copied() {
+                return q.rows.get(ri).and_then(|r| r.pid.parse::<u32>().ok());
+            }
+        }
+        None
     }
 
     fn ps_key(&mut self, key: &Key) {
+        if self.ps_is_inspector() {
+            self.ps_inspector_key(key);
+            return;
+        }
         let page = PS_VISIBLE.saturating_sub(1).max(1);
         match key {
             Key::Named(NamedKey::Escape) => self.ps_close(),
@@ -3856,6 +4085,9 @@ impl App {
     /// 1b (`ps_has_bars`) each percentage carries an 8-cell signal bar (spec §5) and the
     /// rows follow the live `ps_sort` order.
     fn ps_render(&self, q: &Quiet, visible: usize) -> (String, String, Vec<BodySpan>) {
+        if self.ps_is_inspector() {
+            return self.ps_render_inspector(q, visible);
+        }
         let fg = self.theme.fg;
         let muted = blend(self.theme.bg, self.theme.fg, 0.55);
         let no_color = std::env::var_os("NO_COLOR").is_some();
@@ -3960,6 +4192,134 @@ impl App {
             )
         };
         (title, body, spans)
+    }
+
+    /// Render the 1c grouped inspector (spec §6): provenance groups with CPU/RSS subtotals,
+    /// collapsible, a moving selection, and a detail pane for the selected row.
+    fn ps_render_inspector(&self, q: &Quiet, visible: usize) -> (String, String, Vec<BodySpan>) {
+        let fg = self.theme.fg;
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        let accent = self.theme.cursor;
+        let no_color = std::env::var_os("NO_COLOR").is_some();
+
+        // Row column widths across the whole set (headers aren't columnar).
+        let (mut w_pid, mut w_user, mut w_cpu, mut w_mem, mut w_rss) = (3usize, 4, 4, 4, 3);
+        for r in &q.rows {
+            w_pid = w_pid.max(r.pid.chars().count());
+            w_user = w_user.max(r.user.chars().count());
+            w_cpu = w_cpu.max(r.cpu.chars().count());
+            w_mem = w_mem.max(r.mem.chars().count());
+            w_rss = w_rss.max(r.rss.chars().count());
+        }
+        w_user = w_user.min(12);
+        let fixed = 2 + w_pid + 1 + w_user + 1 + w_cpu + 1 + w_mem + 1 + w_rss + 1;
+        let cmd_budget = (self.cols as usize).saturating_sub(fixed).max(8);
+
+        // Window over the visual lines, keeping the selection in view (detail pane reserved).
+        let vlines = self.ps_vlines();
+        let len = vlines.len();
+        let list_rows = visible.saturating_sub(3).max(1);
+        let start = if len <= list_rows {
+            0
+        } else {
+            self.ps_sel.saturating_sub(list_rows / 2).min(len - list_rows)
+        };
+        let end = (start + list_rows).min(len);
+
+        let mut spans: Vec<BodySpan> = Vec::new();
+        for (row_n, vl) in vlines[start..end].iter().enumerate() {
+            let idx = start + row_n;
+            let selected = idx == self.ps_sel;
+            let caret = if selected { "❯ " } else { "  " };
+            if row_n > 0 {
+                spans.push(("\n".to_string(), fg, false, false));
+            }
+            match *vl {
+                PsVLine::Header(gi) => {
+                    let g = &self.ps_groups[gi];
+                    let arrow = if self.ps_collapsed.get(gi).copied().unwrap_or(false) {
+                        "▸"
+                    } else {
+                        "▾"
+                    };
+                    let col = if selected { accent } else { fg };
+                    spans.push((
+                        format!(
+                            "{caret}{arrow} {:<9} {} proc{} · CPU {:.1}% · {}",
+                            group_name(g.group), g.count, if g.count == 1 { "" } else { "s" },
+                            g.cpu, sampa_ps_decorate::fmt_size_kb(g.rss_kb),
+                        ),
+                        col, true, false,
+                    ));
+                }
+                PsVLine::Row(_, ri) => {
+                    let r = &q.rows[ri];
+                    let user = truncate_chars(&r.user, w_user);
+                    let cmd = truncate_chars(&r.command, cmd_budget);
+                    if selected {
+                        // The selection wins the row's colour (no per-cell heat).
+                        spans.push((
+                            format!(
+                                "{caret}{:>wp$} {:<wu$} {:>wc$} {:>wm$} {:>wr$} {}",
+                                r.pid, user, r.cpu, r.mem, r.rss, cmd,
+                                wp = w_pid, wu = w_user, wc = w_cpu, wm = w_mem, wr = w_rss,
+                            ),
+                            accent, true, false,
+                        ));
+                    } else {
+                        let cpu_c = heat_band(r.cpu_val, r.cpu == "–", no_color, fg, muted);
+                        let mem_c = heat_band(r.mem_val, r.mem == "–", no_color, fg, muted);
+                        spans.push((format!("{caret}{:>wp$} {:<wu$} ", r.pid, user, wp = w_pid, wu = w_user), fg, false, false));
+                        spans.push((format!("{:>wc$}", r.cpu, wc = w_cpu), cpu_c, false, false));
+                        spans.push((" ".to_string(), fg, false, false));
+                        spans.push((format!("{:>wm$}", r.mem, wm = w_mem), mem_c, false, false));
+                        spans.push((format!(" {:>wr$} {}", r.rss, cmd, wr = w_rss), fg, false, false));
+                    }
+                }
+            }
+        }
+        // Detail pane — the selected row's enrich fields (spec §6), or the group subtotal.
+        spans.push(("\n".to_string(), fg, false, false));
+        spans.push((self.ps_detail_line(q), muted, false, true));
+
+        let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
+        let procs = q.rows.len();
+        let title = format!(
+            "ps · inspector — {} groups · {} proc{}{}   {}–{}/{}   ·  ↑↓ move · ←→ fold · k kill · y/Y copy · Esc",
+            self.ps_groups.len(),
+            procs,
+            if procs == 1 { "" } else { "s" },
+            if q.kernel_count > 0 { format!(" · {} kernel", q.kernel_count) } else { String::new() },
+            start + 1, end, len,
+        );
+        (title, body, spans)
+    }
+
+    /// The detail line for the current selection: enrich fields for a row (spec §6 detail
+    /// pane), or the CPU/RSS subtotal for a group header.
+    fn ps_detail_line(&self, q: &Quiet) -> String {
+        match self.ps_vlines().get(self.ps_sel).copied() {
+            Some(PsVLine::Row(_, ri)) => {
+                let Some(r) = q.rows.get(ri) else { return String::new() };
+                match &self.ps_detail {
+                    Some((_, d)) => format!(
+                        "↳ pid {} · ppid {} · {} thread{} · {} ({}) · up {} · {}",
+                        d.pid, d.ppid, d.threads, if d.threads == 1 { "" } else { "s" },
+                        d.state_long, d.state, fmt_etime(d.etimes), r.command,
+                    ),
+                    None => format!("↳ pid {} · {}", r.pid, r.command),
+                }
+            }
+            Some(PsVLine::Header(gi)) => {
+                let g = &self.ps_groups[gi];
+                format!(
+                    "↳ {} — {} process{}, CPU {:.1}%, RSS {}   · Enter/←→ folds",
+                    group_name(g.group), g.count, if g.count == 1 { "" } else { "es" },
+                    g.cpu, sampa_ps_decorate::fmt_size_kb(g.rss_kb),
+                )
+            }
+            None => String::new(),
+        }
     }
 
     /// Toggle the live command-preview panel; enabling it previews the current line.
@@ -7200,6 +7560,14 @@ mod tests {
         assert_eq!(ps_sort_order(&rows, PsSort::Cpu), vec![1, 0, 2]); // 9,5,1
         assert_eq!(ps_sort_order(&rows, PsSort::Mem), vec![2, 0, 1]); // 8,2,1
         assert_eq!(ps_sort_order(&rows, PsSort::Pid), vec![1, 2, 0]); // 10,20,30
+    }
+
+    #[test]
+    fn fmt_etime_scales() {
+        assert_eq!(fmt_etime(45), "45s");
+        assert_eq!(fmt_etime(12 * 60), "12m");
+        assert_eq!(fmt_etime(3 * 3600 + 7 * 60), "3h07m");
+        assert_eq!(fmt_etime(2 * 86400 + 5 * 3600), "2d05h");
     }
 
     #[test]
