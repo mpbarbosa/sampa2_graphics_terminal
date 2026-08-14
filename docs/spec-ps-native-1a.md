@@ -137,14 +137,26 @@ and fast (string parsing of a few hundred lines).
   the actual `ps` output cells and freezing back is §9 follow-up work.
 (1b and 1c were originally out of scope here but have since been implemented in the same
 panel — 1b signal bars + `c`/`m`/`p` sort (§9.2), 1c grouped inspector + detail pane +
-`k`→`kill` + `/` filter (§9.3). Still open: the true in-place render (§9.1).)
+`k`→`kill` + `/` filter (§9.3), and an in-place scrollback colouring mode (§9.1). Every
+documented 1a/1b/1c interaction is now implemented.)
 - `ps -ef` decoration (core recognises `HeaderKind::Ef` but 1a only decorates `Aux`).
 
 ## 9. Follow-ups
 
-1. **True in-place render** — replace the `ps` block's grid rows with the decorated model
-   (fold hides rows, summary line inserted), bounded by OSC 133, freezing back to static
-   text at the next prompt. This is the harder renderer change the parent spec §6 describes.
+1. **In-place render — done (colour/elide, no fold).** `Ctrl+Shift+I` toggles an in-place
+   mode that decorates `ps aux` output *where it sits* in the scrollback: each visible line
+   that parses as an aux row is heat-coloured on `%CPU`/`%MEM` (spec §7), has exact-zero
+   measurements elided to a muted `–`, its `VSZ` column dimmed, and — for kernel threads —
+   the whole line dimmed so the noise recedes. It's a per-frame colour/char transform on the
+   snapshot (`apply_ps_inplace`), so it scrolls with the buffer, needs no block tracking or
+   OSC 133, and never touches the real grid — copy/paste of the output stays byte-identical,
+   and toggling off reverts exactly.
+   **Design note — no folding:** the parent spec §6 pictures kernel rows *folded away* with a
+   summary line inserted. In place that's impossible without rewriting scrollback history
+   (the grid has fixed physical lines; removing rows corrupts scroll). Dimming is the
+   in-place stand-in for the fold; true folding stays in the panel view (1a/1c), which builds
+   its own line model. Also deferred in place: `RSS` unit reformatting (a width-changing edit)
+   and the "next prompt freezes it" lifecycle (the transform is already static + non-interactive).
 2. **1b bars — done.** `bars_for` block-glyph bars on `%CPU`/`%MEM` (heat-coloured, scaled to
    the column max), a `CPU x% of N×100%` denominator, a position readout, and live `c`/`m`/`p`
    sort (CPU↓ / MEM↓ / PID↑, toggling back to printed order). Gated to the resolved `Bars`

@@ -105,6 +105,7 @@ enum Action {
     ToggleMan,
     TogglePreview,
     EnhancePs,
+    EnhancePsInplace,
     Ai,
     ZoomIn,
     ZoomOut,
@@ -129,6 +130,7 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     // Not Ctrl+Shift+E — sampa-config defaults `enhance_ps` there, but that chord is
     // toggle_preview here; the native default lives on Ctrl+Shift+D ("decorate").
     (Action::EnhancePs, "enhance_ps", "Enhance last ps output", "Ctrl+Shift+D"),
+    (Action::EnhancePsInplace, "enhance_ps_inplace", "Toggle in-place ps colouring", "Ctrl+Shift+I"),
     (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
     (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
     (Action::ZoomOut, "zoom_out", "Zoom out", "Ctrl+Minus"),
@@ -1834,6 +1836,7 @@ fn main() -> Result<()> {
         ps_detail: None,
         ps_filter: String::new(),
         ps_filter_editing: false,
+        ps_inplace: false,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2173,6 +2176,7 @@ struct App {
     ps_detail: Option<(u32, PsDetail)>, // enrich for the selected row's pid (cached)
     ps_filter: String,       // incremental filter on command/user (spec §6); empty = off
     ps_filter_editing: bool, // true while `/` is capturing keystrokes into ps_filter
+    ps_inplace: bool,        // in-place ps colouring of scrollback (spec §6 in-place render)
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -2864,6 +2868,28 @@ fn ps_sort_order(rows: &[sampa_ps_decorate::QuietRow], sort: PsSort) -> Vec<usiz
     order
 }
 
+/// Char-index spans `(start, end)` of the first `n` whitespace-delimited fields in `line`.
+/// `ps aux` output is ASCII in columnar form, so a char index equals its grid cell column —
+/// letting the in-place decorator recolour exactly the `%CPU`/`%MEM`/`VSZ` cells.
+fn field_spans(line: &str, n: usize) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut spans = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < chars.len() && spans.len() < n {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i > start {
+            spans.push((start, i));
+        }
+    }
+    spans
+}
+
 /// Format an elapsed-seconds count compactly for the inspector detail pane (spec §6):
 /// `45s` · `12m` · `3h07m` · `2d05h`.
 fn fmt_etime(secs: u64) -> String {
@@ -3305,6 +3331,10 @@ impl App {
             Action::ToggleMan => self.man_open(),
             Action::TogglePreview => self.preview_toggle(),
             Action::EnhancePs => self.ps_open(),
+            Action::EnhancePsInplace => {
+                self.ps_inplace = !self.ps_inplace;
+                self.request_redraw();
+            }
             Action::Ai => self.ai_open(),
             Action::ZoomIn => self.zoom_by(1.0),
             Action::ZoomOut => self.zoom_by(-1.0),
@@ -3447,6 +3477,65 @@ impl App {
 
     /// Paint search highlights onto a freshly built snapshot: every visible match gets
     /// a highlight bg, the current one a brighter bg + dark fg. No-op when closed.
+    /// Decorate `ps aux` output **in place** in the visible scrollback (spec §6 in-place
+    /// render): every visible line that parses as an aux data row is heat-coloured on
+    /// `%CPU`/`%MEM`, has its exact-zero measurements elided to a muted `–`, its dropped
+    /// `VSZ` column dimmed, and — for kernel threads — the whole line dimmed so the noise
+    /// recedes. Purely a per-frame colour/char transform on the snapshot: it scrolls with
+    /// the buffer, needs no block tracking, and never touches the real grid (copy/paste of
+    /// the output stays byte-identical). Rows aren't folded away — the grid has fixed
+    /// physical lines, so folding would corrupt scrollback; dimming is the in-place stand-in.
+    fn apply_ps_inplace(&self, snap: &mut Snapshot) {
+        if !self.ps_inplace {
+            return;
+        }
+        let cols = snap.cols;
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        let dim = blend(self.theme.bg, self.theme.fg, 0.32);
+        let no_color = std::env::var_os("NO_COLOR").is_some();
+        for r in 0..snap.rows {
+            let line: String = (0..cols).map(|c| snap.cell(r, c).c).collect();
+            let repaired = repair_truncated_kernel(line.trim_end());
+            let Some(row) = sampa_ps_decorate::parse_aux_row(&repaired) else {
+                continue;
+            };
+            let base = r * cols;
+            if row.is_kernel {
+                for c in 0..cols {
+                    snap.cells[base + c].fg = dim;
+                }
+                continue;
+            }
+            let spans = field_spans(&line, 6); // USER PID %CPU %MEM VSZ RSS
+            if spans.len() < 6 {
+                continue;
+            }
+            // Heat-colour %CPU (field 2) / %MEM (field 3); elide an exact zero to a muted "–".
+            for (fi, val) in [(2usize, row.cpu), (3usize, row.mem)] {
+                let (s, e) = spans[fi];
+                if val == 0.0 {
+                    for c in s..e.min(cols) {
+                        snap.cells[base + c].c = ' ';
+                        snap.cells[base + c].fg = muted;
+                    }
+                    if e >= 1 && e - 1 < cols {
+                        snap.cells[base + e - 1].c = '–';
+                    }
+                } else {
+                    let col = heat_band(val, false, no_color, self.theme.fg, muted);
+                    for c in s..e.min(cols) {
+                        snap.cells[base + c].fg = col;
+                    }
+                }
+            }
+            // Dim VSZ (field 4) — the column the quiet view drops.
+            let (vs, ve) = spans[4];
+            for c in vs..ve.min(cols) {
+                snap.cells[base + c].fg = dim;
+            }
+        }
+    }
+
     fn apply_search_highlight(&self, snap: &mut Snapshot) {
         if !self.search_on || self.search_matches.is_empty() {
             return;
@@ -4648,6 +4737,7 @@ impl App {
             Ok(g) => build_snapshot(&g.term, &self.theme, self.cursor_style, self.cursor_on),
             Err(_) => return,
         };
+        self.apply_ps_inplace(&mut snap);
         self.apply_search_highlight(&mut snap);
         if !self.dumped && std::env::var_os("SAMPA_DUMP_GRID").is_some() {
             let text = snap.to_text();
@@ -7649,6 +7739,21 @@ mod tests {
         assert_eq!(ps_sort_order(&rows, PsSort::Cpu), vec![1, 0, 2]); // 9,5,1
         assert_eq!(ps_sort_order(&rows, PsSort::Mem), vec![2, 0, 1]); // 8,2,1
         assert_eq!(ps_sort_order(&rows, PsSort::Pid), vec![1, 2, 0]); // 10,20,30
+    }
+
+    #[test]
+    fn field_spans_locates_columns() {
+        // Char-index spans map to grid cells for in-place recolouring.
+        let line = "mpb  146585  18.3  0.6  3905396  189640 ?  RNl  20:31  0:07 ./sampa2";
+        let s = field_spans(line, 6);
+        assert_eq!(s.len(), 6);
+        // Field 2 is %CPU, field 3 %MEM — the spans the in-place decorator heat-colours.
+        assert_eq!(&line[s[2].0..s[2].1], "18.3");
+        assert_eq!(&line[s[3].0..s[3].1], "0.6");
+        assert_eq!(&line[s[5].0..s[5].1], "189640");
+        // Fewer fields than requested → returns what it found, no panic.
+        assert_eq!(field_spans("a b", 6).len(), 2);
+        assert_eq!(field_spans("   ", 6).len(), 0);
     }
 
     #[test]
