@@ -148,3 +148,35 @@ Recommended shape: keep the secret in a private `~/.config/sampa/sampa.env` (`ch
 new shell — and any Sampa launched from it — has it. **The key never goes in `config.toml`
 or the repo.** A key pasted anywhere shared (chat, a tracked dotfile) should be considered
 burned — rotate it.
+
+## 7. As-built: the second direction — explain an existing command
+
+§1 framed two *command-producing* directions (NL→command, output→command). A third,
+**command → description**, now ships alongside them and rides the exact same machinery
+with the polarity flipped: instead of turning a request *into* a command, it takes a
+command the user has **already typed** and returns a plain-language description of what it
+does.
+
+- **Trigger.** A dedicated keybinding, `keybindings.explain` (default **`Ctrl+Shift+X`**).
+  It reads the current command line from the **tracked keystrokes** (`tab.typed`) — the
+  same keystroke source the man panel and preview use — so it never scrapes the grid.
+- **Core.** `sampa_ai::explain` (+ `explain_over_network`) builds one `POST /v1/messages`
+  with an `ExplainRequest { command, os, shell }`. Unlike `suggest`, it asks for **free
+  prose**, not a `json_schema` — an explanation is naturally prose — and `parse_text_response`
+  returns the first text block. The system prompt instructs the model to lead with the
+  overall effect and to **call out destructive/irreversible commands** prominently. Same
+  `Transport` seam, so it is unit-tested with a fake transport; the key is never in the body.
+- **Bridge.** `explain_command(command)` — the same gate as `suggest_command` (inert unless
+  `[ai] enabled`; key from `ANTHROPIC_API_KEY`), the same `spawn_blocking` off the async
+  runtime.
+- **UX.** The result appears in a **read-only popup** (`#explain`) showing the command and
+  its description. **Nothing is executed** — this direction has no command to insert, so the
+  insert-never-run boundary is moot here; the only side effect is the network call itself.
+- **Consent.** There is no separate egress modal: **pressing the shortcut *is* the deliberate
+  send** (the typed command line leaves the machine). This mirrors the suggester overlay's
+  "Enter is the send" model. As with the suggester, `[ai] endpoint` can point at a local
+  model to avoid third-party egress entirely.
+
+Everything from §3 (secret handling), §5 (opt-in, local-model escape hatch), and §6
+(credential wiring) applies unchanged — this is the same one network surface, used in a new
+direction, not a second one.
