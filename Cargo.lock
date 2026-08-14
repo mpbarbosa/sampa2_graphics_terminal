@@ -2737,7 +2737,7 @@ dependencies = [
 [[package]]
 name = "sampa-ai"
 version = "0.1.0"
-source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=38f35ae78fdcccac5a7e50edb65d9b62cb39ea8e#38f35ae78fdcccac5a7e50edb65d9b62cb39ea8e"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=d318fb58aaba4e55e341980451e20363a8ffa67b#d318fb58aaba4e55e341980451e20363a8ffa67b"
 dependencies = [
  "serde",
  "serde_json",
@@ -3202,7 +3202,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
