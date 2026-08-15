@@ -175,7 +175,9 @@ interactive pass + wider program coverage outstanding.)*
   active one highlighted (bg-filled + accent underline) with dimmed inactive labels,
   **click-to-switch**; the grid offsets below it (and reflows on the 1↔2 boundary).
   Geometry/label/close-index math unit-tested; bar rendered + verified via `--capture`.
-  ⬜ still: **splits**, tab reordering/drag, a “＋” new-tab affordance.
+  ✅ **splits** — Ctrl+Shift+R splits a vertical pane, Ctrl+Shift+O cycles focus (per-pane
+  render + resize + input routing; single-pane pixel-identical). ⬜ still: horizontal splits,
+  nested layouts, drag-resize, tab reordering/drag, a “＋” new-tab affordance.
 - ✅ **Search overlay** — **Ctrl+Shift+F** opens a bottom search bar; incremental
   regex match over the whole buffer (scrollback included) via `alacritty_terminal`'s
   `RegexSearch`/`RegexIter`. All matches highlighted, the current one brighter;

@@ -83,6 +83,8 @@ const PREVIEW_VISIBLE: usize = 12;
 const PREVIEW_DEBOUNCE_MS: u64 = 550;
 /// `ps` enhancement panel (spec-ps-native-1a.md): max decorated rows shown at once.
 const PS_VISIBLE: usize = 18;
+/// Pixel width of the divider drawn between split panes.
+const DIVIDER: f32 = 2.0;
 /// Heat bands for the `%CPU`/`%MEM` columns (spec §7): 1–5 % green, 5–10 % yellow, >10 % red.
 /// Below 1 % uses the theme foreground; an elided zero (`–`) renders muted.
 const HEAT_GREEN: [u8; 3] = [0x98, 0xc3, 0x79];
@@ -108,6 +110,8 @@ enum Action {
     TogglePreview,
     EnhancePs,
     EnhancePsInplace,
+    SplitRight,
+    FocusPane,
     Ai,
     Explain,
     ZoomIn,
@@ -134,6 +138,8 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     // toggle_preview here; the native default lives on Ctrl+Shift+D ("decorate").
     (Action::EnhancePs, "enhance_ps", "Enhance ps output (or cd tree picker)", "Ctrl+Shift+D"),
     (Action::EnhancePsInplace, "enhance_ps_inplace", "Toggle in-place ps colouring", "Ctrl+Shift+I"),
+    (Action::SplitRight, "split_right", "Split pane to the right", "Ctrl+Shift+R"),
+    (Action::FocusPane, "focus_pane", "Focus the next split pane", "Ctrl+Shift+O"),
     (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
     (Action::Explain, "explain", "Explain the command line", "Ctrl+Shift+X"),
     (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
@@ -611,6 +617,15 @@ fn group_name(g: Group) -> &'static str {
 struct AiCard<'a> {
     title: &'a str,
     body_spans: &'a [BodySpan],
+}
+
+/// One pane's grid to render this frame: its snapshot and the pixel column `[x, x+w]` it
+/// occupies (full width for a single pane). `focused` gets the bright cursor.
+struct PaneRender<'a> {
+    snap: &'a Snapshot,
+    x: f32,
+    w: f32,
+    focused: bool,
 }
 
 /// The `du` disk-usage treemap overlay for one frame (spec-du-treemap.md): the laid-out
@@ -1956,6 +1971,8 @@ fn main() -> Result<()> {
     let mut app = App {
         sessions,
         active: 0,
+        panes: vec![0],
+        focus: 0,
         next_id: 1,
         proxy,
         state,
@@ -2285,6 +2302,10 @@ fn pump(
 struct App {
     sessions: Vec<Session>,
     active: usize,
+    // Vertical split panes: session indices, left-to-right; `focus` indexes it and
+    // `panes[focus] == active`. len()==1 is the classic single-pane view.
+    panes: Vec<usize>,
+    focus: usize,
     next_id: u64,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     // Active-session pointers (Arc-clones re-pointed on switch) so existing call sites
@@ -3489,6 +3510,13 @@ impl App {
         self.schedule_preview(); // pasted commands preview too (grid-read after debounce)
     }
 
+    /// Pixel width of one split-pane column for a window width `w` (dividers subtracted,
+    /// divided evenly). Equals the full width for a single pane.
+    fn pane_col_w(&self, w: f32) -> f32 {
+        let n = self.panes.len().max(1) as f32;
+        ((w - (n - 1.0) * DIVIDER) / n).max(1.0)
+    }
+
     fn resize(&mut self, w: u32, h: u32) {
         let (cell_w, line_h) = self.cell_metrics();
         let top = top_offset(self.sessions.len());
@@ -3497,19 +3525,22 @@ impl App {
         if let Some(gfx) = &mut self.gfx {
             gfx.resize(w, h);
         }
-        if cols != self.cols || rows != self.rows {
-            self.cols = cols;
-            self.rows = rows;
-            // Resize every tab so switching never needs a reflow.
-            for s in &self.sessions {
-                if let Ok(mut g) = s.state.lock() {
-                    g.term.resize(TermSize::new(cols as usize, rows as usize));
-                }
-                if let Ok(p) = s.pty.lock() {
-                    let _ = p.resize(cols, rows, w as u16, h as u16);
-                }
+        // Each split pane gets its own column width; background (non-pane) tabs stay full so
+        // switching to them needs no reflow. `cols`/`rows` above are the full-grid size.
+        let col_w = self.pane_col_w(w as f32);
+        let pane_cols = (((col_w - 2.0 * PAD) / cell_w).floor() as u16).max(1);
+        for (i, s) in self.sessions.iter().enumerate() {
+            let c = if self.panes.contains(&i) { pane_cols } else { cols };
+            if let Ok(mut g) = s.state.lock() {
+                g.term.resize(TermSize::new(c as usize, rows as usize));
+            }
+            if let Ok(p) = s.pty.lock() {
+                let _ = p.resize(c, rows, col_w as u16, h as u16);
             }
         }
+        // `self.cols`/`rows` track the *focused* pane (mouse mapping, split spawn size).
+        self.cols = if self.panes.len() > 1 { pane_cols } else { cols };
+        self.rows = rows;
     }
 
     fn request_redraw(&self) {
@@ -3558,6 +3589,8 @@ impl App {
         if n > 1 {
             let next = if forward { (self.active + 1) % n } else { (self.active + n - 1) % n };
             self.switch_to(next);
+            self.panes = vec![self.active];
+            self.focus = 0;
         }
     }
 
@@ -3594,6 +3627,8 @@ impl App {
             }
             Action::Ai => self.ai_open(),
             Action::Explain => self.explain_open(),
+            Action::SplitRight => self.split_right(),
+            Action::FocusPane => self.focus_pane(),
             Action::ZoomIn => self.zoom_by(1.0),
             Action::ZoomOut => self.zoom_by(-1.0),
             Action::ZoomReset => self.zoom_reset(),
@@ -3623,12 +3658,44 @@ impl App {
                 self.sessions.push(session);
                 let showed_bar = self.sessions.len() == 2;
                 self.switch_to(self.sessions.len() - 1);
+                self.panes = vec![self.active];
+                self.focus = 0;
                 if showed_bar {
                     self.reflow(); // bar just appeared → grid lost a row
                 }
             }
             Err(e) => eprintln!("new tab: {e}"),
         }
+    }
+
+    /// Split the focused pane vertically: spawn a new shell as a pane to its right and focus
+    /// it. Any other session op (new tab, tab switch, close) collapses the split (v1).
+    fn split_right(&mut self) {
+        let cfg = load_config();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let cwd = self.session_cwd();
+        match spawn_session(self.next_id, &self.proxy, self.cols.max(1), self.rows.max(1), &cfg, shell, vec![], cwd) {
+            Ok(session) => {
+                self.next_id += 1;
+                self.sessions.push(session);
+                let new_idx = self.sessions.len() - 1;
+                self.panes.insert(self.focus + 1, new_idx);
+                self.focus += 1;
+                self.switch_to(new_idx); // mirrors state/pty/images; leaves `panes` intact
+                self.reflow();           // re-size every pane to its column
+            }
+            Err(e) => eprintln!("split: {e}"),
+        }
+    }
+
+    /// Cycle focus to the next split pane (left-to-right, wrapping).
+    fn focus_pane(&mut self) {
+        if self.panes.len() < 2 {
+            return;
+        }
+        self.focus = (self.focus + 1) % self.panes.len();
+        let si = self.panes[self.focus];
+        self.switch_to(si); // updates `active`; keeps `panes`/`focus`
     }
 
     /// Close tab `idx` (reaps its shell). Returns true when no tabs remain.
@@ -3645,6 +3712,8 @@ impl App {
         }
         let hid_bar = self.sessions.len() == 1;
         self.switch_to(active_after_close(self.active, idx, self.sessions.len()));
+        self.panes = vec![self.active]; // collapse any split (keeps pane indices valid, v1)
+        self.focus = 0;
         if hid_bar {
             self.reflow(); // bar just disappeared → grid regained a row
         }
@@ -5389,12 +5458,30 @@ impl App {
     }
 
     fn render_now(&mut self) {
-        let mut snap = match self.state.lock() {
-            Ok(g) => build_snapshot(&g.term, &self.theme, self.cursor_style, self.cursor_on),
-            Err(_) => return,
-        };
-        self.apply_ps_inplace(&mut snap);
-        self.apply_search_highlight(&mut snap);
+        // One snapshot per split pane (usually just one). The focused pane also gets the
+        // in-place ps colouring and search highlight overlays. `panes` is cloned so the
+        // per-pane `&mut self` (apply_*) calls don't collide with iterating it.
+        let panes = self.panes.clone();
+        let focus = self.focus.min(panes.len().saturating_sub(1));
+        let mut pane_snaps: Vec<Snapshot> = Vec::with_capacity(panes.len());
+        for (pi, &si) in panes.iter().enumerate() {
+            let focused = pi == focus;
+            let built = self
+                .sessions
+                .get(si)
+                .and_then(|s| s.state.lock().ok().map(|g| build_snapshot(&g.term, &self.theme, self.cursor_style, self.cursor_on && focused)));
+            let Some(mut s) = built else { continue };
+            if focused {
+                self.apply_ps_inplace(&mut s);
+                self.apply_search_highlight(&mut s);
+            }
+            pane_snaps.push(s);
+        }
+        if pane_snaps.is_empty() {
+            return;
+        }
+        let fidx = focus.min(pane_snaps.len() - 1);
+        let snap = &pane_snaps[fidx]; // focused pane — for the dump + IME anchor below
         // Treemap relayout up front (it borrows `self` mutably), cloned into owned locals so
         // the later view builders — palette/ai/panel, which borrow `self` — don't collide.
         let du_boxes_local: Vec<DuBox>;
@@ -5595,8 +5682,16 @@ impl App {
         // Visual bell: flash a border while `bell_until` is in the future, re-drawing
         // until it lapses (then one final frame clears it).
         let bell = self.bell_until.is_some_and(|t| std::time::Instant::now() < t);
+        // Lay the panes into columns (single pane → full width).
+        let win_w = self.window.as_ref().map(|win| win.inner_size().width as f32).unwrap_or(0.0);
+        let col_w = self.pane_col_w(win_w);
+        let pane_views: Vec<PaneRender> = pane_snaps
+            .iter()
+            .enumerate()
+            .map(|(pi, s)| PaneRender { snap: s, x: pi as f32 * (col_w + DIVIDER), w: col_w, focused: pi == fidx })
+            .collect();
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), ai.as_ref(), du.as_ref(), preedit, bell);
+            gfx.render(&pane_views, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), ai.as_ref(), du.as_ref(), preedit, bell);
         }
         if bell {
             self.request_redraw();
@@ -6137,6 +6232,8 @@ struct Renderer {
     preedit_buffer: Buffer,     // IME preedit (composition) text
     du_title_buffer: Buffer,    // du treemap breadcrumb / status strip
     du_buffers: Vec<Buffer>,    // one per treemap box label, grown lazily
+    pane_buffers: Vec<Buffer>,  // one grid text buffer per split pane, grown lazily
+    grid_font_size: f32,        // point size the grid buffers use (for lazily-grown pane buffers)
     quad_pipeline: wgpu::RenderPipeline,
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
@@ -6352,6 +6449,8 @@ impl Renderer {
             preedit_buffer,
             du_title_buffer,
             du_buffers: Vec::new(),
+            pane_buffers: Vec::new(),
+            grid_font_size: font_size,
             quad_pipeline,
             quad_uniform,
             quad_bind_group,
@@ -6463,6 +6562,8 @@ impl Renderer {
         self.preedit_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.du_title_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.du_buffers.clear();
+        self.pane_buffers.clear();
+        self.grid_font_size = font_size;
         // Overlay row buffers carry the old line height — drop so they're rebuilt.
         self.tab_buffers.clear();
         self.palette_buffers.clear();
@@ -6673,7 +6774,7 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
+    fn paint(&mut self, panes: &[PaneRender], view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
         // search bar and the bottom panel (man page / command preview) each overlay a
         // strip/panel at the bottom.
@@ -6765,54 +6866,53 @@ impl Renderer {
         // (underline/strikethrough, drawn over it).
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
         let mut deco_quads: Vec<QuadInstance> = Vec::new();
-        // Horizontal grid viewport (splits foundation): the grid is drawn inside [vp_x, vp_x
-        // + vp_w]. Full-width here (0, w) so single-pane rendering is unchanged; a vertical
-        // split will call the grid render per pane with its own column.
-        let (vp_x, vp_w) = (0.0_f32, w as f32);
         // Tab-bar segment quads render first, under everything.
         self.tab_bar_quads(tabs, active, w, &mut bg_quads);
-        for r in 0..snap.rows {
-            let y = top + r as f32 * self.line_h;
-            // Rows hidden behind an overlay (palette dropdown / search bar) skip their
-            // decorations + cursor, which are drawn after the panel and would leak over it.
-            let row_visible = y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5;
-            for c in 0..snap.cols {
-                let cell = snap.cell(r, c);
-                let x = vp_x + PAD + c as f32 * self.cell_w;
-                if cell.bg != self.theme.bg {
-                    bg_quads.push(QuadInstance {
-                        rect: [x, y, self.cell_w + 0.5, self.line_h],
-                        color: self.color4(cell.bg),
-                    });
+        // Grid cell backgrounds, decorations, and the cursor — per pane. Each pane draws
+        // inside its column [vp_x, vp_x + vp_w] (full width when there's a single pane).
+        for pane in panes {
+            let (vp_x, snap) = (pane.x, pane.snap);
+            for r in 0..snap.rows {
+                let y = top + r as f32 * self.line_h;
+                let row_visible = y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5;
+                for c in 0..snap.cols {
+                    let cell = snap.cell(r, c);
+                    let x = vp_x + PAD + c as f32 * self.cell_w;
+                    if cell.bg != self.theme.bg {
+                        bg_quads.push(QuadInstance { rect: [x, y, self.cell_w + 0.5, self.line_h], color: self.color4(cell.bg) });
+                    }
+                    if row_visible && !hits_card(x, y) && (cell.underline || cell.hyperlink) {
+                        deco_quads.push(QuadInstance { rect: [x, y + self.line_h - 2.0, self.cell_w, 1.5], color: self.color4(cell.fg) });
+                    }
+                    if row_visible && !hits_card(x, y) && cell.strike {
+                        deco_quads.push(QuadInstance { rect: [x, y + self.line_h * 0.45, self.cell_w, 1.5], color: self.color4(cell.fg) });
+                    }
                 }
-                if row_visible && !hits_card(x, y) && (cell.underline || cell.hyperlink) {
-                    deco_quads.push(QuadInstance {
-                        rect: [x, y + self.line_h - 2.0, self.cell_w, 1.5],
-                        color: self.color4(cell.fg),
-                    });
-                }
-                if row_visible && !hits_card(x, y) && cell.strike {
-                    deco_quads.push(QuadInstance {
-                        rect: [x, y + self.line_h * 0.45, self.cell_w, 1.5],
-                        color: self.color4(cell.fg),
-                    });
+            }
+            // Bar/underline cursor (block inverts its cell in build_snapshot). The focused
+            // pane's cursor is bright; an unfocused pane fades it toward the background.
+            if let Some((r, c)) = snap.cursor.filter(|(r, _)| {
+                let y = top + *r as f32 * self.line_h;
+                y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5
+            }) {
+                let (x, y) = (vp_x + PAD + c as f32 * self.cell_w, top + r as f32 * self.line_h);
+                let rect = match self.cursor_style {
+                    CursorStyle::Bar => Some([x, y, 2.0, self.line_h]),
+                    CursorStyle::Underline => Some([x, y + self.line_h - 2.0, self.cell_w, 2.0]),
+                    CursorStyle::Block => None,
+                };
+                let col = if pane.focused { self.theme.cursor } else { blend(self.theme.bg, self.theme.cursor, 0.5) };
+                if let (Some(rect), false) = (rect, hits_card(x, y)) {
+                    deco_quads.push(QuadInstance { rect, color: self.color4(col) });
                 }
             }
         }
-        // Bar/underline cursor (block inverts its cell in build_snapshot).
-        if let Some((r, c)) = snap.cursor.filter(|(r, _)| {
-            let y = top + *r as f32 * self.line_h;
-            y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5
-        }) {
-            let (x, y) = (vp_x + PAD + c as f32 * self.cell_w, top + r as f32 * self.line_h);
-            let rect = match self.cursor_style {
-                CursorStyle::Bar => Some([x, y, 2.0, self.line_h]),
-                CursorStyle::Underline => Some([x, y + self.line_h - 2.0, self.cell_w, 2.0]),
-                CursorStyle::Block => None,
-            };
-            if let (Some(rect), false) = (rect, hits_card(x, y)) {
-                deco_quads.push(QuadInstance { rect, color: self.color4(self.theme.cursor) });
-            }
+        // Divider quads between adjacent panes.
+        for pane in panes.iter().skip(1) {
+            bg_quads.push(QuadInstance {
+                rect: [pane.x - DIVIDER, top, DIVIDER, h as f32 - top],
+                color: self.color4(blend(self.theme.bg, self.theme.fg, 0.28)),
+            });
         }
         // Search bar: an opaque strip at the bottom (drawn over the grid) + a top rule.
         if search.is_some() {
@@ -6940,40 +7040,47 @@ impl Renderer {
         }
 
         // Foreground text as per-cell colored rich-text spans.
-        let base = Attrs::new().family(family_of(&self.font_family));
-        let mut spans: Vec<(String, [u8; 3], bool, bool)> = Vec::new();
-        for r in 0..snap.rows {
-            for c in 0..snap.cols {
-                let cell = snap.cell(r, c);
-                let key = (cell.fg, cell.bold, cell.italic);
-                match spans.last_mut() {
-                    Some((s, fg, b, i)) if (*fg, *b, *i) == key => s.push(cell.c),
-                    _ => spans.push((cell.c.to_string(), cell.fg, cell.bold, cell.italic)),
-                }
-            }
-            spans.push(("\n".to_string(), DEFAULT_FG, false, false));
+        let fam = family_of(&self.font_family);
+        let base = Attrs::new().family(fam);
+        let shaping = if self.ligatures { Shaping::Advanced } else { Shaping::Basic };
+        // One reusable grid buffer per pane (grown lazily), each shaped from its snapshot.
+        while self.pane_buffers.len() < panes.len() {
+            let b = Buffer::new(&mut self.font_system, Metrics::new(self.grid_font_size, self.line_h));
+            self.pane_buffers.push(b);
         }
-
-        self.buffer
-            .set_size(Some(vp_w - 2.0 * PAD), Some(h as f32 - top - PAD));
-        self.buffer.set_rich_text(
-            spans.iter().map(|(s, fg, bold, italic)| {
-                let mut a = Attrs::new()
-                    .family(family_of(&self.font_family))
-                    .color(Color::rgb(fg[0], fg[1], fg[2]));
-                if *bold {
-                    a = a.weight(Weight::BOLD);
+        for (pi, pane) in panes.iter().enumerate() {
+            let snap = pane.snap;
+            let mut spans: Vec<(String, [u8; 3], bool, bool)> = Vec::new();
+            for r in 0..snap.rows {
+                for c in 0..snap.cols {
+                    let cell = snap.cell(r, c);
+                    let key = (cell.fg, cell.bold, cell.italic);
+                    match spans.last_mut() {
+                        Some((s, fg, b, i)) if (*fg, *b, *i) == key => s.push(cell.c),
+                        _ => spans.push((cell.c.to_string(), cell.fg, cell.bold, cell.italic)),
+                    }
                 }
-                if *italic {
-                    a = a.style(Style::Italic);
-                }
-                (s.as_str(), a)
-            }),
-            &base,
-            if self.ligatures { Shaping::Advanced } else { Shaping::Basic },
-            None,
-        );
-        self.buffer.shape_until_scroll(&mut self.font_system, false);
+                spans.push(("\n".to_string(), DEFAULT_FG, false, false));
+            }
+            let buf = &mut self.pane_buffers[pi];
+            buf.set_size(Some(pane.w - 2.0 * PAD), Some(h as f32 - top - PAD));
+            buf.set_rich_text(
+                spans.iter().map(|(s, fg, bold, italic)| {
+                    let mut a = Attrs::new().family(fam).color(Color::rgb(fg[0], fg[1], fg[2]));
+                    if *bold {
+                        a = a.weight(Weight::BOLD);
+                    }
+                    if *italic {
+                        a = a.style(Style::Italic);
+                    }
+                    (s.as_str(), a)
+                }),
+                &base,
+                shaping,
+                None,
+            );
+            buf.shape_until_scroll(&mut self.font_system, false);
+        }
         // Shape the tab-bar labels + search text + palette rows (no-ops when hidden)
         // before borrowing the buffers to build text areas.
         self.shape_tab_labels(tabs, active, w);
@@ -7080,38 +7187,48 @@ impl Renderer {
         // into up to four regions tiling everything except the card rect (a rectangular
         // hole), so terminal text stays visible around the floating card.
         let gfg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
-        let grid_bounds: Vec<TextBounds> = match ai_card {
-            _ if du.is_some() => Vec::new(), // treemap covers the grid — draw no grid text
-            Some((cx, cy, cw, ch)) => {
-                let (gt, gb) = (grid_top, grid_bottom);
-                let (bt, bb) = (cy.max(gt), (cy + ch).min(gb)); // card band, clamped to grid
-                let mut v = Vec::with_capacity(4);
-                if cy > gt {
-                    v.push(TextBounds { left: 0, top: gt as i32, right: w as i32, bottom: cy.min(gb) as i32 });
-                }
-                if cy + ch < gb {
-                    v.push(TextBounds { left: 0, top: (cy + ch).max(gt) as i32, right: w as i32, bottom: gb as i32 });
-                }
-                if bt < bb {
-                    if cx > 0.0 {
-                        v.push(TextBounds { left: 0, top: bt as i32, right: cx as i32, bottom: bb as i32 });
+        // Grid text areas — one per pane, clipped to its column. The AI card's hole-punch
+        // (grid text drawn in bands around the centered card) only applies to a single pane.
+        if du.is_some() {
+            // treemap covers the grid — draw no grid text
+        } else if panes.len() == 1 {
+            let px = panes[0].x;
+            let bands: Vec<TextBounds> = match ai_card {
+                Some((cx, cy, cw, ch)) => {
+                    let (gt, gb) = (grid_top, grid_bottom);
+                    let (bt, bb) = (cy.max(gt), (cy + ch).min(gb));
+                    let mut v = Vec::with_capacity(4);
+                    if cy > gt {
+                        v.push(TextBounds { left: 0, top: gt as i32, right: w as i32, bottom: cy.min(gb) as i32 });
                     }
-                    v.push(TextBounds { left: (cx + cw) as i32, top: bt as i32, right: w as i32, bottom: bb as i32 });
+                    if cy + ch < gb {
+                        v.push(TextBounds { left: 0, top: (cy + ch).max(gt) as i32, right: w as i32, bottom: gb as i32 });
+                    }
+                    if bt < bb {
+                        if cx > 0.0 {
+                            v.push(TextBounds { left: 0, top: bt as i32, right: cx as i32, bottom: bb as i32 });
+                        }
+                        v.push(TextBounds { left: (cx + cw) as i32, top: bt as i32, right: w as i32, bottom: bb as i32 });
+                    }
+                    v
                 }
-                v
+                None => vec![TextBounds { left: 0, top: grid_top as i32, right: w as i32, bottom: grid_bottom as i32 }],
+            };
+            for bounds in bands {
+                text_areas.push(TextArea { buffer: &self.pane_buffers[0], left: px + PAD, top, scale: 1.0, bounds, default_color: gfg, custom_glyphs: &[] });
             }
-            None => vec![TextBounds { left: vp_x as i32, top: grid_top as i32, right: (vp_x + vp_w) as i32, bottom: grid_bottom as i32 }],
-        };
-        for bounds in grid_bounds {
-            text_areas.push(TextArea {
-                buffer: &self.buffer,
-                left: vp_x + PAD,
-                top,
-                scale: 1.0,
-                bounds,
-                default_color: gfg,
-                custom_glyphs: &[],
-            });
+        } else {
+            for (pi, pane) in panes.iter().enumerate() {
+                text_areas.push(TextArea {
+                    buffer: &self.pane_buffers[pi],
+                    left: pane.x + PAD,
+                    top,
+                    scale: 1.0,
+                    bounds: TextBounds { left: pane.x as i32, top: grid_top as i32, right: (pane.x + pane.w) as i32, bottom: grid_bottom as i32 },
+                    default_color: gfg,
+                    custom_glyphs: &[],
+                });
+            }
         }
         if search.is_some() {
             let ltop = grid_bottom + ((SEARCH_H - self.line_h) / 2.0).max(0.0);
@@ -7286,7 +7403,9 @@ impl Renderer {
             bytemuck::bytes_of(&ScreenUniform { size: [w as f32, h as f32], _pad: [0.0, 0.0] }),
         );
         // Upload/evict image textures and build a one-rect vertex buffer per image.
-        let image_rects = self.sync_images(snap.offset, snap.history, top, w, h);
+        // Inline images track the focused pane's scroll state (per-session image layer).
+        let fsnap = panes.iter().find(|p| p.focused).map(|p| p.snap).unwrap_or(panes[0].snap);
+        let image_rects = self.sync_images(fsnap.offset, fsnap.history, top, w, h);
         let image_bufs: Vec<(u64, wgpu::Buffer)> = image_rects
             .iter()
             .map(|(id, rect)| {
@@ -7446,7 +7565,7 @@ impl Gfx {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
+    fn render(&mut self, panes: &[PaneRender], tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -7455,7 +7574,7 @@ impl Gfx {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.r.paint(
-            snap,
+            panes,
             &view,
             self.config.width,
             self.config.height,
@@ -7647,7 +7766,7 @@ fn capture(path: &str) -> Result<()> {
         Some(PanelView { title: &man_title, body: &man_body, body_spans: None })
     };
     r.paint(
-        &snap,
+        &[PaneRender { snap: &snap, x: 0.0, w: w as f32, focused: true }],
         &view,
         w,
         h,
