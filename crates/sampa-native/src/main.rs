@@ -115,6 +115,7 @@ enum Action {
     FocusPane,
     Ai,
     Explain,
+    AnalyzeWindow,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -143,6 +144,7 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     (Action::FocusPane, "focus_pane", "Focus the next split pane", "Ctrl+Shift+O"),
     (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
     (Action::Explain, "explain", "Explain the command line", "Ctrl+Shift+X"),
+    (Action::AnalyzeWindow, "analyze_window", "Screenshot the window & ask AI to review it", "Ctrl+Shift+G"),
     (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
     (Action::ZoomOut, "zoom_out", "Zoom out", "Ctrl+Minus"),
     (Action::ZoomReset, "zoom_reset", "Reset zoom", "Ctrl+0"),
@@ -1838,6 +1840,8 @@ enum UserEvent {
     AiReady { gen: u64, result: Result<sampa_ai::Suggestion, String> },
     /// A background AI command-explanation call finished; `gen` drops stale replies.
     AiExplainReady { gen: u64, command: String, result: Result<String, String> },
+    /// A background AI screenshot-analysis call finished; `gen` drops stale replies.
+    AiAnalyzeReady { gen: u64, result: Result<String, String> },
     /// A background `du` scan finished (or failed/timed out); `gen` drops stale replies.
     DuReady { gen: u64, result: Result<DuNode, String> },
     /// An AccessKit adapter event (tree request / action / deactivation).
@@ -2061,6 +2065,7 @@ fn main() -> Result<()> {
         ai_query: String::new(),
         ai_state: AiState::Editing,
         ai_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        pending_analyze: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -2423,6 +2428,15 @@ struct App {
     ai_state: AiState,
     /// Supersede token: a reply whose gen ≠ this is stale and dropped.
     ai_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Armed by `analyze_window_open`; the next `render_now` captures the frame to a PNG
+    /// and hands it to the analyze thread (capture needs the GPU, which lives in render).
+    pending_analyze: Option<PendingAnalyze>,
+}
+
+/// A screenshot-analysis request waiting for the next frame to be captured.
+struct PendingAnalyze {
+    gen: u64,
+    params: sampa_ai::Params,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -2490,6 +2504,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AiExplainReady { gen, command, result } => {
                 self.ai_explain_ready(gen, command, result)
             }
+            UserEvent::AiAnalyzeReady { gen, result } => self.ai_analyze_ready(gen, result),
             UserEvent::DuReady { gen, result } => self.du_ready(gen, result),
             UserEvent::AccessKit(e) => {
                 // A screen reader attached / requested the tree — push the current one.
@@ -3640,6 +3655,7 @@ impl App {
             }
             Action::Ai => self.ai_open(),
             Action::Explain => self.explain_open(),
+            Action::AnalyzeWindow => self.analyze_window_open(),
             Action::SplitRight => self.split_right(),
             Action::FocusPane => self.focus_pane(),
             Action::ZoomIn => self.zoom_by(1.0),
@@ -4190,6 +4206,81 @@ impl App {
         }
         self.ai_state = match result {
             Ok(text) => AiState::Explanation { command, text },
+            Err(e) => AiState::Error(e),
+        };
+        self.request_redraw();
+    }
+
+    /// Screenshot-analysis (spec-window-analysis): capture the app's own window and ask the
+    /// model to review it. Gates like the other AI paths (opt-in + key). Because capturing
+    /// needs the GPU (which lives in the render path), this only *arms* the request — the
+    /// next `render_now` grabs the frame to a PNG and spawns the call. Reuses the AI card:
+    /// Pending → Explanation (read-only). A screenshot is a heavy egress (whatever is on
+    /// screen leaves), so pressing the shortcut is the deliberate, consented send.
+    fn analyze_window_open(&mut self) {
+        self.ai_on = true;
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+        self.du_on = false;
+        let cfg = load_config();
+        if !cfg.ai.enabled {
+            self.ai_state =
+                AiState::Error("AI is off — set [ai] enabled = true in config.toml.".into());
+            self.request_redraw();
+            return;
+        }
+        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                self.ai_state =
+                    AiState::Error("Set ANTHROPIC_API_KEY in your shell and relaunch Sampa.".into());
+                self.request_redraw();
+                return;
+            }
+        };
+        let gen = self.ai_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.ai_query = "screenshot".into();
+        self.ai_state = AiState::Pending;
+        self.pending_analyze = Some(PendingAnalyze {
+            gen,
+            params: sampa_ai::Params {
+                model: cfg.ai.model,
+                endpoint: cfg.ai.endpoint,
+                api_key,
+                max_tokens: 2048,
+            },
+        });
+        self.request_redraw(); // the next frame performs the capture (see render_now)
+    }
+
+    /// Send a captured PNG to the model on a background thread (called from `render_now`
+    /// once the frame is grabbed). The image is a heavy egress; the key came from the env.
+    fn spawn_analyze(&self, pa: PendingAnalyze, png: Vec<u8>) {
+        use base64::Engine;
+        let image_base64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let proxy = self.proxy.clone();
+        let PendingAnalyze { gen, params } = pa;
+        std::thread::spawn(move || {
+            let req = sampa_ai::AnalyzeRequest {
+                image_base64: &image_base64,
+                media_type: "image/png",
+                prompt: "This is a screenshot of the Sampa terminal emulator's own UI. \
+Analyze it and list the visual/UX issues you find, each with a specific fix.",
+            };
+            let result = sampa_ai::analyze_over_network(&params, &req).map_err(|e| e.to_string());
+            let _ = proxy.send_event(UserEvent::AiAnalyzeReady { gen, result });
+        });
+    }
+
+    /// Deliver a background screenshot analysis, unless stale or the overlay closed.
+    fn ai_analyze_ready(&mut self, gen: u64, result: Result<String, String>) {
+        if !self.ai_on || gen != self.ai_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.ai_state = match result {
+            Ok(text) => AiState::Explanation { command: "screenshot".into(), text },
             Err(e) => AiState::Error(e),
         };
         self.request_redraw();
@@ -5820,8 +5911,26 @@ impl App {
             .enumerate()
             .map(|(pi, s)| PaneRender { snap: s, x: pi as f32 * (col_w + DIVIDER), w: col_w, focused: pi == fidx })
             .collect();
+        // Screenshot-analysis (spec-window-analysis): if a capture is armed, grab this
+        // frame to a PNG off the same GPU. Captured WITHOUT the AI card (it's showing
+        // "Analyzing…") so the shot is the terminal as it was. Taken out before the &mut
+        // self.gfx borrow so we can spawn the call (which touches self) afterwards.
+        let pending = self.pending_analyze.take();
+        let mut captured_png: Option<Vec<u8>> = None;
         if let Some(gfx) = &mut self.gfx {
             gfx.render(&pane_views, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), ai.as_ref(), du.as_ref(), preedit, bell);
+            if pending.is_some() {
+                captured_png = gfx.paint_to_png(&pane_views, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), du.as_ref(), preedit, bell);
+            }
+        }
+        if let Some(pa) = pending {
+            match captured_png {
+                Some(png) => self.spawn_analyze(pa, png),
+                None => {
+                    self.ai_state = AiState::Error("Could not capture the window.".into());
+                    self.request_redraw();
+                }
+            }
         }
         if bell {
             self.request_redraw();
@@ -7720,6 +7829,106 @@ impl Gfx {
             bell,
         );
         self.r.queue.present(frame);
+    }
+
+    /// Render the current frame to an offscreen texture at the window size and read it back
+    /// as PNG bytes (for the screenshot-analysis feature). Uses the same `paint` path as
+    /// `render`, minus the AI card, and the same COPY_SRC → mapped-buffer readback the CI
+    /// `capture` uses. Returns `None` on any GPU/encode failure. Self-contained — no
+    /// display-server capture, no extra process.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_to_png(
+        &mut self,
+        panes: &[PaneRender],
+        tabs: &[String],
+        active: usize,
+        search: Option<&str>,
+        palette: Option<&PaletteView>,
+        panel: Option<&PanelView>,
+        help: Option<&[(String, String)]>,
+        du: Option<&DuView>,
+        preedit: Option<(&str, usize, usize, usize)>,
+        bell: bool,
+    ) -> Option<Vec<u8>> {
+        let w = self.config.width.max(1);
+        let h = self.config.height.max(1);
+        let tex = self.r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("analyze-capture"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // Paint the terminal as-is (no AI card — it's showing "Analyzing…").
+        self.r.paint(
+            panes, &view, w, h, tabs, active, search, palette, panel, help, None, du, preedit,
+            bell,
+        );
+
+        let bpr = (w * 4).div_ceil(256) * 256; // 256-byte row alignment
+        let readback = self.r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("analyze-readback"),
+            size: (bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .r
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.r.queue.submit(std::iter::once(enc.finish()));
+
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        self.r
+            .device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .ok();
+        let data = readback.slice(..).get_mapped_range().ok()?;
+        // Surface format may be BGRA; PNG wants RGBA, so swap R/B when needed.
+        let bgra = matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            let start = (row * bpr) as usize;
+            let line = &data[start..start + (w * 4) as usize];
+            if bgra {
+                for px in line.chunks_exact(4) {
+                    pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                }
+            } else {
+                pixels.extend_from_slice(line);
+            }
+        }
+        drop(data);
+        readback.unmap();
+
+        let img = image::RgbaImage::from_raw(w, h, pixels)?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png).ok()?;
+        Some(png.into_inner())
     }
 }
 
