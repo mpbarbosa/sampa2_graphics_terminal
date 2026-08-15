@@ -2,7 +2,7 @@
 # Build a .deb for sampa2 from the release binary + assets (N3 — Linux citizen).
 # Self-contained: needs only `dpkg-deb` (no cargo-deb). Output: target/sampa2_<ver>_<arch>.deb
 #
-#   ./packaging/build-deb.sh            # builds release if needed, then packages
+#   ./packaging/build-deb.sh            # (re)builds release, verifies version, then packages
 #   sudo apt install ./target/sampa2_*.deb
 set -euo pipefail
 umask 022   # so staged dirs are 0755 / files 0644 (Debian policy)
@@ -13,11 +13,19 @@ BIN="$ROOT/target/release/sampa2"
 VERSION=$(grep -m1 '^version' "$ROOT/crates/sampa-native/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
 ARCH=$(dpkg --print-architecture)
 
-# Build the optimized binary if it's missing.
-if [ ! -x "$BIN" ]; then
-    echo "==> release binary missing; building"
-    (cd "$ROOT" && cargo build --release -p sampa-native)
+# Build the optimized binary. Always invoke cargo (incremental — a no-op when nothing has
+# changed) so a stale artifact from a previous version is never silently packaged. Then
+# verify the freshly built binary's own version matches Cargo.toml before staging, and abort
+# on any mismatch — the packaged binary and the control metadata must agree.
+echo "==> building release binary (v$VERSION)"
+(cd "$ROOT" && cargo build --release -p sampa-native)
+BIN_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}')
+if [ "$BIN_VERSION" != "$VERSION" ]; then
+    echo "error: built binary reports '$BIN_VERSION' but Cargo.toml is '$VERSION' —" >&2
+    echo "       refusing to package a mismatched binary." >&2
+    exit 1
 fi
+echo "==> binary version verified: $BIN_VERSION"
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
