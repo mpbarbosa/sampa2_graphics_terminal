@@ -5,6 +5,24 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.8.0] - 2026-08-15
+
+Escape-hardening for the two paths where the terminal reaches outside the sandbox — the
+system clipboard and the web browser — each now gated by an in-window consent modal. An
+OSC-52 clipboard write prompts before it lands (allow once / allow this session / deny), and
+Ctrl+clicking a hyperlink shows the real target before it opens (the visible OSC-8 text can
+differ from the URI), with a pointing-hand cursor on Ctrl+hover. Packaging also stops
+shipping stale binaries — `build-deb.sh` always rebuilds and verifies the version.
+
+### Features
+
+- Interactive OSC-52 clipboard consent modal (N5 escape hardening)
+- Hyperlink open-confirm modal + Ctrl+hover hand cursor (N5)
+
+### Bug Fixes
+
+- **packaging:** always rebuild + verify the binary version in build-deb.sh
+
 ## [0.7.0] - 2026-08-15
 
 The `df` disk-free gauge and `ping` latency chart land natively — completing the six
