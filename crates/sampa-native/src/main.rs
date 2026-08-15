@@ -59,7 +59,7 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 // --- Fixed metrics (N1: single monospace font) -------------------------------
 const FONT_SIZE: f32 = 15.0;
@@ -2114,6 +2114,8 @@ fn main() -> Result<()> {
         },
         osc52_session_allow: false,
         osc52_prompt: None,
+        link_confirm: None,
+        link_hover: false,
         title: win_title,
         class: wm_class,
         hold,
@@ -2465,6 +2467,8 @@ struct App {
     osc52_policy: Osc52Policy,
     osc52_session_allow: bool,        // set when the user picks "allow for this session"
     osc52_prompt: Option<String>,     // a pending OSC-52 write awaiting consent (the payload)
+    link_confirm: Option<String>,     // a hyperlink awaiting the open/cancel confirm modal
+    link_hover: bool,                 // cursor is over a link with Ctrl held (hand cursor shown)
     title: String,
     /// WM_CLASS / app id (`--class`, default `sampa2`).
     class: String,
@@ -2671,7 +2675,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 event_loop.exit();
             }
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                // Ctrl press/release toggles the link hover affordance without a mouse move.
+                self.update_link_hover();
+            }
             WindowEvent::Resized(size) => {
                 self.resize(size.width.max(1), size.height.max(1));
                 self.request_redraw();
@@ -2719,6 +2727,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // gates a clipboard write the user must explicitly allow or deny.
                 if self.osc52_prompt.is_some() {
                     self.osc52_key(&event.logical_key);
+                    return;
+                }
+                // The link-open confirm modal likewise gates opening a URL in the browser.
+                if self.link_confirm.is_some() {
+                    self.link_confirm_key(&event.logical_key);
                     return;
                 }
                 if self.help_on {
@@ -3512,6 +3525,9 @@ impl App {
         let moved = col != self.mouse_col || row != self.mouse_row;
         self.mouse_col = col;
         self.mouse_row = row;
+        if moved {
+            self.update_link_hover();
+        }
 
         // Shift forces local selection even when the app grabs the mouse.
         if !self.modifiers.shift_key() {
@@ -3538,15 +3554,15 @@ impl App {
         }
     }
 
-    /// Open an OSC-8 hyperlink under the given cell, if any and if its scheme is safe.
-    /// Explicit-action only (Ctrl+click); shows the target in the title, never auto-opens.
-    fn open_hyperlink_at(&mut self, col: usize, row: usize) -> bool {
+    /// The safe hyperlink target under a cell, if any: the OSC-8 URI first, else a plain URL
+    /// scanned from the row. Read-only (no `&mut self`) so hover can call it every move; the
+    /// scheme gate (§13 — http/https only, never `file:`/`javascript:`) is applied here.
+    fn link_uri_at(&self, col: usize, row: usize) -> Option<String> {
         let uri = match self.state.lock() {
             Ok(g) => {
                 let d = g.term.grid().display_offset() as i32;
                 let line = Line(row as i32 - d);
                 let grid = g.term.grid();
-                // OSC-8 hyperlink first; otherwise scan the row for a plain URL.
                 grid[line][Column(col)]
                     .hyperlink()
                     .map(|h| h.uri().to_string())
@@ -3558,15 +3574,52 @@ impl App {
             }
             Err(_) => None,
         };
-        match uri {
-            Some(uri) if is_safe_url(&uri) => {
-                if let Some(w) = &self.window {
-                    w.set_title(&format!("↗ {}", sanitize_title(&uri)));
-                }
-                let _ = std::process::Command::new("xdg-open").arg(&uri).spawn();
+        uri.filter(|u| is_safe_url(u))
+    }
+
+    /// Ctrl+click on a hyperlink: instead of opening straight away, raise a **confirm modal**
+    /// showing the real target (the visible OSC-8 text can differ from the URI — §13). Returns
+    /// true when a link was found (so the click is consumed).
+    fn confirm_hyperlink_at(&mut self, col: usize, row: usize) -> bool {
+        match self.link_uri_at(col, row) {
+            Some(uri) => {
+                self.link_confirm = Some(uri);
+                self.request_redraw();
                 true
             }
-            _ => false,
+            None => false,
+        }
+    }
+
+    /// Key handling for the link-open confirm modal: Enter/`o`/`y` opens the target via
+    /// `xdg-open`, Esc/`n` cancels. Either way the modal closes.
+    fn link_confirm_key(&mut self, key: &Key) {
+        let open = match key {
+            Key::Named(NamedKey::Enter) => true,
+            Key::Named(NamedKey::Escape) => false,
+            Key::Character(c) if c.eq_ignore_ascii_case("o") || c.eq_ignore_ascii_case("y") => true,
+            Key::Character(c) if c.eq_ignore_ascii_case("n") => false,
+            _ => return,
+        };
+        if let Some(uri) = self.link_confirm.take() {
+            if open && is_safe_url(&uri) {
+                let _ = std::process::Command::new("xdg-open").arg(&uri).spawn();
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Hover affordance: when Ctrl is held over a safe link, show a pointing-hand cursor so it
+    /// reads as clickable; otherwise the default cursor. Cheap — only locks the grid while
+    /// Ctrl is down, and only calls `set_cursor` when the state actually flips.
+    fn update_link_hover(&mut self) {
+        let over = self.modifiers.control_key()
+            && self.link_uri_at(self.mouse_col, self.mouse_row).is_some();
+        if over != self.link_hover {
+            self.link_hover = over;
+            if let Some(w) = &self.window {
+                w.set_cursor(if over { CursorIcon::Pointer } else { CursorIcon::Default });
+            }
         }
     }
 
@@ -3602,10 +3655,10 @@ impl App {
             self.switch_to(tab_at_px(self.mouse_px, w, self.sessions.len()));
             return;
         }
-        // Ctrl+click opens a hyperlink under the cursor (explicit action, §13).
+        // Ctrl+click a hyperlink → confirm modal (explicit action, §13), never auto-opens.
         if button == MouseButton::Left && pressed && self.modifiers.control_key() {
             let (col, row) = (self.mouse_col, self.mouse_row);
-            if self.open_hyperlink_at(col, row) {
+            if self.confirm_hyperlink_at(col, row) {
                 return;
             }
         }
@@ -6238,6 +6291,25 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                 (preview, accent, false, false),
                 (
                     "\n\nEnter / y  allow once  ·  a  allow this session  ·  Esc / n  deny".to_string(),
+                    muted,
+                    false,
+                    false,
+                ),
+            ];
+            Some(AiCard { title: &ai_title, body_spans: &ai_body_spans })
+        } else if let Some(uri) = &self.link_confirm {
+            // Link-open confirm modal: shows the real target before opening (the visible
+            // OSC-8 text can differ from the URI). Reuses the centered-card path.
+            let fg = self.theme.fg;
+            let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+            let accent = self.theme.cursor;
+            ai_title = "Open link?".to_string();
+            ai_body_spans = vec![
+                ("This will open in your browser:".to_string(), fg, false, false),
+                ("\n\n".to_string(), muted, false, false),
+                (uri.clone(), accent, false, true),
+                (
+                    "\n\nEnter / o  open  ·  Esc / n  cancel".to_string(),
                     muted,
                     false,
                     false,

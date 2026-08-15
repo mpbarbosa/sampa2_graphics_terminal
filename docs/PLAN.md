@@ -293,12 +293,16 @@ refuses writes (file provably untouched) and clears on Enter.
   (control parse, raw RGBA/RGB, action gate + ack, chunk reassembly) + a pump smoke + a
   **chunked-PNG `--capture` render**. ⬜ still: image ids/placement (`a=t`/`a=p`),
   deletion (`a=d`), z-index/placement geometry.
-- 🔨 **OSC 8 hyperlinks:** ✅ OSC-8 tracked (via `alacritty_terminal`), rendered
-  **underlined**, **Ctrl+click-to-open** with the target shown in the title and a strict
-  **http/https scheme gate** (§13 — never `file:`/`javascript:`); auto-opens nothing.
-  ✅ **plain-URL detection** too (`url_at`: whitespace token under the cursor → extract
-  http/https, trim punctuation) so links work without OSC-8. 3 unit tests + PNG.
-  ⬜ still: an in-window confirm/preview overlay (vs. title), hover affordance.
+- ✅ **OSC 8 hyperlinks:** OSC-8 tracked (via `alacritty_terminal`), rendered
+  **underlined**, with a strict **http/https scheme gate** (§13 — never `file:`/`javascript:`);
+  auto-opens nothing. ✅ **plain-URL detection** too (`url_at`: whitespace token under the
+  cursor → extract http/https, trim punctuation) so links work without OSC-8. ✅ **in-window
+  confirm/preview modal** — Ctrl+click raises a centered card showing the **real target**
+  (the visible OSC-8 text can differ from the URI) resolved by **Enter/`o`** (open via
+  `xdg-open`) or **Esc/`n`** (cancel), replacing the old open-and-retitle. ✅ **hover
+  affordance** — Ctrl+hover over a safe link shows a **pointing-hand cursor** (recomputed on
+  move and on Ctrl press/release; only touches the grid lock while Ctrl is down). 3 unit
+  tests + PNG; confirm modal + no-auto-open Xephyr-verified.
 - 🔨 **IME / dead keys / compose:** IME is enabled (`set_ime_allowed`) and winit's `Ime`
   events are wired — **Preedit** is stored and drawn **underlined at the cursor** (a
   cursor-tinted strip + accent underline; CJK renders via `cosmic-text` fallback),
