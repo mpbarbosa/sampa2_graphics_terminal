@@ -180,3 +180,10 @@ does.
 Everything from §3 (secret handling), §5 (opt-in, local-model escape hatch), and §6
 (credential wiring) applies unchanged — this is the same one network surface, used in a new
 direction, not a second one.
+
+- **Native (Path C) — implemented.** `Ctrl+Shift+X` (`keybindings.explain`) reads the current
+  command line via `grid_command_line` (the native command source the man panel/preview use),
+  calls `sampa_ai::explain_over_network` on a background thread with `ExplainRequest { command,
+  os, shell }`, and renders the reply in the shared AI card as a new read-only `Explanation`
+  state (command + prose, `c` copies, `Esc` closes — no insert). Same gates as the suggester:
+  inert unless `[ai] enabled`, key from `ANTHROPIC_API_KEY`, superseded by the `ai_gen` token.

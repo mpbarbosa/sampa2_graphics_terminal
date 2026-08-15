@@ -108,6 +108,7 @@ enum Action {
     EnhancePs,
     EnhancePsInplace,
     Ai,
+    Explain,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -133,6 +134,7 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     (Action::EnhancePs, "enhance_ps", "Enhance ps output (or cd tree picker)", "Ctrl+Shift+D"),
     (Action::EnhancePsInplace, "enhance_ps_inplace", "Toggle in-place ps colouring", "Ctrl+Shift+I"),
     (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
+    (Action::Explain, "explain", "Explain the command line", "Ctrl+Shift+X"),
     (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
     (Action::ZoomOut, "zoom_out", "Zoom out", "Ctrl+Minus"),
     (Action::ZoomReset, "zoom_reset", "Reset zoom", "Ctrl+0"),
@@ -1648,6 +1650,8 @@ enum UserEvent {
     PreviewReady { gen: u64, line: String, ran: bool, text: String },
     /// A background AI command-suggestion call finished; `gen` drops stale replies.
     AiReady { gen: u64, result: Result<sampa_ai::Suggestion, String> },
+    /// A background AI command-explanation call finished; `gen` drops stale replies.
+    AiExplainReady { gen: u64, command: String, result: Result<String, String> },
     /// An AccessKit adapter event (tree request / action / deactivation).
     AccessKit(accesskit_winit::Event),
 }
@@ -1661,6 +1665,9 @@ enum AiState {
     Pending,
     /// A suggestion came back; Enter inserts `command` at the prompt.
     Result { command: String, explanation: String },
+    /// A command explanation came back (read-only — nothing to insert or run). `c` copies
+    /// the explanation; Esc closes.
+    Explanation { command: String, text: String },
     /// The call was gated off, missing a key, or failed. Enter returns to Editing.
     Error(String),
 }
@@ -2266,6 +2273,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ManReady { cmd, lines } => self.man_ready(cmd, lines),
             UserEvent::PreviewReady { gen, line, ran, text } => self.preview_ready(gen, line, ran, text),
             UserEvent::AiReady { gen, result } => self.ai_ready(gen, result),
+            UserEvent::AiExplainReady { gen, command, result } => {
+                self.ai_explain_ready(gen, command, result)
+            }
             UserEvent::AccessKit(e) => {
                 // A screen reader attached / requested the tree — push the current one.
                 if matches!(e.window_event, accesskit_winit::WindowEvent::InitialTreeRequested) {
@@ -3384,6 +3394,7 @@ impl App {
                 self.request_redraw();
             }
             Action::Ai => self.ai_open(),
+            Action::Explain => self.explain_open(),
             Action::ZoomIn => self.zoom_by(1.0),
             Action::ZoomOut => self.zoom_by(-1.0),
             Action::ZoomReset => self.zoom_reset(),
@@ -3721,6 +3732,7 @@ impl App {
                     self.scroll(Scroll::Bottom);
                     self.ai_close();
                 }
+                AiState::Explanation { .. } => self.ai_close(), // read-only — nothing to insert
                 AiState::Pending => {} // in flight — ignore
                 _ => self.ai_submit(),
             },
@@ -3729,12 +3741,16 @@ impl App {
                 self.request_redraw();
             }
             _ => {
-                // In the result state, 'c' copies the suggested command to the clipboard.
-                if let AiState::Result { command, .. } = &self.ai_state {
-                    if text == Some("c") {
-                        let cmd = command.clone();
+                // 'c' copies: the suggested command (Result) or the explanation (Explanation).
+                let copy = match &self.ai_state {
+                    AiState::Result { command, .. } => Some(command.clone()),
+                    AiState::Explanation { text, .. } => Some(text.clone()),
+                    _ => None,
+                };
+                if text == Some("c") {
+                    if let Some(t) = copy {
                         if let Some(clip) = self.clipboard.as_mut() {
-                            let _ = clip.set_text(cmd);
+                            let _ = clip.set_text(t);
                         }
                         return;
                     }
@@ -3826,6 +3842,73 @@ impl App {
         }
         self.ai_state = match result {
             Ok(s) => AiState::Result { command: s.command, explanation: s.explanation },
+            Err(e) => AiState::Error(e),
+        };
+        self.request_redraw();
+    }
+
+    /// Explain the current command line via the AI overlay (spec-ai-explain §7): reads the
+    /// typed command, asks the model to describe it, and shows the answer in the AI card.
+    /// Read-only — the command is only *described*, never inserted or run.
+    fn explain_open(&mut self) {
+        // Reuse the AI card; open it and report gating errors there.
+        self.ai_on = true;
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+
+        let command = self.grid_command_line().trim().to_string();
+        if command.is_empty() {
+            self.ai_state = AiState::Error("Type a command, then press the key to explain it.".into());
+            self.request_redraw();
+            return;
+        }
+        let cfg = load_config();
+        if !cfg.ai.enabled {
+            self.ai_state =
+                AiState::Error("AI is off — set [ai] enabled = true in config.toml.".into());
+            self.request_redraw();
+            return;
+        }
+        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                self.ai_state =
+                    AiState::Error("Set ANTHROPIC_API_KEY in your shell and relaunch Sampa.".into());
+                self.request_redraw();
+                return;
+            }
+        };
+        let shell = std::env::var("SHELL")
+            .ok()
+            .and_then(|s| s.rsplit('/').next().map(str::to_string))
+            .unwrap_or_else(|| "sh".into());
+        let gen = self.ai_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.ai_query = command.clone();
+        self.ai_state = AiState::Pending;
+        self.request_redraw();
+        let proxy = self.proxy.clone();
+        let params = sampa_ai::Params {
+            model: cfg.ai.model,
+            endpoint: cfg.ai.endpoint,
+            api_key,
+            max_tokens: 2048,
+        };
+        std::thread::spawn(move || {
+            let req = sampa_ai::ExplainRequest { command: &command, os: std::env::consts::OS, shell: &shell };
+            let result = sampa_ai::explain_over_network(&params, &req).map_err(|e| e.to_string());
+            let _ = proxy.send_event(UserEvent::AiExplainReady { gen, command, result });
+        });
+    }
+
+    /// Deliver a background explanation, unless it's stale (gen bumped) or the overlay closed.
+    fn ai_explain_ready(&mut self, gen: u64, command: String, result: Result<String, String>) {
+        if !self.ai_on || gen != self.ai_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.ai_state = match result {
+            Ok(text) => AiState::Explanation { command, text },
             Err(e) => AiState::Error(e),
         };
         self.request_redraw();
@@ -5034,6 +5117,13 @@ impl App {
                         "\n\nEnter inserts it at the prompt (never runs it) · c copies · Esc".into(),
                         muted, false, false,
                     ));
+                }
+                AiState::Explanation { command, text } => {
+                    ai_title = "Explain".to_string();
+                    spans.push(("$ ".into(), muted, false, false));
+                    spans.push((command.clone(), accent, true, false));
+                    spans.push((format!("\n\n{text}"), fg, false, false));
+                    spans.push(("\n\nc copies · Esc closes".into(), muted, false, false));
                 }
                 AiState::Error(e) => {
                     ai_title = "Ask AI — error".to_string();
