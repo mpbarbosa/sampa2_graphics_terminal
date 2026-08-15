@@ -1,11 +1,12 @@
 # Spec — `du` disk-usage treemap
 
-- **Status (this native/Path C build):** the headless **`sampa-dumap` core is available** —
-  wired in as a git-pinned dependency of `sampa-native` (per ADR 0002). The feature ships
-  end-to-end in the `sampa_graphics_terminal` reference (Tauri) build (`crates/dumap`, the
-  `run_du` bridge, the `#dumap` overlay); the **native treemap UI (squarify + zoom) that
-  consumes the parsed tree is Path C's follow-up**. Mirrored here as the behavioral
-  contract; the file/keybinding references describe the reference build.
+- **Status (this native/Path C build):** **implemented.** Typed `du` + `Ctrl+Shift+D`
+  scans the session cwd with a read-only, 6s-timeout-bounded `du -k -x --max-depth=4` on a
+  background thread (`run_du`), parses it with `sampa_dumap::parse_du`, and draws a
+  **squarified treemap** (native `squarify`) as coloured, labelled quads over the grid — a
+  breadcrumb strip on top, click-to-zoom, `Backspace` up a level, `Enter` composes `cd
+  <path>` at the prompt (insert-never-run), `Esc` closes. The keybinding is the native ps
+  chord (`Ctrl+Shift+D`), dispatched on the typed command like the `cd` picker.
 - **Applies to:** visualising the current directory's disk usage as a treemap, opened from
   the keyboard. Language-agnostic behavioral contract so any frontend (webview or native
   Rust) behaves identically.

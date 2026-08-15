@@ -44,6 +44,7 @@ use glyphon::{
 };
 use pty_core::pty::{spawn, PtyEvent, PtyHandle, SpawnConfig};
 use sampa_config::CursorStyle;
+use sampa_dumap::{parse_du, DuNode};
 use sampa_fsnav::{list_subdirs, relativize, Dir};
 use sampa_ps_decorate::{
     decorate_scrollback, group_rows, header_kind, parse_enrich, resolve_level, Group, GroupView,
@@ -432,6 +433,166 @@ struct CdNode {
     expanded: bool,
 }
 
+/// One laid-out cell of the `du` disk-usage treemap (spec-du-treemap.md §4): a pixel
+/// rectangle sized so its area is proportional to `size_kb`. `child` indexes the current
+/// view node's children (`None` = the "(files here)" remainder box, which isn't zoomable).
+#[derive(Clone)]
+struct DuBox {
+    rect: [f32; 4], // x, y, w, h in physical pixels
+    name: String,
+    size_kb: u64,
+    child: Option<usize>,
+}
+
+/// Format a `du -k` size (KiB) as a human string: `K`/`M`/`G`/`T`, one decimal.
+fn fmt_kib(kb: u64) -> String {
+    const M: f64 = 1024.0;
+    const G: f64 = 1024.0 * 1024.0;
+    const T: f64 = 1024.0 * 1024.0 * 1024.0;
+    let k = kb as f64;
+    if k >= T {
+        format!("{:.1}T", k / T)
+    } else if k >= G {
+        format!("{:.1}G", k / G)
+    } else if k >= M {
+        format!("{:.1}M", k / M)
+    } else {
+        format!("{kb}K")
+    }
+}
+
+/// Treemap box fill colours (spec-du-treemap.md §4) — cycled by index; harmonious but
+/// distinct so adjacent boxes read apart.
+const DU_PALETTE: &[[u8; 3]] = &[
+    [0x5b, 0x8a, 0xa6], [0x8a, 0xa6, 0x5b], [0xc0, 0x9b, 0x54], [0xa6, 0x5b, 0x8a],
+    [0x5b, 0xa6, 0x93], [0xa6, 0x7d, 0x5b], [0x7d, 0x5b, 0xa6], [0x5b, 0x6f, 0xa6],
+];
+
+/// Run a **read-only, timeout-bounded** `du -k -x --max-depth=4 <cwd>` off the caller's
+/// thread and parse it into a tree (spec-du-treemap.md §3). A reader thread drains stdout so
+/// the pipe never fills; if the scan overruns 6s the child is killed and an error returned.
+fn run_du(cwd: &str) -> Result<DuNode, String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("du")
+        .args(["-k", "-x", "--max-depth=4", cwd])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("du couldn't start: {e}"))?;
+    let stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut o) = stdout {
+            let _ = o.read_to_string(&mut s);
+        }
+        let _ = tx.send(s);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok(text) => {
+            let _ = child.wait();
+            parse_du(&text).ok_or_else(|| "Nothing to show (empty or unreadable directory).".to_string())
+        }
+        Err(_) => {
+            let _ = child.kill();
+            Err("du timed out after 6s — the directory is very large.".to_string())
+        }
+    }
+}
+
+/// Squarified treemap layout (Bruls, Huizing & van Wijk): lay `weights` (descending) into
+/// `rect` [x,y,w,h] so each area ∝ weight and boxes stay near square. Returns one rect per
+/// weight, in input order.
+fn squarify(weights: &[u64], rect: [f32; 4]) -> Vec<[f32; 4]> {
+    let n = weights.len();
+    let mut out = vec![[rect[0], rect[1], 0.0, 0.0]; n];
+    let total: u64 = weights.iter().sum();
+    if total == 0 || n == 0 {
+        return out;
+    }
+    let full_area = (rect[2] as f64) * (rect[3] as f64);
+    // Each weight's target pixel area.
+    let areas: Vec<f64> = weights.iter().map(|&w| w as f64 / total as f64 * full_area).collect();
+
+    // "Worst" aspect ratio of a row of `areas` laid along a strip of side `side`.
+    let worst = |row: &[(usize, f64)], side: f64| -> f64 {
+        if row.is_empty() || side <= 0.0 {
+            return f64::INFINITY;
+        }
+        let s: f64 = row.iter().map(|&(_, a)| a).sum();
+        let (mn, mx) = row.iter().fold((f64::INFINITY, 0.0_f64), |(mn, mx), &(_, a)| {
+            (mn.min(a), mx.max(a))
+        });
+        let s2 = s * s;
+        let side2 = side * side;
+        (side2 * mx / s2).max(s2 / (side2 * mn))
+    };
+
+    let (mut x, mut y, mut w, mut h) = (rect[0] as f64, rect[1] as f64, rect[2] as f64, rect[3] as f64);
+    let mut i = 0;
+    let mut row: Vec<(usize, f64)> = Vec::new();
+    while i < n {
+        let side = w.min(h);
+        let cand = areas[i];
+        let with = {
+            let mut r = row.clone();
+            r.push((i, cand));
+            worst(&r, side)
+        };
+        if row.is_empty() || with <= worst(&row, side) {
+            row.push((i, cand));
+            i += 1;
+        } else {
+            // Commit the row along the shorter side, then shrink the free rect.
+            let row_sum: f64 = row.iter().map(|&(_, a)| a).sum();
+            if w <= h {
+                let rh = row_sum / w; // row occupies full width, this height
+                let mut cx = x;
+                for &(idx, a) in &row {
+                    let cw = a / rh;
+                    out[idx] = [cx as f32, y as f32, cw as f32, rh as f32];
+                    cx += cw;
+                }
+                y += rh;
+                h -= rh;
+            } else {
+                let rw = row_sum / h;
+                let mut cy = y;
+                for &(idx, a) in &row {
+                    let ch = a / rw;
+                    out[idx] = [x as f32, cy as f32, rw as f32, ch as f32];
+                    cy += ch;
+                }
+                x += rw;
+                w -= rw;
+            }
+            row.clear();
+        }
+    }
+    // Flush the final row.
+    if !row.is_empty() {
+        let row_sum: f64 = row.iter().map(|&(_, a)| a).sum();
+        if w <= h {
+            let rh = if w > 0.0 { row_sum / w } else { 0.0 };
+            let mut cx = x;
+            for &(idx, a) in &row {
+                let cw = if rh > 0.0 { a / rh } else { 0.0 };
+                out[idx] = [cx as f32, y as f32, cw as f32, rh as f32];
+                cx += cw;
+            }
+        } else {
+            let rw = if h > 0.0 { row_sum / h } else { 0.0 };
+            let mut cy = y;
+            for &(idx, a) in &row {
+                let ch = if rw > 0.0 { a / rw } else { 0.0 };
+                out[idx] = [x as f32, cy as f32, rw as f32, ch as f32];
+                cy += ch;
+            }
+        }
+    }
+    out
+}
+
 /// Display name for a provenance [`Group`] (spec §6 order).
 fn group_name(g: Group) -> &'static str {
     match g {
@@ -450,6 +611,15 @@ fn group_name(g: Group) -> &'static str {
 struct AiCard<'a> {
     title: &'a str,
     body_spans: &'a [BodySpan],
+}
+
+/// The `du` disk-usage treemap overlay for one frame (spec-du-treemap.md): the laid-out
+/// boxes to draw, a breadcrumb/status title, and an optional centered message shown
+/// instead of the boxes (scanning / timeout / empty).
+struct DuView<'a> {
+    boxes: &'a [DuBox],
+    title: &'a str,
+    msg: Option<&'a str>,
 }
 
 /// Side effects the VT engine raises during parsing, forwarded from the parser
@@ -1652,6 +1822,8 @@ enum UserEvent {
     AiReady { gen: u64, result: Result<sampa_ai::Suggestion, String> },
     /// A background AI command-explanation call finished; `gen` drops stale replies.
     AiExplainReady { gen: u64, command: String, result: Result<String, String> },
+    /// A background `du` scan finished (or failed/timed out); `gen` drops stale replies.
+    DuReady { gen: u64, result: Result<DuNode, String> },
     /// An AccessKit adapter event (tree request / action / deactivation).
     AccessKit(accesskit_winit::Event),
 }
@@ -1858,6 +2030,12 @@ fn main() -> Result<()> {
         cd_root: String::new(),
         cd_nodes: Vec::new(),
         cd_sel: 0,
+        du_on: false,
+        du_root: None,
+        du_zoom: Vec::new(),
+        du_boxes: Vec::new(),
+        du_msg: None,
+        du_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2203,6 +2381,13 @@ struct App {
     cd_root: String,       // the tree root (session cwd)
     cd_nodes: Vec<CdNode>, // flat visible list; collapsed subtrees are removed
     cd_sel: usize,
+    // du disk-usage treemap (spec-du-treemap.md), also overloaded on the ps chord.
+    du_on: bool,
+    du_root: Option<DuNode>, // the parsed tree (None while scanning / on failure)
+    du_zoom: Vec<usize>,     // child indices from the root to the current view node
+    du_boxes: Vec<DuBox>,    // laid-out cells of the current view (for drawing + click hit-test)
+    du_msg: Option<String>,  // status line: "scanning…", a timeout, or "empty"
+    du_gen: std::sync::Arc<std::sync::atomic::AtomicU64>, // supersede token for the async scan
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -2276,6 +2461,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AiExplainReady { gen, command, result } => {
                 self.ai_explain_ready(gen, command, result)
             }
+            UserEvent::DuReady { gen, result } => self.du_ready(gen, result),
             UserEvent::AccessKit(e) => {
                 // A screen reader attached / requested the tree — push the current one.
                 if matches!(e.window_event, accesskit_winit::WindowEvent::InitialTreeRequested) {
@@ -2377,6 +2563,14 @@ impl ApplicationHandler<UserEvent> for App {
                         self.cd_close();
                     } else {
                         self.cd_key(&event.logical_key);
+                    }
+                    return;
+                }
+                if self.du_on {
+                    if action == Some(Action::EnhancePs) {
+                        self.du_close();
+                    } else {
+                        self.du_key(&event.logical_key);
                     }
                     return;
                 }
@@ -3191,6 +3385,11 @@ impl App {
             self.request_redraw();
             return;
         }
+        // While the du treemap is open, a left-click zooms into the clicked box.
+        if self.du_on && button == MouseButton::Left && pressed {
+            self.du_click(self.mouse_px as f32, self.mouse_py as f32);
+            return;
+        }
         // A click in the visual tab bar switches tabs (never reaches the grid).
         if button == MouseButton::Left
             && pressed
@@ -3381,12 +3580,12 @@ impl App {
             Action::ToggleMan => self.man_open(),
             Action::TogglePreview => self.preview_toggle(),
             Action::EnhancePs => {
-                // Overloaded (spec-cd-tree-picker.md §2): a typed `cd` opens the directory
-                // tree picker; anything else runs the ps decorator.
-                if first_command_token(&self.grid_command_line()) == "cd" {
-                    self.cd_open();
-                } else {
-                    self.ps_open();
+                // Overloaded on the typed command (spec §2): `cd` → tree picker, `du` →
+                // disk-usage treemap, anything else → the ps decorator.
+                match first_command_token(&self.grid_command_line()) {
+                    "cd" => self.cd_open(),
+                    "du" => self.du_open(),
+                    _ => self.ps_open(),
                 }
             }
             Action::EnhancePsInplace => {
@@ -4801,6 +5000,162 @@ impl App {
         (title, body, spans)
     }
 
+    /// Open the `du` disk-usage treemap (spec-du-treemap.md): scan the session cwd with a
+    /// read-only, timeout-bounded `du` on a background thread, then render the parsed tree
+    /// as a squarified treemap. Read-only; the one side effect it offers is composing a
+    /// `cd` at the prompt (never run).
+    fn du_open(&mut self) {
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+        self.du_on = true;
+        self.du_root = None;
+        self.du_zoom.clear();
+        self.du_boxes.clear();
+
+        let Some(cwd) = self.session_cwd() else {
+            self.du_msg = Some("Can't determine the current directory.".into());
+            self.request_redraw();
+            return;
+        };
+        self.du_msg = Some(format!("scanning {cwd} …"));
+        self.request_redraw();
+        let gen = self.du_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = run_du(&cwd);
+            let _ = proxy.send_event(UserEvent::DuReady { gen, result });
+        });
+    }
+
+    fn du_close(&mut self) {
+        self.du_on = false;
+        self.du_root = None;
+        self.du_zoom.clear();
+        self.du_boxes.clear();
+        self.du_msg = None;
+        self.request_redraw();
+    }
+
+    /// Deliver a background `du` result, unless stale (gen bumped) or the overlay closed.
+    fn du_ready(&mut self, gen: u64, result: Result<DuNode, String>) {
+        if !self.du_on || gen != self.du_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        match result {
+            Ok(root) => {
+                self.du_root = Some(root);
+                self.du_zoom.clear();
+                self.du_msg = None;
+            }
+            Err(e) => {
+                self.du_root = None;
+                self.du_msg = Some(e);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// The directory currently in view (root navigated by the `du_zoom` index path).
+    fn du_view(&self) -> Option<&DuNode> {
+        let mut node = self.du_root.as_ref()?;
+        for &i in &self.du_zoom {
+            node = node.children.get(i)?;
+        }
+        Some(node)
+    }
+
+    /// Recompute the treemap cells for the current view into the overlay rectangle. Called
+    /// each frame the overlay is drawn, so it tracks window resizes and zoom changes.
+    fn du_relayout(&mut self, area: [f32; 4]) {
+        self.du_boxes.clear();
+        // Snapshot the view's children (name, size) and total, then drop the borrow so the
+        // boxes can be pushed into `self`.
+        let (children, view_size): (Vec<(String, u64)>, u64) = match self.du_view() {
+            Some(v) => (v.children.iter().map(|c| (c.name.clone(), c.size_kb)).collect(), v.size_kb),
+            None => return,
+        };
+        let child_sum: u64 = children.iter().map(|(_, s)| s).sum();
+        // Weights: each child (largest-first), then a "(files here)" remainder for the bytes
+        // in this directory itself, so the boxes sum to the whole (spec §4).
+        let mut weights: Vec<u64> = children.iter().map(|(_, s)| *s).collect();
+        let remainder = view_size.saturating_sub(child_sum);
+        if remainder > 0 && !children.is_empty() {
+            weights.push(remainder);
+        }
+        let rects = squarify(&weights, area);
+        for (i, r) in rects.iter().enumerate() {
+            let (name, size_kb, child) = if i < children.len() {
+                (children[i].0.clone(), children[i].1, Some(i))
+            } else {
+                ("(files here)".to_string(), remainder, None)
+            };
+            self.du_boxes.push(DuBox { rect: *r, name, size_kb, child });
+        }
+    }
+
+    fn du_key(&mut self, key: &Key) {
+        match key {
+            Key::Named(NamedKey::Escape) => self.du_close(),
+            Key::Named(NamedKey::Backspace) => {
+                if self.du_zoom.pop().is_some() {
+                    self.request_redraw();
+                } else {
+                    self.du_close();
+                }
+            }
+            Key::Named(NamedKey::Enter) => self.du_cd(),
+            _ => {}
+        }
+    }
+
+    /// A left-click while the treemap is open: zoom into the clicked box if it's a
+    /// directory with children (spec §5).
+    fn du_click(&mut self, x: f32, y: f32) {
+        if let Some(b) = self.du_boxes.iter().find(|b| {
+            x >= b.rect[0] && x < b.rect[0] + b.rect[2] && y >= b.rect[1] && y < b.rect[1] + b.rect[3]
+        }) {
+            if let Some(ci) = b.child {
+                let has_children = self
+                    .du_view()
+                    .and_then(|v| v.children.get(ci))
+                    .is_some_and(|c| !c.children.is_empty());
+                if has_children {
+                    self.du_zoom.push(ci);
+                    self.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// `Enter` — compose `cd <path>` for the directory in view (spec §5, insert-never-run):
+    /// relativised to the scan root, shell-quoted, with the typed line cleared first.
+    fn du_cd(&mut self) {
+        let (root, path) = match (self.du_root.as_ref(), self.du_view()) {
+            (Some(r), Some(v)) => (r.path.clone(), v.path.clone()),
+            _ => return,
+        };
+        let arg = shell_quote(&relativize(&root, &path));
+        self.pty_write(b"\x05\x15"); // clear the input line (see cd_choose)
+        self.pty_write(format!("cd {arg} ").as_bytes());
+        self.scroll(Scroll::Bottom);
+        self.du_close();
+    }
+
+    /// The breadcrumb / status strip above the treemap: the current path, its total size,
+    /// and the key hints (or just "du" while a message is showing instead of boxes).
+    fn du_title(&self) -> String {
+        match self.du_view() {
+            Some(v) if self.du_msg.is_none() => format!(
+                "du · {} · {}   ·  click zoom · Backspace up · Enter cd here · Esc",
+                v.path,
+                fmt_kib(v.size_kb),
+            ),
+            _ => "du".to_string(),
+        }
+    }
+
     /// Toggle the live command-preview panel; enabling it previews the current line.
     fn preview_toggle(&mut self) {
         self.preview_on = !self.preview_on;
@@ -5040,6 +5395,34 @@ impl App {
         };
         self.apply_ps_inplace(&mut snap);
         self.apply_search_highlight(&mut snap);
+        // Treemap relayout up front (it borrows `self` mutably), cloned into owned locals so
+        // the later view builders — palette/ai/panel, which borrow `self` — don't collide.
+        let du_boxes_local: Vec<DuBox>;
+        let du_title_local: String;
+        let du_msg_local: Option<String>;
+        if self.du_on {
+            let (win_w, win_h) = self
+                .window
+                .as_ref()
+                .map(|w| (w.inner_size().width as f32, w.inner_size().height as f32))
+                .unwrap_or((0.0, 0.0));
+            let top = top_offset(self.sessions.len());
+            let lh = self.cell_metrics().1;
+            let area = [
+                PAD,
+                top + PAD + lh, // leave a row at the top for the breadcrumb strip
+                (win_w - 2.0 * PAD).max(1.0),
+                (win_h - top - 2.0 * PAD - lh).max(1.0),
+            ];
+            self.du_relayout(area);
+            du_boxes_local = self.du_boxes.clone();
+            du_title_local = self.du_title();
+            du_msg_local = self.du_msg.clone();
+        } else {
+            du_boxes_local = Vec::new();
+            du_title_local = String::new();
+            du_msg_local = None;
+        }
         if !self.dumped && std::env::var_os("SAMPA_DUMP_GRID").is_some() {
             let text = snap.to_text();
             if text.contains("SEAM_OK") {
@@ -5205,11 +5588,15 @@ impl App {
             let (x, y) = (PAD + c as f32 * cw, top + r as f32 * lh);
             w.set_ime_cursor_area(PhysicalPosition::new(x, y), PhysicalSize::new(cw * 8.0, lh));
         }
+        // Build the treemap view from the owned locals computed at the top (no `self` borrow).
+        let du = self
+            .du_on
+            .then(|| DuView { boxes: &du_boxes_local, title: &du_title_local, msg: du_msg_local.as_deref() });
         // Visual bell: flash a border while `bell_until` is in the future, re-drawing
         // until it lapses (then one final frame clears it).
         let bell = self.bell_until.is_some_and(|t| std::time::Instant::now() < t);
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), ai.as_ref(), preedit, bell);
+            gfx.render(&snap, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), ai.as_ref(), du.as_ref(), preedit, bell);
         }
         if bell {
             self.request_redraw();
@@ -5748,6 +6135,8 @@ struct Renderer {
     panel_body_buffer: Buffer,  // bottom-panel body (multi-line)
     help_buffer: Buffer,        // keyboard-shortcut help overlay (title + rows)
     preedit_buffer: Buffer,     // IME preedit (composition) text
+    du_title_buffer: Buffer,    // du treemap breadcrumb / status strip
+    du_buffers: Vec<Buffer>,    // one per treemap box label, grown lazily
     quad_pipeline: wgpu::RenderPipeline,
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
@@ -5798,6 +6187,7 @@ impl Renderer {
         let panel_body_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let help_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let preedit_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+        let du_title_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quad"),
@@ -5960,6 +6350,8 @@ impl Renderer {
             panel_body_buffer,
             help_buffer,
             preedit_buffer,
+            du_title_buffer,
+            du_buffers: Vec::new(),
             quad_pipeline,
             quad_uniform,
             quad_bind_group,
@@ -6069,6 +6461,8 @@ impl Renderer {
         self.panel_body_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.help_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.preedit_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.du_title_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.du_buffers.clear();
         // Overlay row buffers carry the old line height — drop so they're rebuilt.
         self.tab_buffers.clear();
         self.palette_buffers.clear();
@@ -6220,8 +6614,66 @@ impl Renderer {
         }
     }
 
+    /// Shape the treemap's breadcrumb strip and per-box labels (name + size) into reusable
+    /// buffers, returning `(buffer index, left, top, clip-bounds)` for each labelled box —
+    /// only boxes large enough to read get a label. During a message (scanning/timeout) the
+    /// strip shows the message and no boxes are labelled.
+    fn shape_du(&mut self, du: &DuView, w: u32, top: f32) -> Vec<(usize, f32, f32, TextBounds)> {
+        let fam = family_of(&self.font_family);
+        let fg = self.theme.fg;
+        // Breadcrumb / status strip.
+        let strip = du.msg.unwrap_or(du.title);
+        self.du_title_buffer.set_size(Some(w as f32 - 2.0 * PAD), Some(self.line_h));
+        self.du_title_buffer.set_rich_text(
+            [(strip, Attrs::new().family(fam).color(Color::rgb(fg[0], fg[1], fg[2])).weight(Weight::BOLD))],
+            &Attrs::new(),
+            Shaping::Advanced,
+            None,
+        );
+        self.du_title_buffer.shape_until_scroll(&mut self.font_system, false);
+
+        let mut labels = Vec::new();
+        if du.msg.is_some() {
+            return labels;
+        }
+        while self.du_buffers.len() < du.boxes.len() {
+            let b = Buffer::new(&mut self.font_system, Metrics::new((self.line_h / 1.45).max(9.0), self.line_h));
+            self.du_buffers.push(b);
+        }
+        let label_col = Color::rgb(0xf2, 0xf4, 0xf7);
+        for (i, b) in du.boxes.iter().enumerate() {
+            // Only label boxes big enough to hold a readable name + size.
+            if b.rect[2] < 48.0 || b.rect[3] < self.line_h * 1.4 {
+                continue;
+            }
+            let text = format!("{}\n{}", b.name, fmt_kib(b.size_kb));
+            let buf = &mut self.du_buffers[i];
+            buf.set_size(Some((b.rect[2] - 8.0).max(1.0)), Some((b.rect[3] - 5.0).max(1.0)));
+            buf.set_rich_text(
+                [(text.as_str(), Attrs::new().family(fam).color(label_col))],
+                &Attrs::new(),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(&mut self.font_system, false);
+            let _ = top; // (strip sits at `top`; labels clip to their own box)
+            labels.push((
+                i,
+                b.rect[0] + 4.0,
+                b.rect[1] + 3.0,
+                TextBounds {
+                    left: b.rect[0] as i32,
+                    top: b.rect[1] as i32,
+                    right: (b.rect[0] + b.rect[2]) as i32,
+                    bottom: (b.rect[1] + b.rect[3]) as i32,
+                },
+            ));
+        }
+        labels
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
+    fn paint(&mut self, snap: &Snapshot, view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
         // search bar and the bottom panel (man page / command preview) each overlay a
         // strip/panel at the bottom.
@@ -6424,6 +6876,31 @@ impl Renderer {
             bg_quads.push(QuadInstance { rect: [cx, cy, cw, ai_header_h], color: header });
             bg_quads.push(QuadInstance { rect: [cx, cy + ai_header_h, cw, 1.0], color: rule });
         }
+        // du treemap: an opaque cover over the grid, then a fill+border quad per box (area
+        // ∝ disk usage). Labels are added as text areas below; the grid text is suppressed.
+        if let Some(du) = du {
+            let cover = self.color4(blend(self.theme.bg, self.theme.fg, 0.04));
+            bg_quads.push(QuadInstance { rect: [0.0, top, w as f32, h as f32 - top], color: cover });
+            if du.msg.is_none() {
+                let border = self.color4(self.theme.bg);
+                for (i, b) in du.boxes.iter().enumerate() {
+                    if b.rect[2] < 1.5 || b.rect[3] < 1.5 {
+                        continue;
+                    }
+                    let fill = if b.child.is_none() {
+                        self.color4(blend(self.theme.bg, self.theme.fg, 0.28)) // muted remainder
+                    } else {
+                        self.color4(DU_PALETTE[i % DU_PALETTE.len()])
+                    };
+                    bg_quads.push(QuadInstance { rect: b.rect, color: border });
+                    let ins = 1.5;
+                    bg_quads.push(QuadInstance {
+                        rect: [b.rect[0] + ins, b.rect[1] + ins, (b.rect[2] - 2.0 * ins).max(0.0), (b.rect[3] - 2.0 * ins).max(0.0)],
+                        color: fill,
+                    });
+                }
+            }
+        }
         // IME preedit: an opaque cell-strip + underline at the cursor (text added below),
         // plus a bright caret bar at the IME cursor position within the composition.
         if let Some((text, r, c, caret)) = preedit {
@@ -6592,12 +7069,15 @@ impl Renderer {
 
         self.viewport
             .update(&self.queue, Resolution { width: w, height: h });
+        // Shape the treemap labels (mutates buffers) before the text areas borrow them.
+        let du_labels = du.map(|d| self.shape_du(d, w, top)).unwrap_or_default();
         let mut text_areas: Vec<TextArea> = Vec::with_capacity(2 + tabs.len());
         // Grid text. Normally one clipped area; with the AI card open, the grid is split
         // into up to four regions tiling everything except the card rect (a rectangular
         // hole), so terminal text stays visible around the floating card.
         let gfg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
         let grid_bounds: Vec<TextBounds> = match ai_card {
+            _ if du.is_some() => Vec::new(), // treemap covers the grid — draw no grid text
             Some((cx, cy, cw, ch)) => {
                 let (gt, gb) = (grid_top, grid_bottom);
                 let (bt, bb) = (cy.max(gt), (cy + ch).min(gb)); // card band, clamped to grid
@@ -6700,6 +7180,31 @@ impl Renderer {
                 default_color: fg,
                 custom_glyphs: &[],
             });
+        }
+        if du.is_some() {
+            let fg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
+            // Breadcrumb / status strip along the top of the overlay.
+            text_areas.push(TextArea {
+                buffer: &self.du_title_buffer,
+                left: PAD,
+                top: top + 2.0,
+                scale: 1.0,
+                bounds: TextBounds { left: 0, top: top as i32, right: w as i32, bottom: (top + self.line_h + 4.0) as i32 },
+                default_color: fg,
+                custom_glyphs: &[],
+            });
+            let label_col = Color::rgb(0xf2, 0xf4, 0xf7);
+            for (idx, left, ltop, bounds) in &du_labels {
+                text_areas.push(TextArea {
+                    buffer: &self.du_buffers[*idx],
+                    left: *left,
+                    top: *ltop,
+                    scale: 1.0,
+                    bounds: *bounds,
+                    default_color: label_col,
+                    custom_glyphs: &[],
+                });
+            }
         }
         if let Some((_, r, c, _)) = preedit {
             let fg = Color::rgb(self.theme.fg[0], self.theme.fg[1], self.theme.fg[2]);
@@ -6937,7 +7442,7 @@ impl Gfx {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
+    fn render(&mut self, snap: &Snapshot, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -6957,6 +7462,7 @@ impl Gfx {
             panel,
             help,
             ai,
+            du,
             preedit,
             bell,
         );
@@ -7148,6 +7654,7 @@ fn capture(path: &str) -> Result<()> {
         demo_manview.as_ref(),
         demo_help.as_deref(),
         None, // ai card (not exercised by the capture path)
+        None, // du treemap (not exercised by the capture path)
         std::env::var("SAMPA_CAPTURE_PREEDIT")
             .ok()
             .as_deref()
@@ -8056,6 +8563,36 @@ mod tests {
         assert_eq!(ps_sort_order(&rows, PsSort::Cpu), vec![1, 0, 2]); // 9,5,1
         assert_eq!(ps_sort_order(&rows, PsSort::Mem), vec![2, 0, 1]); // 8,2,1
         assert_eq!(ps_sort_order(&rows, PsSort::Pid), vec![1, 2, 0]); // 10,20,30
+    }
+
+    #[test]
+    fn fmt_kib_scales() {
+        assert_eq!(fmt_kib(512), "512K");
+        assert_eq!(fmt_kib(2048), "2.0M");
+        assert_eq!(fmt_kib(3 * 1024 * 1024), "3.0G");
+        assert_eq!(fmt_kib(5 * 1024 * 1024 * 1024), "5.0T");
+    }
+
+    #[test]
+    fn squarify_areas_are_proportional() {
+        // Areas ∝ weights, boxes stay inside the rect and roughly tile it.
+        let rect = [0.0, 0.0, 400.0, 300.0];
+        let w = [60u64, 30, 10];
+        let boxes = squarify(&w, rect);
+        assert_eq!(boxes.len(), 3);
+        let total_area: f32 = boxes.iter().map(|b| b[2] * b[3]).sum();
+        assert!((total_area - 400.0 * 300.0).abs() < 1.0, "boxes should tile the rect");
+        let a: Vec<f32> = boxes.iter().map(|b| b[2] * b[3]).collect();
+        // 60:30:10 → the first box ~6× the third, second ~3×.
+        assert!((a[0] / a[2] - 6.0).abs() < 0.1);
+        assert!((a[1] / a[2] - 3.0).abs() < 0.1);
+        for b in &boxes {
+            assert!(b[0] >= -0.01 && b[1] >= -0.01);
+            assert!(b[0] + b[2] <= 400.01 && b[1] + b[3] <= 300.01);
+        }
+        // Empty / zero-weight inputs don't panic.
+        assert!(squarify(&[], rect).is_empty());
+        assert_eq!(squarify(&[0, 0], rect).len(), 2);
     }
 
     #[test]
