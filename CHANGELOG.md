@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.3.0] - 2026-08-15
+
+The `du` disk-usage treemap lands natively — a squarified layout with click-zoom,
+breadcrumb navigation, and `cd`-on-select — completing the three enhance-shortcut
+decorators (`cd` picker / `ps` enhancement / `du` treemap).
+
+### Features
+
+- Native du disk-usage treemap
+- Mirror du treemap spec + wire the sampa-dumap core into the native build
+
+### Miscellaneous Tasks
+
+- Pin sampa-preview at the du-drop rev (ADR 0002)
+
 ## [0.2.0] - 2026-08-14
 
 First tagged release. Consolidates all work since the `0.1.0` development baseline —
