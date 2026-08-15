@@ -24,7 +24,10 @@ sampa-cli      = { path = "../../../sampa_graphics_terminal/crates/cli" }
 sampa-shellint = { path = "../../../sampa_graphics_terminal/crates/shellint" }
 sampa-palette  = { path = "../../../sampa_graphics_terminal/crates/palette" }
 sampa-man      = { path = "../../../sampa_graphics_terminal/crates/man" }
-sampa-preview  = { path = "../../../sampa_graphics_terminal/crates/preview" }
+# Safe auto-run preview gate. Git-pinned per ADR 0002 (CI-reproducible), like the feature
+# cores below — pinned at the rev that dropped `du` from the allowlist (the du treemap is
+# the intended way to run du now). The other six above remain local path deps for N0.
+sampa-preview  = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b6f2123d69ad6c9a331674f8b8e8dfca6d21cc1a" }
 # Opt-in Claude-API command suggester (spec-ai-overlay.md). Headless like the rest;
 # it is the only crate that can open a socket, and only when `[ai] enabled = true`.
 # Pinned to a git rev (ADR 0002): this feature's dep is CI-reproducible rather than
