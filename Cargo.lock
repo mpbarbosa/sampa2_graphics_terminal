@@ -2758,6 +2758,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sampa-dfdec"
+version = "0.1.0"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=20e8d8aed050e2bd6b4db99c16065c17e93fd3b1#20e8d8aed050e2bd6b4db99c16065c17e93fd3b1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "sampa-dumap"
 version = "0.1.0"
 source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=affebda9f6de482667fc04190f95334946d00f25#affebda9f6de482667fc04190f95334946d00f25"
@@ -2803,6 +2811,7 @@ dependencies = [
  "sampa-ai",
  "sampa-cli",
  "sampa-config",
+ "sampa-dfdec",
  "sampa-dumap",
  "sampa-freemem",
  "sampa-fsnav",
