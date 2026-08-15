@@ -44,8 +44,10 @@ use glyphon::{
 };
 use pty_core::pty::{spawn, PtyEvent, PtyHandle, SpawnConfig};
 use sampa_config::CursorStyle;
+use sampa_dfdec::{parse_df, FsUsage};
 use sampa_dumap::{parse_du, DuNode};
 use sampa_freemem::{parse_free, FreeInfo};
+use sampa_pingdec::{parse_ping, PingReport};
 use sampa_fsnav::{list_subdirs, relativize, Dir};
 use sampa_ps_decorate::{
     decorate_scrollback, group_rows, header_kind, parse_enrich, resolve_level, Group, GroupView,
@@ -505,6 +507,83 @@ fn run_du(cwd: &str) -> Result<DuNode, String> {
         Err(_) => {
             let _ = child.kill();
             Err("du timed out after 6s — the directory is very large.".to_string())
+        }
+    }
+}
+
+/// Truncate `s` to at most `n` chars, keeping the **tail** (mount paths read from the right)
+/// behind a leading ellipsis when clipped.
+fn trunc_tail(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        return s.to_string();
+    }
+    let tail: String = chars[chars.len() - (n.saturating_sub(1))..].iter().collect();
+    format!("…{tail}")
+}
+
+/// Run a **read-only, timeout-bounded** `df -k` off the caller's thread and parse it into
+/// per-filesystem usage rows (spec-df-gauge.md §3). `df` stats every mount and can block on a
+/// stale network mount, so a reader thread drains stdout and the child is killed at 6s.
+fn run_df() -> Result<Vec<FsUsage>, String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("df")
+        .arg("-k")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("df couldn't start: {e}"))?;
+    let stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut o) = stdout {
+            let _ = o.read_to_string(&mut s);
+        }
+        let _ = tx.send(s);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok(text) => {
+            let _ = child.wait();
+            parse_df(&text)
+                .filter(|rows| !rows.is_empty())
+                .ok_or_else(|| "df produced no readable filesystems.".to_string())
+        }
+        Err(_) => {
+            let _ = child.kill();
+            Err("df timed out after 6s — a mount may be stale.".to_string())
+        }
+    }
+}
+
+/// Run a **bounded, read-only** `ping -c 20 -i 0.2 -w 8 <host>` off the caller's thread and
+/// parse it into a report (spec-ping-chart.md §3). `host` is a lone argv (no shell); a reader
+/// thread drains stdout and the child is killed at a 12s backstop.
+fn run_ping(host: &str) -> Result<PingReport, String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("ping")
+        .args(["-c", "20", "-i", "0.2", "-w", "8", host])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("ping couldn't start: {e}"))?;
+    let stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut o) = stdout {
+            let _ = o.read_to_string(&mut s);
+        }
+        let _ = tx.send(s);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(12)) {
+        Ok(text) => {
+            let _ = child.wait();
+            parse_ping(&text).ok_or_else(|| "ping produced no parseable replies.".to_string())
+        }
+        Err(_) => {
+            let _ = child.kill();
+            Err("ping timed out — the host may be unreachable.".to_string())
         }
     }
 }
@@ -1844,6 +1923,10 @@ enum UserEvent {
     AiAnalyzeReady { gen: u64, result: Result<String, String> },
     /// A background `du` scan finished (or failed/timed out); `gen` drops stale replies.
     DuReady { gen: u64, result: Result<DuNode, String> },
+    /// A background `df` run finished (or failed/timed out); `gen` drops stale replies.
+    DfReady { gen: u64, result: Result<Vec<FsUsage>, String> },
+    /// A background `ping` run finished (or failed/timed out); `gen` drops stale replies.
+    PingReady { gen: u64, result: Result<PingReport, String> },
     /// An AccessKit adapter event (tree request / action / deactivation).
     AccessKit(accesskit_winit::Event),
 }
@@ -2061,6 +2144,14 @@ fn main() -> Result<()> {
         free_on: false,
         free_info: None,
         free_msg: None,
+        df_on: false,
+        df_rows: None,
+        df_msg: None,
+        df_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ping_on: false,
+        ping_report: None,
+        ping_msg: None,
+        ping_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2422,6 +2513,14 @@ struct App {
     free_on: bool,
     free_info: Option<FreeInfo>,
     free_msg: Option<String>,
+    df_on: bool,
+    df_rows: Option<Vec<FsUsage>>, // parsed rows (None while running / on failure)
+    df_msg: Option<String>,        // status line: "running df…", a timeout, or an error
+    df_gen: std::sync::Arc<std::sync::atomic::AtomicU64>, // supersede token for the async run
+    ping_on: bool,
+    ping_report: Option<PingReport>, // parsed report (None while pinging / on failure)
+    ping_msg: Option<String>,        // status line: "pinging host…", no-host, or an error
+    ping_gen: std::sync::Arc<std::sync::atomic::AtomicU64>, // supersede token for the async run
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -2506,6 +2605,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::AiAnalyzeReady { gen, result } => self.ai_analyze_ready(gen, result),
             UserEvent::DuReady { gen, result } => self.du_ready(gen, result),
+            UserEvent::DfReady { gen, result } => self.df_ready(gen, result),
+            UserEvent::PingReady { gen, result } => self.ping_ready(gen, result),
             UserEvent::AccessKit(e) => {
                 // A screen reader attached / requested the tree — push the current one.
                 if matches!(e.window_event, accesskit_winit::WindowEvent::InitialTreeRequested) {
@@ -2620,6 +2721,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if self.free_on {
                     self.free_key(&event.logical_key);
+                    return;
+                }
+                if self.df_on {
+                    self.df_key(&event.logical_key);
+                    return;
+                }
+                if self.ping_on {
+                    self.ping_key(&event.logical_key);
                     return;
                 }
                 if self.palette_on {
@@ -3641,11 +3750,14 @@ impl App {
             Action::TogglePreview => self.preview_toggle(),
             Action::EnhancePs => {
                 // Overloaded on the typed command (spec §2): `cd` → tree picker, `du` →
-                // disk-usage treemap, anything else → the ps decorator.
+                // disk-usage treemap, `free` → memory gauge, `df` → disk-free gauge, `ping` →
+                // latency chart, anything else → the ps decorator.
                 match first_command_token(&self.grid_command_line()) {
                     "cd" => self.cd_open(),
                     "du" => self.du_open(),
                     "free" => self.free_open(),
+                    "df" => self.df_open(),
+                    "ping" => self.ping_open(),
                     _ => self.ps_open(),
                 }
             }
@@ -5428,6 +5540,261 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         (title, body, spans)
     }
 
+    // --- df disk-free gauge (spec-df-gauge.md) -------------------------------------------
+    /// Open the df gauge: kick a **timeout-bounded** `df -k` off-thread (it can block on a
+    /// stale mount) and show a status line until `DfReady` lands. Display-only.
+    fn df_open(&mut self) {
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+        self.du_on = false;
+        self.free_on = false;
+        self.ping_on = false;
+        self.df_on = true;
+        self.df_rows = None;
+        self.df_msg = Some("running df …".into());
+        self.request_redraw();
+        let gen = self.df_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = run_df();
+            let _ = proxy.send_event(UserEvent::DfReady { gen, result });
+        });
+    }
+
+    fn df_close(&mut self) {
+        self.df_on = false;
+        self.df_rows = None;
+        self.df_msg = None;
+        self.request_redraw();
+    }
+
+    /// Deliver a background `df` result, unless stale (gen bumped) or the overlay closed.
+    fn df_ready(&mut self, gen: u64, result: Result<Vec<FsUsage>, String>) {
+        if !self.df_on || gen != self.df_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        match result {
+            Ok(rows) => {
+                self.df_rows = Some(rows);
+                self.df_msg = None;
+            }
+            Err(e) => {
+                self.df_rows = None;
+                self.df_msg = Some(e);
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn df_key(&mut self, key: &Key) {
+        // Read-only: Esc / Enter dismiss.
+        if matches!(key, Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)) {
+            self.df_close();
+        }
+    }
+
+    /// Build the df gauge panel's `(title, body, spans)`: one segmented bar per filesystem
+    /// (used / reserved / free), sorted fullest-first, the used slice coloured by a use% band.
+    /// Colour is redundant with bar length (spec §4). Display-only.
+    fn df_render(&self, rows: &[FsUsage]) -> (String, String, Vec<BodySpan>) {
+        let fg = self.theme.fg;
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        let dim = blend(self.theme.bg, self.theme.fg, 0.35);
+        let bar_w = (self.cols as usize).saturating_sub(24).clamp(12, 48);
+        // Use%-band colour: green < 70, yellow < 85, orange < 95, red ≥ 95.
+        let band = |p: u32| -> [u8; 3] {
+            if p >= 95 {
+                HEAT_RED
+            } else if p >= 85 {
+                [0xd1, 0x9a, 0x66] // orange
+            } else if p >= 70 {
+                HEAT_YELLOW
+            } else {
+                HEAT_GREEN
+            }
+        };
+        // Sort fullest-first without mutating the caller's slice (spec §4).
+        let mut order: Vec<&FsUsage> = rows.iter().collect();
+        order.sort_by_key(|f| std::cmp::Reverse(f.use_pct));
+
+        let mut spans: Vec<BodySpan> = Vec::new();
+        for (i, fs) in order.iter().enumerate() {
+            if i > 0 {
+                spans.push(("\n".to_string(), fg, false, false));
+            }
+            let size = fs.size_kb.max(1);
+            // reserved = size − used − avail (root-only blocks); a dim slice when non-zero.
+            let reserved_kb = fs.size_kb.saturating_sub(fs.used_kb + fs.avail_kb);
+            let seg = |kb: u64| ((kb as f64 / size as f64) * bar_w as f64).round() as usize;
+            let used = seg(fs.used_kb).min(bar_w);
+            let resv = seg(reserved_kb).min(bar_w - used);
+            let free = bar_w - used - resv;
+            let label = trunc_tail(&fs.mount, 18);
+            spans.push((format!("{label:<18} "), fg, true, false));
+            spans.push(("█".repeat(used), band(fs.use_pct), false, false));
+            spans.push(("█".repeat(resv), dim, false, false));
+            spans.push(("█".repeat(free), HEAT_GREEN, false, false));
+            spans.push((
+                format!(
+                    "\n{}{}% · {} / {} · {} free",
+                    " ".repeat(19),
+                    fs.use_pct,
+                    fmt_kib(fs.used_kb),
+                    fmt_kib(fs.size_kb),
+                    fmt_kib(fs.avail_kb),
+                ),
+                muted,
+                false,
+                false,
+            ));
+        }
+        let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
+        let title = format!(
+            "df — {} filesystem{}   ·  fullest first  ·  Esc / Enter closes",
+            order.len(),
+            if order.len() == 1 { "" } else { "s" },
+        );
+        (title, body, spans)
+    }
+
+    // --- ping latency chart (spec-ping-chart.md) -----------------------------------------
+    /// Open the ping chart: take the host from the typed line (last non-flag token; a leading
+    /// `-` is rejected) and run a **bounded** ping off-thread. Display-only.
+    fn ping_open(&mut self) {
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+        self.du_on = false;
+        self.free_on = false;
+        self.df_on = false;
+        self.ping_on = true;
+        self.ping_report = None;
+        // Host = last non-flag token of the typed line (spec §3); a leading `-` can't be a host.
+        let line = self.grid_command_line();
+        let host = line
+            .split_whitespace()
+            .skip(1)
+            .filter(|t| !t.starts_with('-'))
+            .last()
+            .map(|s| s.to_string());
+        let Some(host) = host else {
+            self.ping_msg = Some("ping needs a host — type e.g. `ping example.com`.".into());
+            self.request_redraw();
+            return;
+        };
+        self.ping_msg = Some(format!("pinging {host} …"));
+        self.request_redraw();
+        let gen = self.ping_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = run_ping(&host);
+            let _ = proxy.send_event(UserEvent::PingReady { gen, result });
+        });
+    }
+
+    fn ping_close(&mut self) {
+        self.ping_on = false;
+        self.ping_report = None;
+        self.ping_msg = None;
+        self.request_redraw();
+    }
+
+    /// Deliver a background `ping` result, unless stale (gen bumped) or the overlay closed.
+    fn ping_ready(&mut self, gen: u64, result: Result<PingReport, String>) {
+        if !self.ping_on || gen != self.ping_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        match result {
+            Ok(rep) => {
+                self.ping_report = Some(rep);
+                self.ping_msg = None;
+            }
+            Err(e) => {
+                self.ping_report = None;
+                self.ping_msg = Some(e);
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn ping_key(&mut self, key: &Key) {
+        // Read-only: Esc / Enter dismiss.
+        if matches!(key, Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)) {
+            self.ping_close();
+        }
+    }
+
+    /// Build the ping chart panel's `(title, body, spans)`: a per-packet latency **sparkline**
+    /// (one block glyph per sequence, height ∝ RTT, coloured by a latency band), a red floor
+    /// tick for a lost packet, then a summary. Colour is redundant with height (spec §4).
+    fn ping_render(&self, rep: &PingReport) -> (String, String, Vec<BodySpan>) {
+        let fg = self.theme.fg;
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        // Latency band: green < 30 ms, yellow < 100, orange < 200, red ≥ 200.
+        let band = |ms: f64| -> [u8; 3] {
+            if ms >= 200.0 {
+                HEAT_RED
+            } else if ms >= 100.0 {
+                [0xd1, 0x9a, 0x66] // orange
+            } else if ms >= 30.0 {
+                HEAT_YELLOW
+            } else {
+                HEAT_GREEN
+            }
+        };
+        let by_seq: std::collections::HashMap<u32, f64> =
+            rep.replies.iter().map(|r| (r.seq, r.time_ms)).collect();
+        let max_seq = rep
+            .replies
+            .iter()
+            .map(|r| r.seq)
+            .max()
+            .unwrap_or(0)
+            .max(rep.transmitted);
+        let peak = rep.replies.iter().map(|r| r.time_ms).fold(0.0_f64, f64::max);
+        // Scale divisor is floored at 1 ms so sub-millisecond noise (e.g. localhost) doesn't
+        // fill the bars; the displayed `peak` stays the true max so it matches the summary.
+        let scale = peak.max(1.0);
+
+        let mut spans: Vec<BodySpan> = Vec::new();
+        spans.push(("RTT  ".to_string(), fg, true, false));
+        for seq in 1..=max_seq {
+            match by_seq.get(&seq) {
+                Some(&ms) => {
+                    let lvl = ((ms / scale) * 7.0).round().clamp(0.0, 7.0) as usize;
+                    spans.push((BLOCKS[lvl].to_string(), band(ms), false, false));
+                }
+                // Missing sequence = packet loss → a red floor tick, so loss is visible in place.
+                None => spans.push(("▁".to_string(), HEAT_RED, false, false)),
+            }
+        }
+        spans.push((format!("   peak {:.1} ms", peak), muted, false, false));
+
+        let host = rep
+            .host
+            .clone()
+            .or_else(|| rep.ip.clone())
+            .unwrap_or_else(|| "?".into());
+        let mut summary = format!(
+            "\n{} · {}/{} received · {:.0}% loss",
+            host, rep.received, rep.transmitted, rep.loss_pct,
+        );
+        if let Some(rtt) = &rep.rtt {
+            summary.push_str(&format!(
+                "\navg {:.1} ms · min {:.1} · max {:.1} · mdev {:.1}",
+                rtt.avg, rtt.min, rtt.max, rtt.mdev,
+            ));
+        }
+        spans.push((summary, muted, false, false));
+        let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
+        let title = format!("ping {host}   ·  Esc / Enter closes");
+        (title, body, spans)
+    }
+
     /// Toggle the live command-preview panel; enabling it previews the current line.
     fn preview_toggle(&mut self) {
         self.preview_on = !self.preview_on;
@@ -5753,6 +6120,12 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let free_title;
         let free_body;
         let free_spans: Vec<BodySpan>;
+        let df_title;
+        let df_body;
+        let df_spans: Vec<BodySpan>;
+        let ping_title;
+        let ping_body;
+        let ping_spans: Vec<BodySpan>;
         let ai_title;
         let ai_body_spans: Vec<BodySpan>;
         let (_, lh) = self.cell_metrics();
@@ -5874,6 +6247,36 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                     free_title = "free — memory   ·  Esc".to_string();
                     free_body = self.free_msg.clone().unwrap_or_default();
                     Some(PanelView { title: &free_title, body: &free_body, body_spans: None })
+                }
+            }
+        } else if self.df_on {
+            match self.df_rows.as_ref() {
+                Some(rows) => {
+                    let (t, b, spans) = self.df_render(rows);
+                    df_title = t;
+                    df_body = b;
+                    df_spans = spans;
+                    Some(PanelView { title: &df_title, body: &df_body, body_spans: Some(&df_spans) })
+                }
+                None => {
+                    df_title = "df — disk free   ·  Esc".to_string();
+                    df_body = self.df_msg.clone().unwrap_or_default();
+                    Some(PanelView { title: &df_title, body: &df_body, body_spans: None })
+                }
+            }
+        } else if self.ping_on {
+            match self.ping_report.as_ref() {
+                Some(rep) => {
+                    let (t, b, spans) = self.ping_render(rep);
+                    ping_title = t;
+                    ping_body = b;
+                    ping_spans = spans;
+                    Some(PanelView { title: &ping_title, body: &ping_body, body_spans: Some(&ping_spans) })
+                }
+                None => {
+                    ping_title = "ping — latency   ·  Esc".to_string();
+                    ping_body = self.ping_msg.clone().unwrap_or_default();
+                    Some(PanelView { title: &ping_title, body: &ping_body, body_spans: None })
                 }
             }
         } else {
@@ -9033,6 +9436,19 @@ mod tests {
         assert_eq!(fmt_kib(2048), "2.0M");
         assert_eq!(fmt_kib(3 * 1024 * 1024), "3.0G");
         assert_eq!(fmt_kib(5 * 1024 * 1024 * 1024), "5.0T");
+    }
+
+    #[test]
+    fn trunc_tail_keeps_the_right() {
+        // Short strings pass through unchanged.
+        assert_eq!(trunc_tail("/boot/efi", 18), "/boot/efi");
+        assert_eq!(trunc_tail("/home/mpb", 9), "/home/mpb");
+        // Overlong: keep the tail (mount paths read from the right) behind an ellipsis, and
+        // never exceed the budget.
+        let t = trunc_tail("/var/lib/docker/overlay2/deadbeef", 18);
+        assert!(t.starts_with('…'));
+        assert!(t.ends_with("deadbeef"));
+        assert_eq!(t.chars().count(), 18);
     }
 
     #[test]
