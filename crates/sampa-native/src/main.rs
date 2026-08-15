@@ -522,6 +522,23 @@ fn trunc_tail(s: &str, n: usize) -> String {
     format!("…{tail}")
 }
 
+/// Summarize an OSC-52 clipboard payload for the consent modal: a byte-count label and a
+/// single-line preview with control characters neutralized and the text clipped to 60 chars
+/// (a trailing `…` marks a clip or a multi-line payload). Never renders raw control bytes.
+fn osc52_preview(text: &str) -> (String, String) {
+    let bytes = text.len();
+    let label = format!("{bytes} byte{}", if bytes == 1 { "" } else { "s" });
+    let first = text.lines().next().unwrap_or("");
+    let clean: String = first
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let clipped = clean.chars().count() > 60 || text.lines().nth(1).is_some();
+    let head: String = clean.chars().take(60).collect();
+    let preview = format!("\u{201c}{head}{}\u{201d}", if clipped { "…" } else { "" });
+    (label, preview)
+}
+
 /// Run a **read-only, timeout-bounded** `df -k` off the caller's thread and parse it into
 /// per-filesystem usage rows (spec-df-gauge.md §3). `df` stats every mount and can block on a
 /// stale network mount, so a reader thread drains stdout and the child is killed at 6s.
@@ -699,6 +716,16 @@ fn group_name(g: Group) -> &'static str {
 struct AiCard<'a> {
     title: &'a str,
     body_spans: &'a [BodySpan],
+}
+
+/// How OSC-52 clipboard **writes** are handled (spec §13 / N5 escape hardening). Default is
+/// `Ask` — a consent modal per write — set by `SAMPA_OSC52` (`allow` = always, no prompt;
+/// `deny` = always drop, no prompt; anything else / unset = ask). Reads are always dropped.
+#[derive(Clone, Copy, PartialEq)]
+enum Osc52Policy {
+    Allow,
+    Deny,
+    Ask,
 }
 
 /// One pane's grid to render this frame: its snapshot and the pixel column `[x, x+w]` it
@@ -2080,7 +2107,13 @@ fn main() -> Result<()> {
         last_click: None,
         click_count: 0,
         clipboard: arboard::Clipboard::new().ok(),
-        osc52_allow: std::env::var("SAMPA_OSC52").map(|v| v == "allow").unwrap_or(false),
+        osc52_policy: match std::env::var("SAMPA_OSC52").as_deref() {
+            Ok("allow") => Osc52Policy::Allow,
+            Ok("deny") => Osc52Policy::Deny,
+            _ => Osc52Policy::Ask,
+        },
+        osc52_session_allow: false,
+        osc52_prompt: None,
         title: win_title,
         class: wm_class,
         hold,
@@ -2429,7 +2462,9 @@ struct App {
     last_click: Option<(std::time::Instant, usize, usize)>,
     click_count: u8,
     clipboard: Option<arboard::Clipboard>,
-    osc52_allow: bool,
+    osc52_policy: Osc52Policy,
+    osc52_session_allow: bool,        // set when the user picks "allow for this session"
+    osc52_prompt: Option<String>,     // a pending OSC-52 write awaiting consent (the payload)
     title: String,
     /// WM_CLASS / app id (`--class`, default `sampa2`).
     class: String,
@@ -2680,6 +2715,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // Modal overlays capture keys while open, closing on their bound toggle
                 // action (so a rebind still closes them) or Esc — scoped so Esc is never
                 // swallowed for anyone else. Only one of these can be open at a time.
+                // The OSC-52 consent modal takes precedence over every other overlay: it
+                // gates a clipboard write the user must explicitly allow or deny.
+                if self.osc52_prompt.is_some() {
+                    self.osc52_key(&event.logical_key);
+                    return;
+                }
                 if self.help_on {
                     if action == Some(Action::Help) || is_esc {
                         self.help_on = false;
@@ -5918,6 +5959,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let mut retitle = false;
         let mut bell = false;
         let mut stores: Vec<String> = Vec::new();
+        let mut ask: Option<String> = None;
         for i in 0..self.sessions.len() {
             while let Ok(ev) = self.sessions[i].app_rx.try_recv() {
                 match ev {
@@ -5925,12 +5967,23 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                         self.sessions[i].title = sanitize_title(&s);
                         retitle |= i == self.active;
                     }
-                    // OSC-52 write gate: denied by default (SAMPA_OSC52=allow to permit).
-                    AppEvent::ClipboardStore(s) if self.osc52_allow => stores.push(s),
-                    AppEvent::ClipboardStore(_) => {}
+                    // OSC-52 write gate (§13). `allow` (or a session grant) writes straight
+                    // through; `deny` drops silently; `ask` (the default) holds the payload
+                    // for a consent modal — the latest pending write wins.
+                    AppEvent::ClipboardStore(s) => {
+                        if self.osc52_policy == Osc52Policy::Allow || self.osc52_session_allow {
+                            stores.push(s);
+                        } else if self.osc52_policy == Osc52Policy::Ask {
+                            ask = Some(s);
+                        }
+                    }
                     AppEvent::Bell => bell |= i == self.active,
                 }
             }
+        }
+        if let Some(text) = ask {
+            self.osc52_prompt = Some(text);
+            self.request_redraw();
         }
         if bell {
             self.bell_until = Some(std::time::Instant::now() + BELL_FLASH);
@@ -5944,6 +5997,35 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         if retitle {
             self.update_title();
         }
+    }
+
+    /// Key handling for the OSC-52 consent modal: Enter/`y` allow once, `a` allow for the
+    /// session, Esc/`n` deny. Any other key is ignored (modal stays up).
+    fn osc52_key(&mut self, key: &Key) {
+        match key {
+            Key::Named(NamedKey::Enter) => self.osc52_resolve(true, false),
+            Key::Named(NamedKey::Escape) => self.osc52_resolve(false, false),
+            Key::Character(c) if c.eq_ignore_ascii_case("y") => self.osc52_resolve(true, false),
+            Key::Character(c) if c.eq_ignore_ascii_case("a") => self.osc52_resolve(true, true),
+            Key::Character(c) if c.eq_ignore_ascii_case("n") => self.osc52_resolve(false, false),
+            _ => {}
+        }
+    }
+
+    /// Resolve the pending OSC-52 write: on `allow`, write the payload to the system
+    /// clipboard; `for_session` also grants every later write this session (no more prompts).
+    /// On deny, the payload is dropped. Either way the modal closes.
+    fn osc52_resolve(&mut self, allow: bool, for_session: bool) {
+        let pending = self.osc52_prompt.take();
+        if for_session {
+            self.osc52_session_allow = true;
+        }
+        if allow {
+            if let (Some(text), Some(clip)) = (pending, self.clipboard.as_mut()) {
+                let _ = clip.set_text(text);
+            }
+        }
+        self.request_redraw();
     }
 
     /// Scroll the primary-screen scrollback (no-op on the alt screen), then repaint.
@@ -6137,7 +6219,32 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         };
         // The AI suggester is a centered floating card (its own render channel), not a
         // bottom band: an accent header + a rich body (command highlighted, 'c' copies).
-        let ai = if self.ai_on {
+        let ai = if let Some(text) = &self.osc52_prompt {
+            // OSC-52 consent modal: reuses the centered-card path. Priority over the AI card
+            // (only one is ever built) — matches the key-routing precedence above.
+            let fg = self.theme.fg;
+            let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+            let accent = self.theme.cursor;
+            let (label, preview) = osc52_preview(text);
+            ai_title = "Clipboard write requested".to_string();
+            ai_body_spans = vec![
+                (
+                    format!("An application wants to copy {label} to the system clipboard (OSC 52)."),
+                    fg,
+                    false,
+                    false,
+                ),
+                ("\n\n".to_string(), muted, false, false),
+                (preview, accent, false, false),
+                (
+                    "\n\nEnter / y  allow once  ·  a  allow this session  ·  Esc / n  deny".to_string(),
+                    muted,
+                    false,
+                    false,
+                ),
+            ];
+            Some(AiCard { title: &ai_title, body_spans: &ai_body_spans })
+        } else if self.ai_on {
             let accent = self.theme.cursor;
             let fg = self.theme.fg;
             let muted = blend(self.theme.bg, self.theme.fg, 0.55);
@@ -9449,6 +9556,25 @@ mod tests {
         assert!(t.starts_with('…'));
         assert!(t.ends_with("deadbeef"));
         assert_eq!(t.chars().count(), 18);
+    }
+
+    #[test]
+    fn osc52_preview_labels_sanitizes_and_clips() {
+        // Byte-count label (singular vs plural) and a quoted preview.
+        let (label, preview) = osc52_preview("hello");
+        assert_eq!(label, "5 bytes");
+        assert_eq!(preview, "\u{201c}hello\u{201d}");
+        assert_eq!(osc52_preview("x").0, "1 byte");
+        // A multi-line payload is clipped to its first line with a trailing ellipsis, and
+        // control characters within that line are neutralized (never rendered raw).
+        let (_, multi) = osc52_preview("line1\tmore\nline2");
+        assert!(multi.contains("line1 more")); // tab → space
+        assert!(!multi.contains('\t'));
+        assert!(multi.ends_with("…\u{201d}"));
+        // A long single line is clipped to 60 chars.
+        let (_, long) = osc52_preview(&"a".repeat(80));
+        assert_eq!(long.chars().filter(|&c| c == 'a').count(), 60);
+        assert!(long.ends_with("…\u{201d}"));
     }
 
     #[test]
