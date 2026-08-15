@@ -5,6 +5,17 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.5.0] - 2026-08-15
+
+The `free` memory gauge lands natively — completing the four enhance-shortcut views (`ps` /
+`cd` / `du` / `free`). Type `free` and press the enhance chord for proportional RAM/swap
+segmented bars.
+
+### Features
+
+- Native free memory gauge
+- Mirror free gauge spec + wire sampa-freemem into the native build
+
 ## [0.4.0] - 2026-08-15
 
 Vertical split panes land in the native build — `Ctrl+Shift+R` splits a shell to the right,
