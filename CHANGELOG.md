@@ -5,6 +5,24 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.7.0] - 2026-08-15
+
+The `df` disk-free gauge and `ping` latency chart land natively — completing the six
+enhance-shortcut views (`ps` / `cd` / `du` / `free` / `df` / `ping`). Type `df` for
+proportional per-filesystem bars (fullest-first, banded by use%), or `ping <host>` for a
+per-packet latency sparkline (with loss ticks and a min/avg/max/mdev summary), and press the
+enhance chord. Both are display-only.
+
+### Features
+
+- Native df disk-free gauge + ping latency chart
+- Mirror df gauge spec + wire sampa-dfdec into the native build
+- Mirror ping chart spec + wire sampa-pingdec into the native build
+
+### Documentation
+
+- Consolidate the enhance-views feature set
+
 ## [0.6.0] - 2026-08-15
 
 AI window analysis — press Ctrl+Shift+G to screenshot the terminal window and have Claude
