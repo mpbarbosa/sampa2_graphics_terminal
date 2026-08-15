@@ -5,6 +5,20 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.4.0] - 2026-08-15
+
+Vertical split panes land in the native build — `Ctrl+Shift+R` splits a shell to the right,
+`Ctrl+Shift+O` cycles focus — built on a viewport refactor that keeps single-pane rendering
+pixel-identical.
+
+### Features
+
+- Native vertical split panes (N2)
+
+### Refactor
+
+- **splits:** Render the grid through a horizontal viewport
+
 ## [0.3.0] - 2026-08-15
 
 The `du` disk-usage treemap lands natively — a squarified layout with click-zoom,
