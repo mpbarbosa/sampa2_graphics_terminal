@@ -46,6 +46,10 @@ sampa-fsnav    = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal",
 # tree from `du -k` output; no shell, no Tauri. Git-pinned per ADR 0002. The native treemap
 # UI (squarify + zoom) that consumes it is Path C's follow-up; Enter inserts cd, never runs.
 sampa-dumap    = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "affebda9f6de482667fc04190f95334946d00f25" }
+# free memory gauge core (docs/spec-free-gauge.md). parse_free -> Mem/Swap stats; no shell,
+# no Tauri. Git-pinned per ADR 0002. The native gauge UI that consumes it is Path C's
+# follow-up; this view is purely informational (no insert action).
+sampa-freemem  = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "5d918b00f8ec275f8d5ac5fb8c389b17ff732e57" }
 
 anyhow = "1"
 winit = "0.30.13"
