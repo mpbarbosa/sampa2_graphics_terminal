@@ -1,11 +1,18 @@
 # Spec — `ping` latency chart
 
-- **Status (this native/Path C build):** the headless **`sampa-pingdec` core is available** —
-  wired in as a git-pinned dependency of `sampa-native` (per ADR 0002). The feature ships
-  end-to-end in the `sampa_graphics_terminal` reference (Tauri) build (`crates/pingdec`, the
-  `run_ping` bridge, the `#pingchart` overlay); the **native chart UI that consumes the
-  parsed report is Path C's follow-up**. Mirrored here as the behavioral contract; the
-  file/keybinding references describe the reference build.
+- **Status (this native/Path C build):** **implemented.** Typed `ping <host>` + `Ctrl+Shift+D`
+  takes the host from the typed line (last non-flag token; a leading `-` is rejected), runs a
+  **bounded** `ping -c 20 -i 0.2 -w 8 <host>` off the UI thread (host passed as a lone argv —
+  no shell), parses it with `sampa_pingdec::parse_ping`, and shows a per-packet latency
+  **sparkline** (one block-eighth glyph per sequence, height ∝ RTT, coloured by a latency band:
+  green < 30 ms, yellow < 100, orange < 200, red ≥ 200), with a **red floor tick** for a lost
+  packet so loss shows in place, plus a summary line (host, sent/received/loss, min/avg/max/
+  mdev). Colour is redundant with height. Display-only — no insert action; `Esc` / `Enter`
+  dismiss. The keybinding is the native ps chord (`Ctrl+Shift+D`), dispatched on the typed
+  command like `cd` / `du` / `free` / `df`. (The native text panel renders the series as a
+  single-line sparkline rather than the reference build's vertical SVG bars; the data and
+  bands are identical.) Mirrored below as the language-agnostic contract; the `#pingchart`
+  file/keybinding references describe the reference (Tauri) build.
 - **Applies to:** visualising per-packet ping latency as a bar chart, opened from the
   keyboard. Language-agnostic behavioral contract so any frontend (webview or native Rust)
   behaves identically.

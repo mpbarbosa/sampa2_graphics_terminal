@@ -1,11 +1,15 @@
 # Spec — `df` disk-free gauge
 
-- **Status (this native/Path C build):** the headless **`sampa-dfdec` core is available** —
-  wired in as a git-pinned dependency of `sampa-native` (per ADR 0002). The feature ships
-  end-to-end in the `sampa_graphics_terminal` reference (Tauri) build (`crates/dfdec`, the
-  `run_df` bridge, the `#dfgauge` overlay); the **native gauge UI that consumes the parsed
-  rows is Path C's follow-up**. Mirrored here as the behavioral contract; the file/keybinding
-  references describe the reference build.
+- **Status (this native/Path C build):** **implemented.** Typed `df` + `Ctrl+Shift+D` runs a
+  read-only, **timeout-bounded** `df -k` off the UI thread (it can block on a stale mount),
+  parses it with `sampa_dfdec::parse_df`, and shows one proportional **segmented bar per
+  filesystem** — used / reserved / free — **sorted fullest-first**, the used slice coloured by
+  a use% band (green < 70, yellow < 85, orange < 95, red ≥ 95), with a legend
+  (`use% · used / size · free`). Colour is redundant with bar length. Display-only — no insert
+  action; `Esc` / `Enter` dismiss. The keybinding is the native ps chord (`Ctrl+Shift+D`),
+  dispatched on the typed command like `cd` / `du` / `free`. Mirrored below as the
+  language-agnostic contract; the `#dfgauge` file/keybinding references describe the reference
+  (Tauri) build.
 - **Applies to:** visualising per-filesystem disk usage as proportional gauges, opened from
   the keyboard. Language-agnostic behavioral contract so any frontend (webview or native
   Rust) behaves identically.
