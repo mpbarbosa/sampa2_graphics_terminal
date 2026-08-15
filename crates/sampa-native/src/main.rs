@@ -4742,11 +4742,11 @@ impl App {
             return;
         };
         let arg = shell_quote(&relativize(&self.cd_root, &node.dir.path));
-        // Erase whatever the user typed (cursor is at line end after typing `cd …`), then
-        // write the composed command — no newline, so the shell doesn't run it.
-        let typed = self.grid_command_line();
-        let erase = "\u{7f}".repeat(typed.chars().count());
-        self.pty_write(erase.as_bytes());
+        // Clear the whole input line, then compose — no newline, so the shell doesn't run
+        // it. Ctrl+E (to end of line) then Ctrl+U (kill line) clears it exactly in both bash
+        // and zsh emacs mode; a counted-backspace erase mis-sized on a trailing space, a
+        // non-end cursor, or an OSC-133 off-by-one, leaving a stray char (`cd ` → `ccd …`).
+        self.pty_write(b"\x05\x15");
         self.pty_write(format!("cd {arg} ").as_bytes());
         self.scroll(Scroll::Bottom);
         self.cd_close();
