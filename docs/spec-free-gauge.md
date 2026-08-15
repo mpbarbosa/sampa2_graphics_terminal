@@ -1,11 +1,12 @@
 # Spec — `free` memory gauge
 
-- **Status (this native/Path C build):** the headless **`sampa-freemem` core is available** —
-  wired in as a git-pinned dependency of `sampa-native` (per ADR 0002). The feature ships
-  end-to-end in the `sampa_graphics_terminal` reference (Tauri) build (`crates/freemem`, the
-  `run_free` bridge, the `#freegauge` overlay); the **native gauge UI that consumes the
-  parsed stats is Path C's follow-up**. Mirrored here as the behavioral contract; the
-  file/keybinding references describe the reference build.
+- **Status (this native/Path C build):** **implemented.** Typed `free` + `Ctrl+Shift+D` runs
+  a read-only `free -k` (instant — no thread/timeout), parses it with `sampa_freemem::parse_free`,
+  and shows the stats as a bottom panel of proportional **segmented bars** (block glyphs):
+  RAM as used / buff-cache / free with a legend (sizes + % of total, plus the `avail` marker),
+  and a swap bar when swap exists. Colour is redundant with segment length. Display-only —
+  no insert action; `Esc` / `Enter` dismiss. The keybinding is the native ps chord
+  (`Ctrl+Shift+D`), dispatched on the typed command like `cd`/`du`.
 - **Applies to:** visualising RAM and swap usage as proportional gauges, opened from the
   keyboard. Language-agnostic behavioral contract so any frontend (webview or native Rust)
   behaves identically.

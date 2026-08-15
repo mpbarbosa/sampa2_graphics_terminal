@@ -45,6 +45,7 @@ use glyphon::{
 use pty_core::pty::{spawn, PtyEvent, PtyHandle, SpawnConfig};
 use sampa_config::CursorStyle;
 use sampa_dumap::{parse_du, DuNode};
+use sampa_freemem::{parse_free, FreeInfo};
 use sampa_fsnav::{list_subdirs, relativize, Dir};
 use sampa_ps_decorate::{
     decorate_scrollback, group_rows, header_kind, parse_enrich, resolve_level, Group, GroupView,
@@ -2053,6 +2054,9 @@ fn main() -> Result<()> {
         du_boxes: Vec::new(),
         du_msg: None,
         du_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        free_on: false,
+        free_info: None,
+        free_msg: None,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2409,6 +2413,10 @@ struct App {
     du_boxes: Vec<DuBox>,    // laid-out cells of the current view (for drawing + click hit-test)
     du_msg: Option<String>,  // status line: "scanning…", a timeout, or "empty"
     du_gen: std::sync::Arc<std::sync::atomic::AtomicU64>, // supersede token for the async scan
+    // free memory gauge (spec-free-gauge.md), also overloaded on the ps chord.
+    free_on: bool,
+    free_info: Option<FreeInfo>,
+    free_msg: Option<String>,
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -2593,6 +2601,10 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         self.du_key(&event.logical_key);
                     }
+                    return;
+                }
+                if self.free_on {
+                    self.free_key(&event.logical_key);
                     return;
                 }
                 if self.palette_on {
@@ -3618,6 +3630,7 @@ impl App {
                 match first_command_token(&self.grid_command_line()) {
                     "cd" => self.cd_open(),
                     "du" => self.du_open(),
+                    "free" => self.free_open(),
                     _ => self.ps_open(),
                 }
             }
@@ -5225,6 +5238,105 @@ impl App {
         }
     }
 
+    /// Open the `free` memory gauge (spec-free-gauge.md): run a read-only `free -k`, parse
+    /// it, and show RAM/swap as proportional segmented bars. Instant (reads /proc/meminfo),
+    /// so no thread/timeout. Display-only — there is no command to compose.
+    fn free_open(&mut self) {
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+        self.du_on = false;
+        self.free_on = true;
+        let parsed = std::process::Command::new("free")
+            .arg("-k")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| parse_free(&String::from_utf8_lossy(&o.stdout)));
+        match parsed {
+            Some(info) => {
+                self.free_info = Some(info);
+                self.free_msg = None;
+            }
+            None => {
+                self.free_info = None;
+                self.free_msg = Some("free unavailable or unparseable.".into());
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn free_close(&mut self) {
+        self.free_on = false;
+        self.free_info = None;
+        self.free_msg = None;
+        self.request_redraw();
+    }
+
+    fn free_key(&mut self, key: &Key) {
+        // Read-only: Esc / Enter (or the toggle chord) all just dismiss it.
+        if matches!(key, Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)) {
+            self.free_close();
+        }
+    }
+
+    /// Build the gauge panel's `(title, body, spans)`: a segmented RAM bar (used / buff-cache
+    /// / free) with a legend, then a swap bar when swap exists. Colour is redundant with
+    /// segment length (spec §4).
+    fn free_render(&self, info: &FreeInfo) -> (String, String, Vec<BodySpan>) {
+        let fg = self.theme.fg;
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        let bar_w = (self.cols as usize).saturating_sub(8).clamp(16, 60);
+        let mut spans: Vec<BodySpan> = Vec::new();
+        // Bar segments are sized against the sum of the segments shown (so they always fill
+        // the bar exactly — `free`'s used+cache+free can top 100% of total because procps
+        // counts reclaimable slab in both used and buff/cache). Legend %s stay against total.
+        let seg = |kb: u64, denom: u64| ((kb as f64 / denom.max(1) as f64) * bar_w as f64).round() as usize;
+        let pct = |kb: u64, total: u64| (kb as f64 / total.max(1) as f64 * 100.0).round();
+
+        // RAM bar: used | buff/cache | free.
+        let m = &info.mem;
+        let rsum = m.used_kb + m.buff_cache_kb + m.free_kb;
+        let used = seg(m.used_kb, rsum);
+        let cache = seg(m.buff_cache_kb, rsum);
+        let free = bar_w.saturating_sub(used + cache);
+        spans.push(("RAM  ".to_string(), fg, true, false));
+        spans.push(("█".repeat(used), HEAT_RED, false, false));
+        spans.push(("█".repeat(cache), HEAT_YELLOW, false, false));
+        spans.push(("█".repeat(free), HEAT_GREEN, false, false));
+        spans.push((
+            format!(
+                "\n     used {} ({:.0}%) · buff/cache {} ({:.0}%) · free {} ({:.0}%) · avail {} ({:.0}%)",
+                fmt_kib(m.used_kb), pct(m.used_kb, m.total_kb),
+                fmt_kib(m.buff_cache_kb), pct(m.buff_cache_kb, m.total_kb),
+                fmt_kib(m.free_kb), pct(m.free_kb, m.total_kb),
+                fmt_kib(m.available_kb), pct(m.available_kb, m.total_kb),
+            ),
+            muted, false, false,
+        ));
+
+        // Swap bar (only when swap exists): used | free.
+        if let Some(s) = info.swap.filter(|s| s.total_kb > 0) {
+            let su = seg(s.used_kb, s.total_kb);
+            let sf = bar_w.saturating_sub(su);
+            spans.push(("\nSwap ".to_string(), fg, true, false));
+            spans.push(("█".repeat(su), HEAT_RED, false, false));
+            spans.push(("█".repeat(sf), HEAT_GREEN, false, false));
+            spans.push((
+                format!(
+                    "\n     used {} ({:.0}%) · free {} ({:.0}%)",
+                    fmt_kib(s.used_kb), pct(s.used_kb, s.total_kb),
+                    fmt_kib(s.free_kb), pct(s.free_kb, s.total_kb),
+                ),
+                muted, false, false,
+            ));
+        }
+        let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
+        let title = format!("free — {} RAM total   ·  Esc / Enter closes", fmt_kib(m.total_kb));
+        (title, body, spans)
+    }
+
     /// Toggle the live command-preview panel; enabling it previews the current line.
     fn preview_toggle(&mut self) {
         self.preview_on = !self.preview_on;
@@ -5547,6 +5659,9 @@ impl App {
         let cd_title;
         let cd_body;
         let cd_spans: Vec<BodySpan>;
+        let free_title;
+        let free_body;
+        let free_spans: Vec<BodySpan>;
         let ai_title;
         let ai_body_spans: Vec<BodySpan>;
         let (_, lh) = self.cell_metrics();
@@ -5655,6 +5770,21 @@ impl App {
             cd_body = b;
             cd_spans = spans;
             Some(PanelView { title: &cd_title, body: &cd_body, body_spans: Some(&cd_spans) })
+        } else if self.free_on {
+            match self.free_info.as_ref() {
+                Some(info) => {
+                    let (t, b, spans) = self.free_render(info);
+                    free_title = t;
+                    free_body = b;
+                    free_spans = spans;
+                    Some(PanelView { title: &free_title, body: &free_body, body_spans: Some(&free_spans) })
+                }
+                None => {
+                    free_title = "free — memory   ·  Esc".to_string();
+                    free_body = self.free_msg.clone().unwrap_or_default();
+                    Some(PanelView { title: &free_title, body: &free_body, body_spans: None })
+                }
+            }
         } else {
             None
         };
