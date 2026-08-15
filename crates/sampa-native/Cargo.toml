@@ -39,6 +39,10 @@ sampa-ps-decorate = { git = "https://github.com/mpbarbosa/sampa_graphics_termina
 # (list_subdirs / relativize) — no shell, no Tauri. Git-pinned per ADR 0002. The native
 # tree UI that consumes it is Path C's follow-up; the chosen path is inserted, never run.
 sampa-fsnav    = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "815594ffe69f07a011472391371dad040216400c" }
+# du disk-usage treemap core (docs/spec-du-treemap.md). parse_du builds a size-aggregated
+# tree from `du -k` output; no shell, no Tauri. Git-pinned per ADR 0002. The native treemap
+# UI (squarify + zoom) that consumes it is Path C's follow-up; Enter inserts cd, never runs.
+sampa-dumap    = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "affebda9f6de482667fc04190f95334946d00f25" }
 
 anyhow = "1"
 winit = "0.30.13"
