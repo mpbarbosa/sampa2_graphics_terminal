@@ -1,11 +1,13 @@
 # Spec — `cd` directory tree picker
 
-- **Status (this native/Path C build):** mirrored from the `sampa_graphics_terminal`
-  reference build, where it is **implemented** (`crates/fsnav`, the `list_dirs` bridge, the
-  `#cdtree` overlay). The headless `sampa-fsnav` core is **not yet wired** into `sampa-native`
-  (a git-pinned-dep follow-up, as done for `ps-decorate`/`ai`), and there is no native tree
-  UI yet. Carried here as the behavioral contract; the file/keybinding references describe
-  the reference (Tauri) build.
+- **Status (this native/Path C build):** **implemented.** The headless `sampa-fsnav` core is
+  git-pinned into `sampa-native` (per ADR 0002) and consumed by a native tree overlay: a
+  typed `cd` + `Ctrl+Shift+D` opens a bottom panel rooted at the session cwd (`session_cwd`
+  via `/proc/<pid>/cwd`), lazily expanded with `→`/`l` (children fetched on first open via
+  `list_subdirs`), navigated with `↑↓`/`jk` and `←`/`h` (collapse or jump to parent), and
+  `Enter` composes `cd <path>` at the prompt — path `relativize`d to the root and
+  `shell_quote`d, replacing the typed line, never run. The behavioral contract below is the
+  same one the reference (Tauri) build follows; native keybinding is the ps chord (§2).
 - **Applies to:** choosing a `cd` argument from a navigable directory tree, opened from the
   keyboard. Language-agnostic behavioral contract so any frontend (webview or native Rust)
   behaves identically.

@@ -44,6 +44,7 @@ use glyphon::{
 };
 use pty_core::pty::{spawn, PtyEvent, PtyHandle, SpawnConfig};
 use sampa_config::CursorStyle;
+use sampa_fsnav::{list_subdirs, relativize, Dir};
 use sampa_ps_decorate::{
     decorate_scrollback, group_rows, header_kind, parse_enrich, resolve_level, Group, GroupView,
     HeaderKind, Level, PsDetail, Quiet, WidthThresholds, ENRICH_FORMAT,
@@ -129,7 +130,7 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     (Action::TogglePreview, "toggle_preview", "Toggle command preview", "Ctrl+Shift+E"),
     // Not Ctrl+Shift+E — sampa-config defaults `enhance_ps` there, but that chord is
     // toggle_preview here; the native default lives on Ctrl+Shift+D ("decorate").
-    (Action::EnhancePs, "enhance_ps", "Enhance last ps output", "Ctrl+Shift+D"),
+    (Action::EnhancePs, "enhance_ps", "Enhance ps output (or cd tree picker)", "Ctrl+Shift+D"),
     (Action::EnhancePsInplace, "enhance_ps_inplace", "Toggle in-place ps colouring", "Ctrl+Shift+I"),
     (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
     (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
@@ -418,6 +419,15 @@ impl PsSort {
 enum PsVLine {
     Header(usize),    // index into `ps_groups`
     Row(usize, usize), // (group index, row index into the Quiet)
+}
+
+/// One visible row of the `cd` directory tree picker (spec-cd-tree-picker.md): a
+/// subdirectory at a given indent depth, and whether it's currently expanded. Collapsed
+/// subtrees are removed from the flat list, so the vector *is* the visible row list.
+struct CdNode {
+    dir: Dir,
+    depth: usize,
+    expanded: bool,
 }
 
 /// Display name for a provenance [`Group`] (spec §6 order).
@@ -1837,6 +1847,10 @@ fn main() -> Result<()> {
         ps_filter: String::new(),
         ps_filter_editing: false,
         ps_inplace: false,
+        cd_on: false,
+        cd_root: String::new(),
+        cd_nodes: Vec::new(),
+        cd_sel: 0,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2177,6 +2191,11 @@ struct App {
     ps_filter: String,       // incremental filter on command/user (spec §6); empty = off
     ps_filter_editing: bool, // true while `/` is capturing keystrokes into ps_filter
     ps_inplace: bool,        // in-place ps colouring of scrollback (spec §6 in-place render)
+    // cd directory tree picker (spec-cd-tree-picker.md), overloaded on the ps chord.
+    cd_on: bool,
+    cd_root: String,       // the tree root (session cwd)
+    cd_nodes: Vec<CdNode>, // flat visible list; collapsed subtrees are removed
+    cd_sel: usize,
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -2340,6 +2359,14 @@ impl ApplicationHandler<UserEvent> for App {
                         self.ps_close();
                     } else {
                         self.ps_key(&event.logical_key);
+                    }
+                    return;
+                }
+                if self.cd_on {
+                    if action == Some(Action::EnhancePs) {
+                        self.cd_close();
+                    } else {
+                        self.cd_key(&event.logical_key);
                     }
                     return;
                 }
@@ -2868,6 +2895,19 @@ fn ps_sort_order(rows: &[sampa_ps_decorate::QuietRow], sort: PsSort) -> Vec<usiz
     order
 }
 
+/// Shell-quote a `cd` argument (spec-cd-tree-picker.md §5): a "safe" path (only characters
+/// that never need quoting) passes through; anything else is single-quoted with embedded
+/// single quotes escaped as `'\''`. Purely for composing text at the prompt — never run.
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || "._/-+@%=:,".contains(c)) {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Char-index spans `(start, end)` of the first `n` whitespace-delimited fields in `line`.
 /// `ps aux` output is ASCII in columnar form, so a char index equals its grid cell column —
 /// letting the in-place decorator recolour exactly the `%CPU`/`%MEM`/`VSZ` cells.
@@ -3330,7 +3370,15 @@ impl App {
             Action::Palette => self.palette_open(),
             Action::ToggleMan => self.man_open(),
             Action::TogglePreview => self.preview_toggle(),
-            Action::EnhancePs => self.ps_open(),
+            Action::EnhancePs => {
+                // Overloaded (spec-cd-tree-picker.md §2): a typed `cd` opens the directory
+                // tree picker; anything else runs the ps decorator.
+                if first_command_token(&self.grid_command_line()) == "cd" {
+                    self.cd_open();
+                } else {
+                    self.ps_open();
+                }
+            }
             Action::EnhancePsInplace => {
                 self.ps_inplace = !self.ps_inplace;
                 self.request_redraw();
@@ -4500,6 +4548,176 @@ impl App {
         }
     }
 
+    /// Open the `cd` directory tree picker (spec-cd-tree-picker.md) rooted at the session
+    /// cwd. Read-only: it lists directories and, on choose, composes `cd <path>` at the
+    /// prompt without running it — never touches the filesystem or the shell.
+    fn cd_open(&mut self) {
+        let Some(root) = self.session_cwd() else {
+            return; // no cwd (e.g. child exited) — nothing to root the tree at
+        };
+        self.cd_nodes = list_subdirs(&root)
+            .into_iter()
+            .map(|dir| CdNode { dir, depth: 0, expanded: false })
+            .collect();
+        self.cd_root = root;
+        self.cd_sel = 0;
+        self.cd_on = true;
+        // Own the overlay slot (the bottom panels are mutually exclusive).
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.request_redraw();
+    }
+
+    fn cd_close(&mut self) {
+        self.cd_on = false;
+        self.cd_nodes = Vec::new();
+        self.cd_root.clear();
+        self.request_redraw();
+    }
+
+    fn cd_key(&mut self, key: &Key) {
+        let n = self.cd_nodes.len();
+        let page = PS_VISIBLE.saturating_sub(2).max(1);
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.cd_close();
+                return;
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.cd_choose();
+                return;
+            }
+            Key::Named(NamedKey::ArrowDown) => self.cd_sel = (self.cd_sel + 1).min(n.saturating_sub(1)),
+            Key::Named(NamedKey::ArrowUp) => self.cd_sel = self.cd_sel.saturating_sub(1),
+            Key::Named(NamedKey::PageDown) => self.cd_sel = (self.cd_sel + page).min(n.saturating_sub(1)),
+            Key::Named(NamedKey::PageUp) => self.cd_sel = self.cd_sel.saturating_sub(page),
+            Key::Named(NamedKey::Home) => self.cd_sel = 0,
+            Key::Named(NamedKey::ArrowRight) => self.cd_expand(),
+            Key::Named(NamedKey::ArrowLeft) => self.cd_collapse(),
+            Key::Character(s) => match s.as_str() {
+                "j" => self.cd_sel = (self.cd_sel + 1).min(n.saturating_sub(1)),
+                "k" => self.cd_sel = self.cd_sel.saturating_sub(1),
+                "l" => self.cd_expand(),
+                "h" => self.cd_collapse(),
+                _ => return,
+            },
+            _ => return,
+        }
+        self.request_redraw();
+    }
+
+    /// `→`/`l` — expand the selected directory (loads its children lazily on first expand);
+    /// if it's already open, step into its first child.
+    fn cd_expand(&mut self) {
+        let Some(node) = self.cd_nodes.get(self.cd_sel) else { return };
+        if node.expanded {
+            if self.cd_sel + 1 < self.cd_nodes.len()
+                && self.cd_nodes[self.cd_sel + 1].depth > node.depth
+            {
+                self.cd_sel += 1; // step into the first child
+            }
+            return;
+        }
+        let (path, depth) = (node.dir.path.clone(), node.depth);
+        let children: Vec<CdNode> = list_subdirs(&path)
+            .into_iter()
+            .map(|dir| CdNode { dir, depth: depth + 1, expanded: false })
+            .collect();
+        self.cd_nodes[self.cd_sel].expanded = true;
+        let at = self.cd_sel + 1;
+        self.cd_nodes.splice(at..at, children);
+    }
+
+    /// `←`/`h` — collapse the selected directory (drops its descendants from the list); if
+    /// it's a leaf/closed, jump to its parent instead.
+    fn cd_collapse(&mut self) {
+        let Some(node) = self.cd_nodes.get(self.cd_sel) else { return };
+        let depth = node.depth;
+        if node.expanded {
+            self.cd_nodes[self.cd_sel].expanded = false;
+            let start = self.cd_sel + 1;
+            let mut end = start;
+            while end < self.cd_nodes.len() && self.cd_nodes[end].depth > depth {
+                end += 1;
+            }
+            self.cd_nodes.drain(start..end);
+        } else if depth > 0 {
+            // Jump to the parent (nearest preceding node at a shallower depth).
+            if let Some(p) = (0..self.cd_sel).rev().find(|&i| self.cd_nodes[i].depth < depth) {
+                self.cd_sel = p;
+            }
+        }
+    }
+
+    /// `Enter` — compose `cd <path>` at the prompt and close (insert-never-run, spec §5):
+    /// the path is relativised to the root, shell-quoted if needed, and the user's typed
+    /// line is erased first so a partial `cd foo` is replaced cleanly.
+    fn cd_choose(&mut self) {
+        let Some(node) = self.cd_nodes.get(self.cd_sel) else {
+            self.cd_close();
+            return;
+        };
+        let arg = shell_quote(&relativize(&self.cd_root, &node.dir.path));
+        // Erase whatever the user typed (cursor is at line end after typing `cd …`), then
+        // write the composed command — no newline, so the shell doesn't run it.
+        let typed = self.grid_command_line();
+        let erase = "\u{7f}".repeat(typed.chars().count());
+        self.pty_write(erase.as_bytes());
+        self.pty_write(format!("cd {arg} ").as_bytes());
+        self.scroll(Scroll::Bottom);
+        self.cd_close();
+    }
+
+    /// Build the `cd` picker's `(title, body, spans)`: an indented directory tree with a
+    /// caret on the selection, a `▾`/`▸` twisty per node, windowed to what fits.
+    fn cd_render(&self, visible: usize) -> (String, String, Vec<BodySpan>) {
+        let fg = self.theme.fg;
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        let accent = self.theme.cursor;
+        let n = self.cd_nodes.len();
+        let start = if n <= visible {
+            0
+        } else {
+            self.cd_sel.saturating_sub(visible / 2).min(n - visible)
+        };
+        let end = (start + visible).min(n);
+
+        let mut spans: Vec<BodySpan> = Vec::new();
+        if n == 0 {
+            spans.push(("  (no subdirectories here)".to_string(), muted, false, true));
+        }
+        for (row_n, node) in self.cd_nodes[start..end].iter().enumerate() {
+            let idx = start + row_n;
+            if row_n > 0 {
+                spans.push(("\n".to_string(), fg, false, false));
+            }
+            let caret = if idx == self.cd_sel { "❯ " } else { "  " };
+            let indent = "  ".repeat(node.depth);
+            let twisty = if node.expanded { "▾" } else { "▸" };
+            let col = if idx == self.cd_sel { accent } else { fg };
+            spans.push((
+                format!("{caret}{indent}{twisty} {}", node.dir.name),
+                col,
+                idx == self.cd_sel,
+                false,
+            ));
+        }
+        let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
+        let root_disp = self.cd_root.replace(
+            &std::env::var("HOME").unwrap_or_default(),
+            "~",
+        );
+        let title = format!(
+            "cd — {}   {} dir{}   {}   ·  ↑↓ move · →← open/close · Enter choose · Esc",
+            root_disp,
+            n,
+            if n == 1 { "" } else { "s" },
+            if n > 0 { format!("{}/{}", self.cd_sel + 1, n) } else { "0/0".into() },
+        );
+        (title, body, spans)
+    }
+
     /// Toggle the live command-preview panel; enabling it previews the current line.
     fn preview_toggle(&mut self) {
         self.preview_on = !self.preview_on;
@@ -4773,6 +4991,9 @@ impl App {
         let ps_title;
         let ps_body;
         let ps_spans: Vec<BodySpan>;
+        let cd_title;
+        let cd_body;
+        let cd_spans: Vec<BodySpan>;
         let ai_title;
         let ai_body_spans: Vec<BodySpan>;
         let (_, lh) = self.cell_metrics();
@@ -4868,6 +5089,12 @@ impl App {
                 }
                 None => None,
             }
+        } else if self.cd_on {
+            let (t, b, spans) = self.cd_render(fit(PS_VISIBLE));
+            cd_title = t;
+            cd_body = b;
+            cd_spans = spans;
+            Some(PanelView { title: &cd_title, body: &cd_body, body_spans: Some(&cd_spans) })
         } else {
             None
         };
@@ -7739,6 +7966,18 @@ mod tests {
         assert_eq!(ps_sort_order(&rows, PsSort::Cpu), vec![1, 0, 2]); // 9,5,1
         assert_eq!(ps_sort_order(&rows, PsSort::Mem), vec![2, 0, 1]); // 8,2,1
         assert_eq!(ps_sort_order(&rows, PsSort::Pid), vec![1, 2, 0]); // 10,20,30
+    }
+
+    #[test]
+    fn shell_quote_only_when_needed() {
+        // Safe paths pass through; anything with whitespace/specials gets single-quoted.
+        assert_eq!(shell_quote("src/app"), "src/app");
+        assert_eq!(shell_quote("a.b-c_1"), "a.b-c_1");
+        assert_eq!(shell_quote("my docs"), "'my docs'");
+        assert_eq!(shell_quote("weird$name"), "'weird$name'");
+        // Embedded single quote is escaped as '\'' and the empty string quotes to ''.
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]
