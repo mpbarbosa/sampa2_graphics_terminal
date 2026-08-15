@@ -9,13 +9,37 @@ This is a *renderer swap* of the origin project
 replaces the webview frontend with a native `winit` + `wgpu` + `cosmic-text` renderer
 driving an `alacritty_terminal` VT engine.
 
+## Features
+
+Beyond being a fast, real terminal (truecolor, images, tabs, scrollback — nvim/tmux/btop
+all run), Sampa adds keyboard-driven helpers. All are **read-only** and honour
+**insert-never-run** — anything that produces a command composes it at the prompt for you to
+run, never on its own.
+
+- **Enhance views — `Ctrl+Shift+D`**, dispatched on the command you've typed
+  ([overview](docs/spec-enhance-views.md)):
+  - `cd` → a **directory tree picker** → composes `cd <path>`
+  - `du` → a **disk-usage treemap** (squarify + zoom) → composes `cd <path>`
+  - `free` → a **memory gauge** (RAM/swap segmented bars) — display-only
+  - *anything else* → the **`ps` output enhancement** (quiet columns / bars + sort / grouped
+    inspector, by width). `Ctrl+Shift+I` decorates `ps` output **in place** in the scrollback.
+- **AI (opt-in, one network surface):** `Ctrl+Shift+A` suggest a command · `Ctrl+Shift+X`
+  explain the typed command · `Ctrl+Shift+G` screenshot the window and ask Claude to review it.
+- **Split panes:** `Ctrl+Shift+R` split vertically · `Ctrl+Shift+O` cycle focus.
+- **Also:** command palette (`Ctrl+Shift+P`), live man-page panel (`Ctrl+Shift+M`),
+  preview-as-you-type (`Ctrl+Shift+E`), search (`Ctrl+Shift+F`), tabs, and a help overlay
+  (`Ctrl+Shift+?`) that lists every binding.
+
 ## Status
 
-**N0 (proof of life) — shipped & verified.** A native window runs a live shell:
-`pty-core` → `alacritty_terminal` → `glyphon` render, with resize and keyboard input.
-
-Colors, bold/dim/inverse, truecolor, cell backgrounds, and a block cursor render
-(N1 color pass); keyboard/mouse/selection/scrollback are in progress.
+**N0–N4 shipped & verified**, packaged (`.deb`/AppImage/`.rpm`), and released (see the
+[GitHub releases](https://github.com/mpbarbosa/sampa2_graphics_terminal/releases)). The
+native window is a real terminal — truecolor, cell backgrounds, cursors, keyboard/mouse,
+selection + clipboard, 10k-line scrollback, inline images, tabs, and split panes — verified
+against nvim/tmux/btop and the `esctest` conformance suite. The signature helpers above
+(palette, man, preview, the enhance views, AI overlays) are all built. Remaining: the N5/N6
+long tail (graphics/links/i18n/a11y edges, VT conformance, perf) — see
+[docs/PLAN.md](docs/PLAN.md).
 
 ```bash
 cargo run                       # native window running your $SHELL
@@ -47,6 +71,8 @@ An `.rpm` (`./packaging/build-rpm.sh`) is available too. See
 
 ## Docs
 
+- [docs/spec-enhance-views.md](docs/spec-enhance-views.md) — the `Ctrl+Shift+D` command
+  visualisers (`ps` / `cd` / `du` / `free`), with links to each view's spec.
 - [docs/PLAN.md](docs/PLAN.md) — the phased development plan (N0–N6, v1).
 - [docs/rust-only-feasibility.md](docs/rust-only-feasibility.md) — why Path C is a
   renderer swap, not a rewrite.
