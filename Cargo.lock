@@ -2766,6 +2766,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sampa-freemem"
+version = "0.1.0"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=5d918b00f8ec275f8d5ac5fb8c389b17ff732e57#5d918b00f8ec275f8d5ac5fb8c389b17ff732e57"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "sampa-fsnav"
 version = "0.1.0"
 source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=815594ffe69f07a011472391371dad040216400c#815594ffe69f07a011472391371dad040216400c"
@@ -2796,6 +2804,7 @@ dependencies = [
  "sampa-cli",
  "sampa-config",
  "sampa-dumap",
+ "sampa-freemem",
  "sampa-fsnav",
  "sampa-man",
  "sampa-palette",
