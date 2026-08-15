@@ -2813,6 +2813,7 @@ version = "0.1.0"
 [[package]]
 name = "sampa-preview"
 version = "0.1.0"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=b6f2123d69ad6c9a331674f8b8e8dfca6d21cc1a#b6f2123d69ad6c9a331674f8b8e8dfca6d21cc1a"
 dependencies = [
  "libc",
 ]
