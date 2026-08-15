@@ -6765,6 +6765,10 @@ impl Renderer {
         // (underline/strikethrough, drawn over it).
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
         let mut deco_quads: Vec<QuadInstance> = Vec::new();
+        // Horizontal grid viewport (splits foundation): the grid is drawn inside [vp_x, vp_x
+        // + vp_w]. Full-width here (0, w) so single-pane rendering is unchanged; a vertical
+        // split will call the grid render per pane with its own column.
+        let (vp_x, vp_w) = (0.0_f32, w as f32);
         // Tab-bar segment quads render first, under everything.
         self.tab_bar_quads(tabs, active, w, &mut bg_quads);
         for r in 0..snap.rows {
@@ -6774,7 +6778,7 @@ impl Renderer {
             let row_visible = y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5;
             for c in 0..snap.cols {
                 let cell = snap.cell(r, c);
-                let x = PAD + c as f32 * self.cell_w;
+                let x = vp_x + PAD + c as f32 * self.cell_w;
                 if cell.bg != self.theme.bg {
                     bg_quads.push(QuadInstance {
                         rect: [x, y, self.cell_w + 0.5, self.line_h],
@@ -6800,7 +6804,7 @@ impl Renderer {
             let y = top + *r as f32 * self.line_h;
             y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5
         }) {
-            let (x, y) = (PAD + c as f32 * self.cell_w, top + r as f32 * self.line_h);
+            let (x, y) = (vp_x + PAD + c as f32 * self.cell_w, top + r as f32 * self.line_h);
             let rect = match self.cursor_style {
                 CursorStyle::Bar => Some([x, y, 2.0, self.line_h]),
                 CursorStyle::Underline => Some([x, y + self.line_h - 2.0, self.cell_w, 2.0]),
@@ -6951,7 +6955,7 @@ impl Renderer {
         }
 
         self.buffer
-            .set_size(Some(w as f32 - 2.0 * PAD), Some(h as f32 - top - PAD));
+            .set_size(Some(vp_w - 2.0 * PAD), Some(h as f32 - top - PAD));
         self.buffer.set_rich_text(
             spans.iter().map(|(s, fg, bold, italic)| {
                 let mut a = Attrs::new()
@@ -7096,12 +7100,12 @@ impl Renderer {
                 }
                 v
             }
-            None => vec![TextBounds { left: 0, top: grid_top as i32, right: w as i32, bottom: grid_bottom as i32 }],
+            None => vec![TextBounds { left: vp_x as i32, top: grid_top as i32, right: (vp_x + vp_w) as i32, bottom: grid_bottom as i32 }],
         };
         for bounds in grid_bounds {
             text_areas.push(TextArea {
                 buffer: &self.buffer,
-                left: PAD,
+                left: vp_x + PAD,
                 top,
                 scale: 1.0,
                 bounds,
