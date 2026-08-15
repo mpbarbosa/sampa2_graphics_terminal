@@ -326,9 +326,11 @@ refuses writes (file provably untouched) and clears on Enter.
   - ✅ **query replies routed** — DA/DSR/DECRQSS `PtyWrite` and OSC 4/10/11 color
     requests now answer the app (a correctness win — `VoidListener` silently dropped
     them); color replies use fixed palette values, never attacker input.
-  - ✅ **OSC-52 write gate** — surfaced as `ClipboardStore`, **default-deny**
-    (`SAMPA_OSC52=allow` to permit); **OSC-52 reads dropped** (no clipboard
-    exfiltration to the PTY).
+  - ✅ **OSC-52 write gate** — surfaced as `ClipboardStore` and gated by a **consent
+    modal** (default): a clipboard write pops a centered card showing the byte count and a
+    sanitized one-line preview, resolved by **Enter/`y`** (allow once), **`a`** (allow this
+    session), or **Esc/`n`** (deny). `SAMPA_OSC52=allow` writes through without a prompt and
+    `=deny` drops silently. **OSC-52 reads dropped** (no clipboard exfiltration to the PTY).
   - ✅ **title (OSC 0/2) sanitized** — control chars stripped, capped at 256.
   - ✅ **synchronous, in-order reply path** — replies (DA/DSR/DECRQSS/color, DECRQCRA)
     are written to the PTY by the parser thread in stream order via a shared
@@ -338,7 +340,10 @@ refuses writes (file provably untouched) and clears on Enter.
     the rectangular-area checksum sees the exact grid state, replying
     `DCS Pid !~ HHHH ST` (raw 16-bit codepoint sum, empty = 0x20 — the
     `--xterm-checksum 334` convention). 6 unit tests (title/DA/OSC-52 ×2, scanner, checksum).
-  - 6 unit tests. ⬜ still: interactive OSC-52 **consent modal** (vs. env toggle).
+  - ✅ **interactive OSC-52 consent modal** — replaces the env-only toggle with a per-write
+    prompt (allow once / allow session / deny), reusing the centered-card path; the payload
+    preview strips control chars and clips to one line. `osc52_preview` unit-tested;
+    Xephyr-verified end to end (allow writes the X clipboard, deny leaves it untouched).
 
 **Exit:** sixel renders within caps, oversized rejected not OOM; links need a click
 and show target; a CJK/emoji/compose input test passes; a screen reader sees the grid.
