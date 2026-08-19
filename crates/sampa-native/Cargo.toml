@@ -58,6 +58,10 @@ sampa-pingdec  = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal",
 # no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native disk-free gauge UI
 # (df_render — one segmented bar per filesystem, fullest-first); informational (no insert).
 sampa-dfdec    = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "20e8d8aed050e2bd6b4db99c16065c17e93fd3b1" }
+# uptime load gauge core (docs/spec-load-gauge.md). parse_uptime -> load averages + up/users
+# (expects C-locale output); no shell, no Tauri. Git-pinned per ADR 0002. The native gauge UI
+# that consumes it is Path C's follow-up; informational (nothing composed or run).
+sampa-uptimedec = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b05ded339a8448bed19552341235dd550a2dbc17" }
 
 anyhow = "1"
 winit = "0.30.13"
