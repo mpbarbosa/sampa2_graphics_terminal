@@ -371,9 +371,13 @@ and show target; a CJK/emoji/compose input test passes; a screen reader sees the
   [tools/conformance/](../tools/conformance/README.md).
 - **vttest** manual smoke; **real-app matrix** green (add mc, ssh, weechat, emacs -nw,
   fzf, truecolor, sixel, CJK/emoji).
-- **Perf:** the native ceiling is the payoff — `cat 50MB` throughput, typometer
-  added-input-latency **< one frame** (now measurable without a webview compositor in
-  the paint path), 100k-line scrollback memory. Trend in CI.
+- 🔨 **Perf:** the native ceiling is the payoff — ✅ **VT ingest throughput** benchmark
+  (`sampa2 --bench [MiB]`) measures the parse+grid hot path (the `cat 50MB` ceiling minus GPU
+  present) on a deterministic representative workload, reporting MiB/s, line rate, and the
+  100k-line scrollback RSS. Baseline **~82–87 MiB/s · ~1.2 M lines/s · ~193 MiB scrollback**
+  (`bench_workload` unit-tested), documented in [perf.md](perf.md). ⬜ still: typometer
+  added-input-latency **< one frame** (needs the live window), and wiring the bench as a
+  non-gating **trend in CI**.
 
 **v1:** app matrix green · esctest threshold met · latency/throughput targets met ·
 signature-feature tests green · config reference + docs complete.

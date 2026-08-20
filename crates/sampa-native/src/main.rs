@@ -14,7 +14,8 @@
 //! scrollback scrolling, underline/strikethrough, damage-tracked redraw.
 //!
 //! Modes: `sampa` (window), `sampa --smoke` (headless wiring check),
-//! `sampa --capture <png>` (offscreen render of a color demo — CI screenshot / proof).
+//! `sampa --capture <png>` (offscreen render of a color demo — CI screenshot / proof),
+//! `sampa --bench [MiB]` (headless VT ingest throughput benchmark — docs/perf.md).
 
 mod smoke;
 
@@ -1992,6 +1993,71 @@ struct Session {
     title: String,
 }
 
+/// Resident set size in KiB from `/proc/self/statm` (Linux) — a coarse memory figure for the
+/// `--bench` trend line. `None` if the file can't be read or parsed.
+fn rss_kb() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(resident_pages * 4) // resident pages × 4 KiB page
+}
+
+/// Build a **deterministic** ~`target`-byte workload representative of real terminal output:
+/// plain text, `ls --color`-style SGR runs, log lines, a compiler error, and mixed-width
+/// UTF-8 (accents / CJK / emoji). No RNG, so `--bench` numbers are reproducible.
+fn bench_workload(target: usize) -> Vec<u8> {
+    const TEMPLATES: [&str; 6] = [
+        "the quick brown fox jumps over the lazy dog 0123456789\n",
+        "\x1b[32m✔\x1b[0m \x1b[1mbuild\x1b[0m compiled \x1b[33munit\x1b[0m in \x1b[36m1.23s\x1b[0m\n",
+        "\x1b[31merror\x1b[0m[E0502]: cannot borrow `x` as mutable — line 42\n",
+        "2026-08-15T20:00:00Z INFO  request id=abc123 status=200 dur=12ms path=/api/v1/x\n",
+        "café tä 一二三 emoji 🚀 mixed-width column test │ padding │ end of the row\n",
+        "\x1b[38;5;208m██\x1b[38;5;39m██\x1b[38;5;120m██\x1b[0m gradient swatches 0xDEADBEEF cols\n",
+    ];
+    let mut out = Vec::with_capacity(target + 128);
+    let mut i = 0usize;
+    // Append whole templates (never split a UTF-8/escape sequence) until we reach target.
+    while out.len() < target {
+        out.extend_from_slice(TEMPLATES[i % TEMPLATES.len()].as_bytes());
+        i += 1;
+    }
+    out
+}
+
+/// `--bench [MiB]`: measure **VT ingest throughput** — the parse-and-grid hot path
+/// (`Processor::advance` into `Term`), i.e. the "cat a big file" ceiling *minus* GPU present.
+/// Feeds a representative workload in 64 KiB chunks (like the real reader thread) through an
+/// 80×24 grid with a 100k-line scrollback, then reports MiB/s, lines/s, and the RSS delta.
+fn bench(mb: usize) -> Result<()> {
+    let (cols, rows) = (80u16, 24u16);
+    let payload = bench_workload(mb * 1024 * 1024);
+    let lines = payload.iter().filter(|&&b| b == b'\n').count();
+    let mut parser: Processor = Processor::new();
+    let mut term = Term::new(
+        TermConfig { scrolling_history: 100_000, ..TermConfig::default() },
+        &TermSize::new(cols as usize, rows as usize),
+        VoidListener,
+    );
+
+    let rss_before = rss_kb();
+    let start = std::time::Instant::now();
+    for chunk in payload.chunks(64 * 1024) {
+        parser.advance(&mut term, chunk);
+    }
+    let elapsed = start.elapsed();
+    let rss_after = rss_kb();
+
+    let secs = elapsed.as_secs_f64();
+    let actual_mib = payload.len() as f64 / (1024.0 * 1024.0);
+    println!("sampa2 --bench — VT ingest (parse + grid, no GPU present)");
+    println!("  workload:   {actual_mib:.1} MiB · {lines} lines · {cols}×{rows} grid · 100k scrollback");
+    println!("  elapsed:    {secs:.3} s");
+    println!("  throughput: {:.0} MiB/s · {:.0} lines/s", actual_mib / secs, lines as f64 / secs);
+    if let (Some(a), Some(b)) = (rss_before, rss_after) {
+        println!("  RSS delta:  {} KiB (parser + grid + scrollback)", b.saturating_sub(a));
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--smoke") {
@@ -2000,6 +2066,10 @@ fn main() -> Result<()> {
     if let Some(i) = args.iter().position(|a| a == "--capture") {
         let path = args.get(i + 1).map(String::as_str).unwrap_or("sampa.png");
         return capture(path);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--bench") {
+        let mb = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
+        return bench(mb);
     }
 
     // Full CLI (§12.2) via the shared, tested `sampa-cli` parser: -e/-- CMD…,
@@ -9628,6 +9698,18 @@ mod tests {
         assert!(t.starts_with('…'));
         assert!(t.ends_with("deadbeef"));
         assert_eq!(t.chars().count(), 18);
+    }
+
+    #[test]
+    fn bench_workload_is_deterministic_and_sized() {
+        // Reaches at least the target, is reproducible, and carries real terminal content
+        // (newlines for scrolling + SGR escapes) so the throughput number is meaningful.
+        let a = bench_workload(100_000);
+        let b = bench_workload(100_000);
+        assert_eq!(a, b, "workload must be deterministic (no RNG)");
+        assert!(a.len() >= 100_000);
+        assert!(a.contains(&b'\n'), "should contain line breaks (grid scrolling)");
+        assert!(a.windows(2).any(|w| w == [0x1b, b'[']), "should contain SGR escapes");
     }
 
     #[test]
