@@ -47,6 +47,7 @@ long tail (graphics/links/i18n/a11y edges, VT conformance, perf) — see
 cargo run                       # native window running your $SHELL
 cargo run -- --smoke            # headless cross-repo wiring + PTY round-trip check
 cargo run -- --capture out.png  # offscreen render of a color demo (no display needed)
+cargo run --release -- --bench  # VT ingest throughput benchmark (docs/perf.md)
 cargo test                      # unit tests (VT seam, colors, keyboard, mouse, selection, scrollback)
 cargo test -- --ignored         # app-matrix + ^C/resize smokes against real programs (PTY→VT)
 ```
@@ -76,6 +77,7 @@ An `.rpm` (`./packaging/build-rpm.sh`) is available too. See
 - [docs/spec-enhance-views.md](docs/spec-enhance-views.md) — the `Ctrl+Shift+D` command
   visualisers (`ps` / `cd` / `du` / `free` / `df` / `ping`), with links to each view's spec.
 - [docs/PLAN.md](docs/PLAN.md) — the phased development plan (N0–N6, v1).
+- [docs/perf.md](docs/perf.md) — the VT ingest throughput benchmark (`--bench`) + baseline.
 - [docs/rust-only-feasibility.md](docs/rust-only-feasibility.md) — why Path C is a
   renderer swap, not a rewrite.
 - [docs/adr/](docs/adr/) — decisions: [0002](docs/adr/0002-core-code-sharing.md)
