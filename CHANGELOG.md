@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.9.0] - 2026-08-20
+
+The `uptime` load gauge lands natively, **completing the seven-view enhance set** (`ps` / `cd`
+/ `du` / `free` / `df` / `ping` / `uptime`) — type `uptime` and press the enhance chord for
+1/5/15-minute load bars scaled to your CPU cores and banded by how close each is to capacity.
+Also adds a headless **VT-ingest throughput benchmark** (`sampa2 --bench [MiB]`) that measures
+the parse+grid ceiling (the `cat 50MB` path minus GPU present), establishing the N6 perf
+baseline.
+
+### Features
+
+- Native uptime load gauge — completing the enhance-view set
+- VT ingest throughput benchmark (--bench) — N6 perf baseline
+- Mirror load gauge spec + wire sampa-uptimedec into the native build
+
 ## [0.8.0] - 2026-08-15
 
 Escape-hardening for the two paths where the terminal reaches outside the sandbox — the
