@@ -1,12 +1,16 @@
 # Spec — `uptime` load gauge
 
-- **Status (this native/Path C build):** the headless **`sampa-uptimedec` core is available**
-  — wired in as a git-pinned dependency of `sampa-native` (per ADR 0002). The feature ships
-  end-to-end in the `sampa_graphics_terminal` reference (Tauri) build (`crates/uptimedec`, the
-  `run_uptime` bridge, the `#loadgauge` overlay); the **native gauge UI that consumes the
-  parsed loads is Path C's follow-up** (and must likewise run `uptime` with `LC_ALL=C`).
-  Mirrored here as the behavioral contract; the file/keybinding references describe the
-  reference build.
+- **Status (this native/Path C build):** **implemented.** Typed `uptime` + `Ctrl+Shift+D` runs
+  a read-only `uptime` with **`LC_ALL=C`** forced (some locales print the load averages with a
+  decimal comma, which is unparseable), parses it with `sampa_uptimedec::parse_uptime`, and
+  attaches the CPU core count (`available_parallelism`). Shows **three horizontal bars** — 1 /
+  5 / 15 min — each filled to `min(load / cores, 1)` over a faint track and coloured by the
+  load÷cores ratio (green < 0.7, yellow < 1.0, orange < 1.5, red ≥ 1.5), each row giving the
+  raw load and its % of cores, with an `up <duration> · N users · M cores` subtitle. Colour is
+  redundant with bar length. Display-only — no insert action; `Esc` / `Enter` dismiss. The
+  keybinding is the native ps chord (`Ctrl+Shift+D`), dispatched on the typed command like
+  `cd` / `du` / `free` / `df` / `ping`. Mirrored below as the language-agnostic contract; the
+  `#loadgauge` file/keybinding references describe the reference (Tauri) build.
 - **Applies to:** visualising the 1/5/15-minute load averages relative to the CPU core count,
   opened from the keyboard. Language-agnostic behavioral contract so any frontend (webview or
   native Rust) behaves identically.

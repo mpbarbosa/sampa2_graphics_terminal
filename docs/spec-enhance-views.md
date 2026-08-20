@@ -15,6 +15,7 @@ you've typed** (keystroke-derived — autosuggestions never affect it) selects t
 | `free` | **memory gauge** | proportional RAM/swap segmented bars with a legend | ❌ display-only |
 | `df` | **disk-free gauge** | one segmented bar per filesystem (used / reserved / free), fullest-first | ❌ display-only |
 | `ping` | **latency chart** | a per-packet RTT sparkline (height ∝ RTT, banded) + loss ticks + summary | ❌ display-only |
+| `uptime` | **load gauge** | three load bars (1/5/15 min) scaled to CPU cores, banded by load÷cores | ❌ display-only |
 | *anything else* (incl. `ps`) | **ps output enhancement** | the last `ps aux`, decorated: quiet columns / bars + live sort / grouped inspector (by width) | `k` → `kill <pid>` in the inspector |
 
 Each is a **modal overlay**: `Esc` (and its view-specific keys) dismisses it and returns
@@ -23,7 +24,7 @@ focus to the terminal.
 ## The rules they share
 
 - **Read-only.** Every view either runs a read-only command (`du -k`, `free -k`, `df -k`, a
-  bounded `ping`) or reads the scrollback/cwd. Nothing runs on your behalf.
+  bounded `ping`, `uptime`) or reads the scrollback/cwd. Nothing runs on your behalf.
 - **Insert-never-run.** The views that produce a command (`cd`, `du` → `cd <path>`; the ps
   inspector → `kill <pid>`) **compose it at the prompt and never press Enter** — you review
   and run it yourself. The `free` gauge has no command to compose, so it's purely
@@ -48,6 +49,7 @@ of in a panel. A per-frame, non-destructive transform — copy/paste stays byte-
 - [spec-free-gauge.md](spec-free-gauge.md) — the `free` memory gauge.
 - [spec-df-gauge.md](spec-df-gauge.md) — the `df` disk-free gauge.
 - [spec-ping-chart.md](spec-ping-chart.md) — the `ping` latency chart.
+- [spec-load-gauge.md](spec-load-gauge.md) — the `uptime` load gauge.
 
 Related overlays that share the insert-never-run rule but not the `Ctrl+Shift+D` dispatch:
 the [AI suggester/explainer](spec-ai-overlay.md) (`Ctrl+Shift+A` / `Ctrl+Shift+X`) and the

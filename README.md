@@ -23,6 +23,7 @@ run, never on its own.
   - `free` → a **memory gauge** (RAM/swap segmented bars) — display-only
   - `df` → a **disk-free gauge** (one bar per filesystem, fullest-first) — display-only
   - `ping <host>` → a **latency chart** (per-packet RTT sparkline + loss ticks) — display-only
+  - `uptime` → a **load gauge** (1/5/15-min load bars scaled to CPU cores) — display-only
   - *anything else* → the **`ps` output enhancement** (quiet columns / bars + sort / grouped
     inspector, by width). `Ctrl+Shift+I` decorates `ps` output **in place** in the scrollback.
 - **AI (opt-in, one network surface):** `Ctrl+Shift+A` suggest a command · `Ctrl+Shift+X`
@@ -75,7 +76,7 @@ An `.rpm` (`./packaging/build-rpm.sh`) is available too. See
 ## Docs
 
 - [docs/spec-enhance-views.md](docs/spec-enhance-views.md) — the `Ctrl+Shift+D` command
-  visualisers (`ps` / `cd` / `du` / `free` / `df` / `ping`), with links to each view's spec.
+  visualisers (`ps` / `cd` / `du` / `free` / `df` / `ping` / `uptime`), with links to each view's spec.
 - [docs/PLAN.md](docs/PLAN.md) — the phased development plan (N0–N6, v1).
 - [docs/perf.md](docs/perf.md) — the VT ingest throughput benchmark (`--bench`) + baseline.
 - [docs/rust-only-feasibility.md](docs/rust-only-feasibility.md) — why Path C is a

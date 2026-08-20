@@ -48,6 +48,7 @@ use sampa_config::CursorStyle;
 use sampa_dfdec::{parse_df, FsUsage};
 use sampa_dumap::{parse_du, DuNode};
 use sampa_freemem::{parse_free, FreeInfo};
+use sampa_uptimedec::{parse_uptime, UptimeInfo};
 use sampa_pingdec::{parse_ping, PingReport};
 use sampa_fsnav::{list_subdirs, relativize, Dir};
 use sampa_ps_decorate::{
@@ -93,7 +94,22 @@ const DIVIDER: f32 = 2.0;
 /// Below 1 % uses the theme foreground; an elided zero (`–`) renders muted.
 const HEAT_GREEN: [u8; 3] = [0x98, 0xc3, 0x79];
 const HEAT_YELLOW: [u8; 3] = [0xe5, 0xc0, 0x7b];
+const HEAT_ORANGE: [u8; 3] = [0xd1, 0x9a, 0x66];
 const HEAT_RED: [u8; 3] = [0xe0, 0x6c, 0x75];
+
+/// Colour for a load-average bar by its load÷cores ratio (spec-load-gauge.md §4): green < 0.7,
+/// yellow < 1.0, orange < 1.5, red ≥ 1.5 (≥ 1.0 means at/over capacity for that window).
+fn load_band(ratio: f64) -> [u8; 3] {
+    if ratio >= 1.5 {
+        HEAT_RED
+    } else if ratio >= 1.0 {
+        HEAT_ORANGE
+    } else if ratio >= 0.7 {
+        HEAT_YELLOW
+    } else {
+        HEAT_GREEN
+    }
+}
 /// Font-size bounds for zoom (Ctrl +/−/0).
 const FONT_SIZE_MIN: f32 = 6.0;
 const FONT_SIZE_MAX: f32 = 48.0;
@@ -2257,6 +2273,10 @@ fn main() -> Result<()> {
         ping_report: None,
         ping_msg: None,
         ping_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        load_on: false,
+        load_info: None,
+        load_cores: 1,
+        load_msg: None,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2630,6 +2650,10 @@ struct App {
     ping_report: Option<PingReport>, // parsed report (None while pinging / on failure)
     ping_msg: Option<String>,        // status line: "pinging host…", no-host, or an error
     ping_gen: std::sync::Arc<std::sync::atomic::AtomicU64>, // supersede token for the async run
+    load_on: bool,
+    load_info: Option<UptimeInfo>, // parsed loads (None on parse failure)
+    load_cores: usize,             // CPU core count, to scale the load bars
+    load_msg: Option<String>,      // status line when uptime is unavailable/unparseable
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -2853,6 +2877,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if self.ping_on {
                     self.ping_key(&event.logical_key);
+                    return;
+                }
+                if self.load_on {
+                    self.load_key(&event.logical_key);
                     return;
                 }
                 if self.palette_on {
@@ -3915,13 +3943,14 @@ impl App {
             Action::EnhancePs => {
                 // Overloaded on the typed command (spec §2): `cd` → tree picker, `du` →
                 // disk-usage treemap, `free` → memory gauge, `df` → disk-free gauge, `ping` →
-                // latency chart, anything else → the ps decorator.
+                // latency chart, `uptime` → load gauge, anything else → the ps decorator.
                 match first_command_token(&self.grid_command_line()) {
                     "cd" => self.cd_open(),
                     "du" => self.du_open(),
                     "free" => self.free_open(),
                     "df" => self.df_open(),
                     "ping" => self.ping_open(),
+                    "uptime" => self.load_open(),
                     _ => self.ps_open(),
                 }
             }
@@ -5704,6 +5733,102 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         (title, body, spans)
     }
 
+    // --- uptime load gauge (spec-load-gauge.md) ------------------------------------------
+    /// Open the load gauge: run a read-only `uptime` with **`LC_ALL=C`** (forced — some
+    /// locales print the load averages with a decimal comma, which is unparseable), parse it,
+    /// and attach the CPU core count so the bars scale to capacity. Instant; display-only.
+    fn load_open(&mut self) {
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+        self.du_on = false;
+        self.free_on = false;
+        self.df_on = false;
+        self.ping_on = false;
+        self.load_on = true;
+        self.load_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let parsed = std::process::Command::new("uptime")
+            .env("LC_ALL", "C")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| parse_uptime(&String::from_utf8_lossy(&o.stdout)));
+        match parsed {
+            Some(info) => {
+                self.load_info = Some(info);
+                self.load_msg = None;
+            }
+            None => {
+                self.load_info = None;
+                self.load_msg = Some("uptime unavailable or unparseable.".into());
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn load_close(&mut self) {
+        self.load_on = false;
+        self.load_info = None;
+        self.load_msg = None;
+        self.request_redraw();
+    }
+
+    fn load_key(&mut self, key: &Key) {
+        // Read-only: Esc / Enter dismiss.
+        if matches!(key, Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)) {
+            self.load_close();
+        }
+    }
+
+    /// Build the load gauge panel's `(title, body, spans)`: three horizontal bars (1 / 5 / 15
+    /// min), each filled to `min(load / cores, 1)` and coloured by the load÷cores ratio, over
+    /// a faint track. Colour is redundant with bar length (spec §4). Display-only.
+    fn load_render(&self, info: &UptimeInfo) -> (String, String, Vec<BodySpan>) {
+        let fg = self.theme.fg;
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        let track = blend(self.theme.bg, self.theme.fg, 0.18);
+        let bar_w = (self.cols as usize).saturating_sub(8).clamp(16, 60);
+        let cores = self.load_cores.max(1);
+        let rows = [("1 min ", info.load1), ("5 min ", info.load5), ("15 min", info.load15)];
+        let mut spans: Vec<BodySpan> = Vec::new();
+        for (i, (label, load)) in rows.iter().enumerate() {
+            if i > 0 {
+                spans.push(("\n".to_string(), fg, false, false));
+            }
+            let ratio = load / cores as f64;
+            let fill = (ratio.min(1.0) * bar_w as f64).round() as usize;
+            let empty = bar_w.saturating_sub(fill);
+            spans.push((format!("{label} "), fg, true, false));
+            spans.push(("█".repeat(fill), load_band(ratio), false, false));
+            spans.push(("█".repeat(empty), track, false, false));
+            spans.push((
+                format!("  {load:.2}  ({:.0}% of {cores})", ratio * 100.0),
+                muted,
+                false,
+                false,
+            ));
+        }
+        // Subtitle: up <duration> · N users · M cores.
+        let mut sub = String::new();
+        if let Some(up) = &info.up {
+            sub.push_str(&format!("up {up}"));
+        }
+        if let Some(users) = info.users {
+            if !sub.is_empty() {
+                sub.push_str(" · ");
+            }
+            sub.push_str(&format!("{users} user{}", if users == 1 { "" } else { "s" }));
+        }
+        if !sub.is_empty() {
+            sub.push_str(" · ");
+        }
+        sub.push_str(&format!("{cores} core{}", if cores == 1 { "" } else { "s" }));
+        let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
+        let title = format!("load — {sub}   ·  Esc / Enter closes");
+        (title, body, spans)
+    }
+
     // --- df disk-free gauge (spec-df-gauge.md) -------------------------------------------
     /// Open the df gauge: kick a **timeout-bounded** `df -k` off-thread (it can block on a
     /// stale mount) and show a status line until `DfReady` lands. Display-only.
@@ -6331,6 +6456,9 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let ping_title;
         let ping_body;
         let ping_spans: Vec<BodySpan>;
+        let load_title;
+        let load_body;
+        let load_spans: Vec<BodySpan>;
         let ai_title;
         let ai_body_spans: Vec<BodySpan>;
         let (_, lh) = self.cell_metrics();
@@ -6526,6 +6654,21 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                     ping_title = "ping — latency   ·  Esc".to_string();
                     ping_body = self.ping_msg.clone().unwrap_or_default();
                     Some(PanelView { title: &ping_title, body: &ping_body, body_spans: None })
+                }
+            }
+        } else if self.load_on {
+            match self.load_info.as_ref() {
+                Some(info) => {
+                    let (t, b, spans) = self.load_render(info);
+                    load_title = t;
+                    load_body = b;
+                    load_spans = spans;
+                    Some(PanelView { title: &load_title, body: &load_body, body_spans: Some(&load_spans) })
+                }
+                None => {
+                    load_title = "load — uptime   ·  Esc".to_string();
+                    load_body = self.load_msg.clone().unwrap_or_default();
+                    Some(PanelView { title: &load_title, body: &load_body, body_spans: None })
                 }
             }
         } else {
@@ -9698,6 +9841,17 @@ mod tests {
         assert!(t.starts_with('…'));
         assert!(t.ends_with("deadbeef"));
         assert_eq!(t.chars().count(), 18);
+    }
+
+    #[test]
+    fn load_band_thresholds() {
+        // load ÷ cores ratio → colour band (spec-load-gauge.md §4).
+        assert_eq!(load_band(0.3), HEAT_GREEN); // < 0.7 idle
+        assert_eq!(load_band(0.7), HEAT_YELLOW); // busy
+        assert_eq!(load_band(1.0), HEAT_ORANGE); // at capacity
+        assert_eq!(load_band(1.49), HEAT_ORANGE);
+        assert_eq!(load_band(1.5), HEAT_RED); // overloaded
+        assert_eq!(load_band(4.0), HEAT_RED);
     }
 
     #[test]
