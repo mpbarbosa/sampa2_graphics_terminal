@@ -1745,6 +1745,7 @@ impl KittyScanner {
 /// so it scrolls up with the text (see [`image_row`]). `id` keys the GPU texture.
 struct PlacedImage {
     id: u64,
+    kitty_id: Option<u32>, // kitty protocol image id (`i=`), for `a=d` delete-by-id
     anchor: i32,
     base_history: usize,
     col: usize,
@@ -1769,11 +1770,19 @@ struct ImageStore {
 }
 
 impl ImageStore {
-    fn add(&mut self, anchor: i32, base_history: usize, col: usize, img: DecodedImage) {
+    fn add(
+        &mut self,
+        anchor: i32,
+        base_history: usize,
+        col: usize,
+        kitty_id: Option<u32>,
+        img: DecodedImage,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         self.images.push(PlacedImage {
             id,
+            kitty_id,
             anchor,
             base_history,
             col,
@@ -1784,6 +1793,25 @@ impl ImageStore {
         if self.images.len() > MAX_IMAGES {
             self.images.remove(0);
         }
+    }
+
+    /// Apply a kitty `a=d` delete (spec §6.4). Supported selectors: `d=a`/`d=A` (or `d`
+    /// absent) → **all** placements; `d=i`/`d=I` with `i=<id>` → placements with that kitty
+    /// id. Other selectors (by cursor/number/position) are ignored. Returns whether anything
+    /// was removed (so the caller can redraw). Delete-all clears every inline image
+    /// regardless of source — an app clearing images wants the screen clear.
+    fn delete_kitty(&mut self, control: &str) -> bool {
+        let before = self.images.len();
+        match kitty_key(control, "d").unwrap_or("a") {
+            "a" | "A" => self.images.clear(),
+            "i" | "I" => {
+                if let Some(id) = kitty_num(control, "i") {
+                    self.images.retain(|im| im.kitty_id != Some(id));
+                }
+            }
+            _ => {}
+        }
+        self.images.len() != before
     }
 }
 
@@ -2354,7 +2382,8 @@ fn pump(
                 // the next output byte is processed — that's what apps block on).
                 let mut replies: Vec<Vec<u8>> = Vec::new();
                 let mut pty_resize: Option<(u16, u16)> = None;
-                let mut image_adds: Vec<(i32, usize, usize, DecodedImage)> = Vec::new();
+                let mut image_adds: Vec<(i32, usize, usize, Option<u32>, DecodedImage)> = Vec::new();
+                let mut kitty_deletes: Vec<String> = Vec::new();
                 if let Ok(mut g) = state.lock() {
                     let g = &mut *g;
                     // Split the feed at each DECRQCRA so the checksum sees the exact
@@ -2458,7 +2487,7 @@ fn pump(
                             let base = g.term.grid().history_size();
                             let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
                             g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-                            image_adds.push((anchor, base, col, img));
+                            image_adds.push((anchor, base, col, None, img));
                         }
                     }
                     // Sixel graphics (DCS): rasterize + place like an inline image.
@@ -2469,7 +2498,7 @@ fn pump(
                             let base = g.term.grid().history_size();
                             let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
                             g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-                            image_adds.push((anchor, base, col, img));
+                            image_adds.push((anchor, base, col, None, img));
                         }
                     }
                     // Kitty graphics (APC): decode chunked transmissions, place, and ack.
@@ -2479,9 +2508,13 @@ fn pump(
                             let cur = g.term.renderable_content().cursor.point;
                             let (anchor, col) = (cur.line.0, cur.column.0);
                             let base = g.term.grid().history_size();
+                            let kid = kitty_num(&control, "i");
                             let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
                             g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-                            image_adds.push((anchor, base, col, img));
+                            image_adds.push((anchor, base, col, kid, img));
+                        } else if kitty_key(&control, "a") == Some("d") {
+                            // `a=d` delete request — applied to the shared store below.
+                            kitty_deletes.push(control);
                         }
                     }
                     // Correct alacritty's DECRQM replies (§17): permanently-reset modes
@@ -2495,10 +2528,13 @@ fn pump(
                         }
                     }
                 }
-                if !image_adds.is_empty() {
+                if !image_adds.is_empty() || !kitty_deletes.is_empty() {
                     if let Ok(mut store) = image_store.lock() {
-                        for (anchor, base, col, img) in image_adds {
-                            store.add(anchor, base, col, img);
+                        for (anchor, base, col, kid, img) in image_adds {
+                            store.add(anchor, base, col, kid, img);
+                        }
+                        for control in &kitty_deletes {
+                            store.delete_kitty(control);
                         }
                     }
                 }
@@ -8780,7 +8816,7 @@ fn capture(path: &str) -> Result<()> {
         images
             .lock()
             .unwrap()
-            .add(6, 0, 2, DecodedImage { width: iw, height: ih, rgba });
+            .add(6, 0, 2, None, DecodedImage { width: iw, height: ih, rgba });
     }
     // Optional sixel demo: SAMPA_CAPTURE_SIXEL=<file> rasterizes a real sixel into view.
     if let Ok(path) = std::env::var("SAMPA_CAPTURE_SIXEL") {
@@ -8788,7 +8824,7 @@ fn capture(path: &str) -> Result<()> {
             let mut sc = SixelScanner::new();
             for payload in sc.feed(&bytes) {
                 if let Some(img) = parse_sixel(&payload) {
-                    images.lock().unwrap().add(4, 0, 30, img);
+                    images.lock().unwrap().add(4, 0, 30, None, img);
                 }
             }
         }
@@ -8799,7 +8835,7 @@ fn capture(path: &str) -> Result<()> {
             let mut sc = KittyScanner::new();
             for (control, payload) in sc.feed(&bytes) {
                 if let Some(img) = parse_kitty(&control, &payload) {
-                    images.lock().unwrap().add(4, 0, 30, img);
+                    images.lock().unwrap().add(4, 0, 30, None, img);
                 }
             }
         }
@@ -9229,6 +9265,35 @@ mod tests {
         // Inserted when scrollback already had 8 lines: only *later* growth moves it.
         assert_eq!(image_row(2, 8, 8, 0), 2);
         assert_eq!(image_row(2, 8, 11, 0), -1);
+    }
+
+    #[test]
+    fn kitty_delete_removes_images() {
+        let px = || DecodedImage { width: 2, height: 2, rgba: vec![0u8; 16] };
+        let mut store = ImageStore::default();
+        store.add(0, 0, 0, Some(7), px());
+        store.add(0, 0, 0, Some(9), px());
+        store.add(0, 0, 0, None, px()); // e.g. a sixel / OSC-1337 image (no kitty id)
+        assert_eq!(store.images.len(), 3);
+
+        // Delete-by-id (d=i, i=7) removes only that placement.
+        assert!(store.delete_kitty("a=d,d=i,i=7"));
+        assert_eq!(store.images.len(), 2);
+        assert!(store.images.iter().all(|im| im.kitty_id != Some(7)));
+
+        // A no-match id delete changes nothing.
+        assert!(!store.delete_kitty("a=d,d=i,i=999"));
+        assert_eq!(store.images.len(), 2);
+
+        // Delete-all (d absent defaults to `a`) clears everything, including non-kitty images.
+        assert!(store.delete_kitty("a=d"));
+        assert!(store.images.is_empty());
+
+        // Deleting from an empty store reports no change.
+        assert!(!store.delete_kitty("a=d,d=a"));
+
+        // `a=d` is not mistaken for an image transmission.
+        assert!(parse_kitty("a=d,d=a", &[]).is_none());
     }
 
     #[test]
