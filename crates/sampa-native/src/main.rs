@@ -50,6 +50,7 @@ use sampa_dumap::{parse_du, DuNode};
 use sampa_freemem::{parse_free, FreeInfo};
 use sampa_ghhelp::{parse_gh_help, GhCommand};
 use sampa_uptimedec::{parse_uptime, UptimeInfo};
+use sampa_netdec::{parse_ss, Conn};
 use sampa_pingdec::{parse_ping, PingReport};
 use sampa_fsnav::{list_subdirs, relativize, Dir};
 use sampa_ps_decorate::{
@@ -97,6 +98,23 @@ const HEAT_GREEN: [u8; 3] = [0x98, 0xc3, 0x79];
 const HEAT_YELLOW: [u8; 3] = [0xe5, 0xc0, 0x7b];
 const HEAT_ORANGE: [u8; 3] = [0xd1, 0x9a, 0x66];
 const HEAT_RED: [u8; 3] = [0xe0, 0x6c, 0x75];
+const HEAT_BLUE: [u8; 3] = [0x61, 0xaf, 0xef];
+
+/// Colour a socket by its connection state (spec-netstat-table.md §4): listening/unconnected
+/// green (waiting), established blue (active), teardown states (`*WAIT`/`CLOS*`) orange.
+/// `muted` is the caller's fallback for anything else. Colour is redundant with the state text.
+fn net_state_color(state: &str, muted: [u8; 3]) -> [u8; 3] {
+    let s = state.to_ascii_uppercase();
+    if s == "LISTEN" || s == "UNCONN" {
+        HEAT_GREEN
+    } else if s == "ESTAB" {
+        HEAT_BLUE
+    } else if s.contains("WAIT") || s.starts_with("CLOS") || s == "LAST-ACK" || s == "CLOSING" {
+        HEAT_ORANGE
+    } else {
+        muted
+    }
+}
 
 /// Colour for a load-average bar by its load÷cores ratio (spec-load-gauge.md §4): green < 0.7,
 /// yellow < 1.0, orange < 1.5, red ≥ 1.5 (≥ 1.0 means at/over capacity for that window).
@@ -2385,6 +2403,9 @@ fn main() -> Result<()> {
         load_info: None,
         load_cores: 1,
         load_msg: None,
+        net_on: false,
+        net_conns: None,
+        net_msg: None,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2810,6 +2831,9 @@ struct App {
     load_info: Option<UptimeInfo>, // parsed loads (None on parse failure)
     load_cores: usize,             // CPU core count, to scale the load bars
     load_msg: Option<String>,      // status line when uptime is unavailable/unparseable
+    net_on: bool,
+    net_conns: Option<Vec<Conn>>, // parsed sockets (None on failure)
+    net_msg: Option<String>,      // status line when ss is unavailable/unparseable
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -3037,6 +3061,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if self.load_on {
                     self.load_key(&event.logical_key);
+                    return;
+                }
+                if self.net_on {
+                    self.net_key(&event.logical_key);
                     return;
                 }
                 if self.palette_on {
@@ -3458,6 +3486,27 @@ fn gh_cheatsheet_lines(cmds: &[GhCommand]) -> Vec<String> {
         lines.push(format!("  {:<width$}  {}", c.name, c.desc, width = width));
     }
     lines
+}
+
+/// The `gh` sub-command path to drill into, from a typed line whose command is `gh`: the
+/// leading **non-flag** tokens after `gh`, stopping at the first flag (spec-gh-cheatsheet.md).
+/// `gh` → `[]` (top level); `gh repo view --web` → `["repo","view"]`; skips a `sudo` prefix.
+fn gh_subcommands(line: &str) -> Vec<String> {
+    let mut found = false;
+    let mut path = Vec::new();
+    for t in line.split_whitespace() {
+        if !found {
+            if t.strip_prefix('\\').unwrap_or(t) == "gh" {
+                found = true;
+            }
+            continue; // skip everything up to and including the `gh` token
+        }
+        if t.starts_with('-') {
+            break; // a flag ends the sub-command path
+        }
+        path.push(t.to_string());
+    }
+    path
 }
 
 fn first_command_token(line: &str) -> &str {
@@ -4119,7 +4168,8 @@ impl App {
             Action::EnhancePs => {
                 // Overloaded on the typed command (spec §2): `cd` → tree picker, `du` →
                 // disk-usage treemap, `free` → memory gauge, `df` → disk-free gauge, `ping` →
-                // latency chart, `uptime` → load gauge, anything else → the ps decorator.
+                // latency chart, `uptime` → load gauge, `netstat`/`ss` → connections table,
+                // anything else → the ps decorator.
                 match first_command_token(&self.grid_command_line()) {
                     "cd" => self.cd_open(),
                     "du" => self.du_open(),
@@ -4127,6 +4177,7 @@ impl App {
                     "df" => self.df_open(),
                     "ping" => self.ping_open(),
                     "uptime" => self.load_open(),
+                    "netstat" | "ss" => self.net_open(),
                     _ => self.ps_open(),
                 }
             }
@@ -4780,23 +4831,36 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             self.man_lines = vec!["Type a command, then press Ctrl+Shift+M for its man page.".into()];
         } else if cmd == "gh" {
             // `gh` has no useful man page — show a grouped cheat-sheet of its subcommands
-            // (spec-gh-cheatsheet.md), routed through the man panel.
+            // (spec-gh-cheatsheet.md), routed through the man panel. Drill in by the typed
+            // subcommand path: `gh repo` shows `gh repo`'s commands, a leaf shows raw help.
+            let subs = gh_subcommands(&line);
+            let display = if subs.is_empty() {
+                "gh".to_string()
+            } else {
+                format!("gh {}", subs.join(" "))
+            };
+            self.man_cmd = display.clone();
             self.man_loading = true;
             self.man_lines.clear();
             let proxy = self.proxy.clone();
             std::thread::spawn(move || {
-                let lines = match std::process::Command::new("gh").arg("--help").output() {
+                let mut command = std::process::Command::new("gh");
+                command.args(&subs).arg("--help");
+                let lines = match command.output() {
                     Ok(o) => {
-                        // `gh --help` prints to stdout; fold in stderr just in case.
+                        // `gh … --help` prints to stdout; fold in stderr just in case.
                         let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
                         text.push_str(&String::from_utf8_lossy(&o.stderr));
-                        parse_gh_help(&text)
-                            .map(|c| gh_cheatsheet_lines(&c))
-                            .unwrap_or_else(|| vec!["`gh --help` produced no commands.".to_string()])
+                        match parse_gh_help(&text) {
+                            Some(cmds) => gh_cheatsheet_lines(&cmds),
+                            // A leaf (no `… COMMANDS` sections) → show its raw help text.
+                            None if !text.trim().is_empty() => text.lines().map(str::to_string).collect(),
+                            None => vec!["No gh help available.".to_string()],
+                        }
                     }
                     Err(_) => vec!["gh not found on PATH.".to_string()],
                 };
-                let _ = proxy.send_event(UserEvent::ManReady { cmd, lines: Some(lines) });
+                let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
             });
         } else {
             self.man_loading = true;
@@ -6025,6 +6089,133 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         (title, body, spans)
     }
 
+    // --- netstat connections table (spec-netstat-table.md) -------------------------------
+    /// Open the connections panel: run a **read-only** `ss -tunap` (ss is the data source —
+    /// net-tools `netstat` is deprecated and drops the udp State column), parse the sockets,
+    /// and show them as a state-coloured, listening-first table. Display-only — nothing runs.
+    fn net_open(&mut self) {
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+        self.du_on = false;
+        self.free_on = false;
+        self.df_on = false;
+        self.ping_on = false;
+        self.load_on = false;
+        self.net_on = true;
+        let parsed = std::process::Command::new("ss")
+            .args(["-tunap"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| parse_ss(&String::from_utf8_lossy(&o.stdout)));
+        match parsed {
+            Some(conns) => {
+                self.net_conns = Some(conns);
+                self.net_msg = None;
+            }
+            None => {
+                self.net_conns = None;
+                self.net_msg = Some("ss unavailable or unparseable.".into());
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn net_close(&mut self) {
+        self.net_on = false;
+        self.net_conns = None;
+        self.net_msg = None;
+        self.request_redraw();
+    }
+
+    fn net_key(&mut self, key: &Key) {
+        // Read-only: Esc / Enter dismiss.
+        if matches!(key, Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)) {
+            self.net_close();
+        }
+    }
+
+    /// Build the connections panel's `(title, body, spans)`: an aligned table (proto · state ·
+    /// local · peer · process), one row per socket **coloured by state** (spec §4), sorted
+    /// **listening-first**, with a `sockets · listening · established` summary. Display-only.
+    fn net_render(&self, conns: &[Conn]) -> (String, String, Vec<BodySpan>) {
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        // Listening-first: LISTEN/UNCONN sort ahead, then stable by original order.
+        let listening = |s: &str| {
+            let u = s.to_ascii_uppercase();
+            u == "LISTEN" || u == "UNCONN"
+        };
+        let mut rows: Vec<&Conn> = conns.iter().collect();
+        rows.sort_by_key(|c| !listening(&c.state));
+        // Column widths from the data (capped so a pathological address can't blow the layout).
+        let w = |f: fn(&Conn) -> &str, cap: usize| {
+            rows.iter().map(|c| f(c).chars().count()).max().unwrap_or(0).clamp(0, cap)
+        };
+        let wp = w(|c| c.proto.as_str(), 5).max(5);
+        let ws = w(|c| c.state.as_str(), 10).max(6);
+        let wl = w(|c| c.local.as_str(), 28).max(14);
+        let wr = w(|c| c.peer.as_str(), 28).max(14);
+        let clip = |s: &str, n: usize| -> String {
+            let len = s.chars().count();
+            if len <= n {
+                format!("{s:<n$}")
+            } else {
+                let keep: String = s.chars().take(n.saturating_sub(1)).collect();
+                format!("{keep}…")
+            }
+        };
+        let mut spans: Vec<BodySpan> = Vec::new();
+        // Header row (bold, muted).
+        spans.push((
+            format!(
+                "{}  {}  {}  {}  {}\n",
+                clip("PROTO", wp),
+                clip("STATE", ws),
+                clip("LOCAL ADDRESS", wl),
+                clip("PEER ADDRESS", wr),
+                "PROCESS"
+            ),
+            muted,
+            true,
+            false,
+        ));
+        let mut n_listen = 0usize;
+        let mut n_estab = 0usize;
+        for c in &rows {
+            let su = c.state.to_ascii_uppercase();
+            if listening(&c.state) {
+                n_listen += 1;
+            } else if su == "ESTAB" {
+                n_estab += 1;
+            }
+            let color = net_state_color(&c.state, muted);
+            let proc = c.process.as_deref().unwrap_or("");
+            spans.push((
+                format!(
+                    "{}  {}  {}  {}  {}\n",
+                    clip(&c.proto, wp),
+                    clip(&c.state, ws),
+                    clip(&c.local, wl),
+                    clip(&c.peer, wr),
+                    proc
+                ),
+                color,
+                false,
+                false,
+            ));
+        }
+        let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
+        let title = format!(
+            "connections — {} sockets · {} listening · {} established   ·  Esc / Enter closes",
+            rows.len(),
+            n_listen,
+            n_estab
+        );
+        (title, body, spans)
+    }
+
     // --- df disk-free gauge (spec-df-gauge.md) -------------------------------------------
     /// Open the df gauge: kick a **timeout-bounded** `df -k` off-thread (it can block on a
     /// stale mount) and show a status line until `DfReady` lands. Display-only.
@@ -6655,6 +6846,9 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let load_title;
         let load_body;
         let load_spans: Vec<BodySpan>;
+        let net_title;
+        let net_body;
+        let net_spans: Vec<BodySpan>;
         let ai_title;
         let ai_body_spans: Vec<BodySpan>;
         let (_, lh) = self.cell_metrics();
@@ -6764,9 +6958,9 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let start = self.man_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
             panel_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
-            // `gh` shows a cheat-sheet, not a man page — label it accordingly.
-            let label = if self.man_cmd == "gh" {
-                "gh — commands".to_string()
+            // `gh` (and `gh <sub>` drill-ins) show a cheat-sheet, not a man page.
+            let label = if self.man_cmd == "gh" || self.man_cmd.starts_with("gh ") {
+                format!("{} — commands", self.man_cmd)
             } else {
                 format!("man {}", self.man_cmd)
             };
@@ -6870,6 +7064,21 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                     load_title = "load — uptime   ·  Esc".to_string();
                     load_body = self.load_msg.clone().unwrap_or_default();
                     Some(PanelView { title: &load_title, body: &load_body, body_spans: None })
+                }
+            }
+        } else if self.net_on {
+            match self.net_conns.as_ref() {
+                Some(conns) => {
+                    let (t, b, spans) = self.net_render(conns);
+                    net_title = t;
+                    net_body = b;
+                    net_spans = spans;
+                    Some(PanelView { title: &net_title, body: &net_body, body_spans: Some(&net_spans) })
+                }
+                None => {
+                    net_title = "connections — ss   ·  Esc".to_string();
+                    net_body = self.net_msg.clone().unwrap_or_default();
+                    Some(PanelView { title: &net_title, body: &net_body, body_spans: None })
                 }
             }
         } else {
@@ -9650,6 +9859,18 @@ mod tests {
         assert_eq!(first_command_token("\\ls -a"), "ls"); // skip a leading backslash escape
         assert_eq!(first_command_token(""), "");
         assert_eq!(first_command_token("sudo"), ""); // sudo with nothing after
+    }
+
+    #[test]
+    fn gh_subcommands_extracts_drill_path() {
+        let empty: Vec<String> = vec![];
+        assert_eq!(gh_subcommands("gh"), empty); // top level
+        assert_eq!(gh_subcommands("gh repo"), vec!["repo"]);
+        assert_eq!(gh_subcommands("gh repo view --web"), vec!["repo", "view"]); // stop at flag
+        assert_eq!(gh_subcommands("gh pr list -s open"), vec!["pr", "list"]);
+        assert_eq!(gh_subcommands("gh --help"), empty); // flag immediately after gh
+        assert_eq!(gh_subcommands("sudo gh repo"), vec!["repo"]); // skip a sudo prefix
+        assert_eq!(gh_subcommands("ls -la"), empty); // not gh at all
     }
 
     #[test]

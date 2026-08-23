@@ -16,6 +16,7 @@ you've typed** (keystroke-derived — autosuggestions never affect it) selects t
 | `df` | **disk-free gauge** | one segmented bar per filesystem (used / reserved / free), fullest-first | ❌ display-only |
 | `ping` | **latency chart** | a per-packet RTT sparkline (height ∝ RTT, banded) + loss ticks + summary | ❌ display-only |
 | `uptime` | **load gauge** | three load bars (1/5/15 min) scaled to CPU cores, banded by load÷cores | ❌ display-only |
+| `netstat` / `ss` | **connections table** | open sockets as a state-coloured table (listening-first) + a summary | ❌ display-only |
 | *anything else* (incl. `ps`) | **ps output enhancement** | the last `ps aux`, decorated: quiet columns / bars + live sort / grouped inspector (by width) | `k` → `kill <pid>` in the inspector |
 
 Each is a **modal overlay**: `Esc` (and its view-specific keys) dismisses it and returns
@@ -50,6 +51,7 @@ of in a panel. A per-frame, non-destructive transform — copy/paste stays byte-
 - [spec-df-gauge.md](spec-df-gauge.md) — the `df` disk-free gauge.
 - [spec-ping-chart.md](spec-ping-chart.md) — the `ping` latency chart.
 - [spec-load-gauge.md](spec-load-gauge.md) — the `uptime` load gauge.
+- [spec-netstat-table.md](spec-netstat-table.md) — the `netstat`/`ss` connections table.
 
 Related overlays that share the insert-never-run rule but not the `Ctrl+Shift+D` dispatch:
 the [AI suggester/explainer](spec-ai-overlay.md) (`Ctrl+Shift+A` / `Ctrl+Shift+X`) and the
