@@ -289,10 +289,14 @@ refuses writes (file provably untouched) and clears on Enter.
   transmissions** (`m=1` … `m=0`); `parse_kitty` decodes the result — **PNG** (`f=100`),
   raw **RGBA** (`f=32`), raw **RGB** (`f=24`, alpha filled) with `s`×`v` dims — for the
   immediate transmit+display action (`a=T`) into the shared image path, and an
-  `ESC _ G i=<id>;OK ST` **ack** is sent so clients like `icat` don't block. 4 unit tests
-  (control parse, raw RGBA/RGB, action gate + ack, chunk reassembly) + a pump smoke + a
-  **chunked-PNG `--capture` render**. ⬜ still: image ids/placement (`a=t`/`a=p`),
-  deletion (`a=d`), z-index/placement geometry.
+  `ESC _ G i=<id>;OK ST` **ack** is sent so clients like `icat` don't block. ✅ **deletion
+  (`a=d`)** — the `i=` image id is tracked per placement, and a delete request removes
+  images: `d=a`/`d=A` (or `d` absent) clears **all** inline images (any source — an app
+  clearing images wants a clear screen), `d=i`/`d=I` with `i=<id>` clears **by id**; other
+  selectors are ignored. 5 unit tests (adds control parse, raw RGBA/RGB, action gate + ack,
+  chunk reassembly, delete-by-id/all) + a pump smoke + a **chunked-PNG `--capture` render**;
+  the transmit→delete round-trip is Xephyr-verified. ⬜ still: image ids/placement
+  (`a=t`/`a=p`), z-index/placement geometry.
 - ✅ **OSC 8 hyperlinks:** OSC-8 tracked (via `alacritty_terminal`), rendered
   **underlined**, with a strict **http/https scheme gate** (§13 — never `file:`/`javascript:`);
   auto-opens nothing. ✅ **plain-URL detection** too (`url_at`: whitespace token under the
