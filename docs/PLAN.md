@@ -295,8 +295,14 @@ refuses writes (file provably untouched) and clears on Enter.
   clearing images wants a clear screen), `d=i`/`d=I` with `i=<id>` clears **by id**; other
   selectors are ignored. 5 unit tests (adds control parse, raw RGBA/RGB, action gate + ack,
   chunk reassembly, delete-by-id/all) + a pump smoke + a **chunked-PNG `--capture` render**;
-  the transmit→delete round-trip is Xephyr-verified. ⬜ still: image ids/placement
-  (`a=t`/`a=p`), z-index/placement geometry.
+  the transmit→delete round-trip is Xephyr-verified. ✅ **transmit + place by id
+  (`a=t`/`a=p`)** — `a=t` decodes and **stores** the image under its `i=` id without
+  displaying (capped store, oldest evicted); `a=p` **places** a stored image by id at the
+  cursor. `a=T` still transmits-and-displays, and now also retains the image so it can be
+  re-placed. `decode_kitty_payload` (the format decode) is split from the display gate and
+  unit-tested for `a=t`; the transmit-only→place round-trip is Xephyr-verified (image hidden
+  on `a=t`, shown on `a=p`). ⬜ still: z-index / placement geometry (`z=`, `r=`/`c=` scaling,
+  relative placement).
 - ✅ **OSC 8 hyperlinks:** OSC-8 tracked (via `alacritty_terminal`), rendered
   **underlined**, with a strict **http/https scheme gate** (§13 — never `file:`/`javascript:`);
   auto-opens nothing. ✅ **plain-URL detection** too (`url_at`: whitespace token under the
