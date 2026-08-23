@@ -2790,6 +2790,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sampa-ghhelp"
+version = "0.1.0"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=19308db1014d2abc924e739683f1d5d5ba8163b8#19308db1014d2abc924e739683f1d5d5ba8163b8"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "sampa-man"
 version = "0.1.0"
 
@@ -2815,6 +2823,7 @@ dependencies = [
  "sampa-dumap",
  "sampa-freemem",
  "sampa-fsnav",
+ "sampa-ghhelp",
  "sampa-man",
  "sampa-palette",
  "sampa-pingdec",
