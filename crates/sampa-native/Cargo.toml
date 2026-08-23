@@ -65,7 +65,7 @@ sampa-uptimedec = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal"
 # gh command cheat-sheet core (docs/spec-gh-cheatsheet.md). parse_gh_help -> grouped gh
 # subcommands; no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native man panel:
 # a typed `gh` + Ctrl+Shift+M routes to gh_cheatsheet_lines instead of a man page (informational).
-sampa-ghhelp   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "19308db1014d2abc924e739683f1d5d5ba8163b8" }
+sampa-ghhelp   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "4208c7a33b49a50d9c19875ced1ac660a5562942" }
 
 anyhow = "1"
 winit = "0.30.13"

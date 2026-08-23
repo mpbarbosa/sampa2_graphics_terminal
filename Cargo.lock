@@ -2792,7 +2792,7 @@ dependencies = [
 [[package]]
 name = "sampa-ghhelp"
 version = "0.1.0"
-source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=19308db1014d2abc924e739683f1d5d5ba8163b8#19308db1014d2abc924e739683f1d5d5ba8163b8"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=4208c7a33b49a50d9c19875ced1ac660a5562942#4208c7a33b49a50d9c19875ced1ac660a5562942"
 dependencies = [
  "serde",
 ]
