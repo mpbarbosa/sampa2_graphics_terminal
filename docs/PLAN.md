@@ -301,8 +301,13 @@ refuses writes (file provably untouched) and clears on Enter.
   cursor. `a=T` still transmits-and-displays, and now also retains the image so it can be
   re-placed. `decode_kitty_payload` (the format decode) is split from the display gate and
   unit-tested for `a=t`; the transmit-only→place round-trip is Xephyr-verified (image hidden
-  on `a=t`, shown on `a=p`). ⬜ still: z-index / placement geometry (`z=`, `r=`/`c=` scaling,
-  relative placement).
+  on `a=t`, shown on `a=p`). ✅ **cell-box scaling (`c=`/`r=`)** — a placement's display size
+  follows the requested columns/rows against the live cell metrics (both → the exact box, one
+  → that axis fixed and the other by source aspect, neither → natural), and `r=` rows are
+  reserved exactly; the source texture stays native and the quad samples it.
+  `image_display_size` unit-tested; Xephyr-verified (an 80×80 square placed `c=30,r=3` renders
+  as a wide 30×3-cell strip with text flowing below). ⬜ still: z-index (`z=`) and relative
+  placement.
 - ✅ **OSC 8 hyperlinks:** OSC-8 tracked (via `alacritty_terminal`), rendered
   **underlined**, with a strict **http/https scheme gate** (§13 — never `file:`/`javascript:`);
   auto-opens nothing. ✅ **plain-URL detection** too (`url_at`: whitespace token under the
