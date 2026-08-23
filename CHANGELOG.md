@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.11.0] - 2026-08-23
+
+A native **`netstat`/`ss` connections table** joins the enhance-view set (`Ctrl+Shift+D`):
+open sockets as a **state-coloured, listening-first** table with process names and a
+sockets / listening / established summary. The **`gh` cheat-sheet drills in by sub-command**
+now — `gh repo` shows `gh repo`'s commands (a leaf like `gh repo view` shows its raw help) —
+and **Kitty graphics honour `c=`/`r=` cell-box scaling**, so a placement sizes to the
+requested columns/rows.
+
+### Features
+
+- netstat / ss connections table (`Ctrl+Shift+D`)
+- gh cheat-sheet sub-command drill-in (`gh repo` → `gh repo`'s commands)
+- Kitty graphics cell-box scaling (`c=` / `r=`) — N5 placement geometry
+
 ## [0.10.0] - 2026-08-23
 
 A native **`gh` command cheat-sheet** — type `gh` and press `Ctrl+Shift+M` and the man panel
