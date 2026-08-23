@@ -4,11 +4,14 @@
   `Ctrl+Shift+M` opens the man panel on a **cheat-sheet** instead of a man page: the emulator
   runs a read-only `gh --help`, parses it with `sampa_ghhelp::parse_gh_help`, and renders each
   `<SECTION> COMMANDS` header followed by name-aligned `  <name>  <desc>` rows
-  (`gh_cheatsheet_lines`), titled `gh — commands`, scrollable like any man page. Any other
-  command still shows its man page. Fails safe: `gh` missing or no commands → a one-line
-  message. (The native build routes on the `Ctrl+Shift+M` toggle; it has no live man
-  keystroke auto-update.) Mirrored below as the language-agnostic contract; the `showGhHelp`
-  file references describe the reference (Tauri) build.
+  (`gh_cheatsheet_lines`), titled `gh — commands`, scrollable like any man page. It **drills
+  in by the typed sub-command path** (`gh_subcommands`): `gh repo` runs `gh repo --help` and
+  shows `gh repo`'s commands (titled `gh repo — commands`); a **leaf** (`gh repo view`, no
+  `… COMMANDS` sections) shows that command's **raw help** instead. Any other command still
+  shows its man page. Fails safe: `gh` missing → a one-line message. (The native build routes
+  on the `Ctrl+Shift+M` toggle; it has no live man keystroke auto-update.) Mirrored below as
+  the language-agnostic contract; the `showGhHelp` file references describe the reference
+  (Tauri) build.
 - **Applies to:** showing a grouped list of GitHub CLI (`gh`) commands in the man panel when
   the typed command is `gh`. Language-agnostic behavioral contract so any frontend behaves
   identically.
