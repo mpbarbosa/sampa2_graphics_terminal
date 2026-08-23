@@ -1,11 +1,14 @@
 # Spec — `gh` command cheat-sheet
 
-- **Status (this native/Path C build):** the headless **`sampa-ghhelp` core is available** —
-  wired in as a git-pinned dependency of `sampa-native` (per ADR 0002). The feature ships
-  end-to-end in the `sampa_graphics_terminal` reference (Tauri) build (`crates/ghhelp`, the
-  `gh_help` bridge, `showGhHelp` in the man panel); the **native man-panel routing for `gh`
-  is Path C's follow-up**. Mirrored here as the behavioral contract; the file/keybinding
-  references describe the reference build.
+- **Status (this native/Path C build):** **implemented.** Typing `gh` and pressing
+  `Ctrl+Shift+M` opens the man panel on a **cheat-sheet** instead of a man page: the emulator
+  runs a read-only `gh --help`, parses it with `sampa_ghhelp::parse_gh_help`, and renders each
+  `<SECTION> COMMANDS` header followed by name-aligned `  <name>  <desc>` rows
+  (`gh_cheatsheet_lines`), titled `gh — commands`, scrollable like any man page. Any other
+  command still shows its man page. Fails safe: `gh` missing or no commands → a one-line
+  message. (The native build routes on the `Ctrl+Shift+M` toggle; it has no live man
+  keystroke auto-update.) Mirrored below as the language-agnostic contract; the `showGhHelp`
+  file references describe the reference (Tauri) build.
 - **Applies to:** showing a grouped list of GitHub CLI (`gh`) commands in the man panel when
   the typed command is `gh`. Language-agnostic behavioral contract so any frontend behaves
   identically.
