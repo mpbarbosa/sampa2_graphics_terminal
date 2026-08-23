@@ -66,6 +66,11 @@ sampa-uptimedec = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal"
 # subcommands; no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native man panel:
 # a typed `gh` + Ctrl+Shift+M routes to gh_cheatsheet_lines instead of a man page (informational).
 sampa-ghhelp   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "4208c7a33b49a50d9c19875ced1ac660a5562942" }
+# netstat connections table core (docs/spec-netstat-table.md). parse_ss -> sockets from
+# `ss -tunap` (ss is the data source: net-tools netstat is deprecated + drops the udp State
+# column); no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native connections
+# panel (net_render — a state-coloured, listening-first socket table); informational (no insert).
+sampa-netdec   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b6d24e99a0418f9c6eb1a590afa2c7946de21712" }
 
 anyhow = "1"
 winit = "0.30.13"

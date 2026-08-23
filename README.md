@@ -24,6 +24,7 @@ run, never on its own.
   - `df` → a **disk-free gauge** (one bar per filesystem, fullest-first) — display-only
   - `ping <host>` → a **latency chart** (per-packet RTT sparkline + loss ticks) — display-only
   - `uptime` → a **load gauge** (1/5/15-min load bars scaled to CPU cores) — display-only
+  - `netstat` / `ss` → a **connections table** (open sockets, state-coloured, listening-first) — display-only
   - *anything else* → the **`ps` output enhancement** (quiet columns / bars + sort / grouped
     inspector, by width). `Ctrl+Shift+I` decorates `ps` output **in place** in the scrollback.
 - **AI (opt-in, one network surface):** `Ctrl+Shift+A` suggest a command · `Ctrl+Shift+X`
