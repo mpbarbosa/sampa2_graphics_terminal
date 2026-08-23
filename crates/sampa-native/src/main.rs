@@ -48,6 +48,7 @@ use sampa_config::CursorStyle;
 use sampa_dfdec::{parse_df, FsUsage};
 use sampa_dumap::{parse_du, DuNode};
 use sampa_freemem::{parse_free, FreeInfo};
+use sampa_ghhelp::{parse_gh_help, GhCommand};
 use sampa_uptimedec::{parse_uptime, UptimeInfo};
 use sampa_pingdec::{parse_ping, PingReport};
 use sampa_fsnav::{list_subdirs, relativize, Dir};
@@ -3369,6 +3370,26 @@ fn preedit_caret_cells(text: &str, range: Option<(usize, usize)>) -> usize {
     }
 }
 
+/// Format parsed `gh` commands into the man-panel cheat-sheet (spec-gh-cheatsheet.md §4):
+/// each `<SECTION> COMMANDS` header, then name-aligned `  <name>  <desc>` rows, with a blank
+/// line between sections. Names are padded to the widest so descriptions line up.
+fn gh_cheatsheet_lines(cmds: &[GhCommand]) -> Vec<String> {
+    let width = cmds.iter().map(|c| c.name.chars().count()).max().unwrap_or(0);
+    let mut lines: Vec<String> = Vec::new();
+    let mut section = String::new();
+    for c in cmds {
+        if c.section != section {
+            if !lines.is_empty() {
+                lines.push(String::new()); // blank line between sections
+            }
+            lines.push(format!("{} COMMANDS", c.section));
+            section = c.section.clone();
+        }
+        lines.push(format!("  {:<width$}  {}", c.name, c.desc, width = width));
+    }
+    lines
+}
+
 fn first_command_token(line: &str) -> &str {
     let mut it = line.split_whitespace();
     let first = it.next().unwrap_or("");
@@ -4687,6 +4708,26 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         if cmd.is_empty() {
             self.man_loading = false;
             self.man_lines = vec!["Type a command, then press Ctrl+Shift+M for its man page.".into()];
+        } else if cmd == "gh" {
+            // `gh` has no useful man page — show a grouped cheat-sheet of its subcommands
+            // (spec-gh-cheatsheet.md), routed through the man panel.
+            self.man_loading = true;
+            self.man_lines.clear();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let lines = match std::process::Command::new("gh").arg("--help").output() {
+                    Ok(o) => {
+                        // `gh --help` prints to stdout; fold in stderr just in case.
+                        let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                        text.push_str(&String::from_utf8_lossy(&o.stderr));
+                        parse_gh_help(&text)
+                            .map(|c| gh_cheatsheet_lines(&c))
+                            .unwrap_or_else(|| vec!["`gh --help` produced no commands.".to_string()])
+                    }
+                    Err(_) => vec!["gh not found on PATH.".to_string()],
+                };
+                let _ = proxy.send_event(UserEvent::ManReady { cmd, lines: Some(lines) });
+            });
         } else {
             self.man_loading = true;
             self.man_lines.clear();
@@ -6653,12 +6694,17 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let start = self.man_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
             panel_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
+            // `gh` shows a cheat-sheet, not a man page — label it accordingly.
+            let label = if self.man_cmd == "gh" {
+                "gh — commands".to_string()
+            } else {
+                format!("man {}", self.man_cmd)
+            };
             panel_title = if self.man_loading {
-                format!("man {} — loading…", self.man_cmd)
+                format!("{label} — loading…")
             } else {
                 format!(
-                    "man {}   {}   ·  ↑/↓ PgUp/PgDn · Esc",
-                    self.man_cmd,
+                    "{label}   {}   ·  ↑/↓ PgUp/PgDn · Esc",
                     if total > 0 { format!("{}–{}/{}", start + 1, end, total) } else { "0/0".into() }
                 )
             };
@@ -9512,6 +9558,29 @@ mod tests {
         assert_eq!(first_command_token("\\ls -a"), "ls"); // skip a leading backslash escape
         assert_eq!(first_command_token(""), "");
         assert_eq!(first_command_token("sudo"), ""); // sudo with nothing after
+    }
+
+    #[test]
+    fn gh_cheatsheet_formats_and_aligns() {
+        let gc = |n: &str, d: &str, s: &str| GhCommand {
+            name: n.into(),
+            desc: d.into(),
+            section: s.into(),
+        };
+        let cmds = vec![
+            gc("auth", "Authenticate", "CORE"),
+            gc("pr", "Manage pull requests", "CORE"),
+            gc("actions", "Learn about Actions", "GITHUB ACTIONS"),
+        ];
+        let lines = gh_cheatsheet_lines(&cmds);
+        // Section header, then rows padded to the widest name ("actions" = 7).
+        assert_eq!(lines[0], "CORE COMMANDS");
+        assert_eq!(lines[1], "  auth     Authenticate");
+        assert_eq!(lines[2], "  pr       Manage pull requests");
+        // A blank line separates sections, and the next header renders.
+        assert!(lines.iter().any(|l| l.is_empty()));
+        assert!(lines.iter().any(|l| l == "GITHUB ACTIONS COMMANDS"));
+        assert!(gh_cheatsheet_lines(&[]).is_empty());
     }
 
     #[test]
