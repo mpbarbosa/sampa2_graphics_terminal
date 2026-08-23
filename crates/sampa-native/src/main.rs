@@ -1257,7 +1257,9 @@ const MAX_IMAGE_DIM: u32 = 4096; // reject absurd dimensions
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024; // decoded-source cap
 const MAX_OSC_BYTES: usize = 12 * 1024 * 1024; // in-flight OSC accumulation cap
 const MAX_IMAGES: usize = 32; // live image cap (oldest evicted)
+const MAX_KITTY_STORED: usize = 32; // transmitted-but-unplaced kitty images kept for `a=p`
 
+#[derive(Clone)]
 struct DecodedImage {
     width: u32,
     height: u32,
@@ -1598,13 +1600,11 @@ fn kitty_num(control: &str, key: &str) -> Option<u32> {
     kitty_key(control, key)?.parse().ok()
 }
 
-/// Decode a completed kitty transmission into RGBA — but only when it asks to display
-/// (`a=T`). Formats: `f=100` PNG (default here), `f=32` raw RGBA, `f=24` raw RGB; raw
-/// needs the pixel dimensions `s`×`v`. Enforces the shared dimension/byte caps.
-fn parse_kitty(control: &str, payload: &[u8]) -> Option<DecodedImage> {
-    if kitty_key(control, "a") != Some("T") {
-        return None; // transmit-only / placement / delete — not handled in v1
-    }
+/// Decode a kitty payload (base64 → RGBA) by **format**, enforcing the shared dimension/byte
+/// caps. Formats: `f=100` PNG (default here), `f=32` raw RGBA, `f=24` raw RGB; raw needs the
+/// pixel dimensions `s`×`v`. Format-only — the caller decides what the *action* means
+/// (`a=T` transmit+display, `a=t` transmit-and-store for a later `a=p`).
+fn decode_kitty_payload(control: &str, payload: &[u8]) -> Option<DecodedImage> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
     if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
@@ -1638,6 +1638,15 @@ fn parse_kitty(control: &str, payload: &[u8]) -> Option<DecodedImage> {
         }
         _ => None,
     }
+}
+
+/// Decode a kitty transmission that asks to **display immediately** (`a=T`). Thin gate over
+/// [`decode_kitty_payload`]; `a=t` (store) / `a=p` (place) / `a=d` (delete) are handled by the
+/// feed loop, not here.
+fn parse_kitty(control: &str, payload: &[u8]) -> Option<DecodedImage> {
+    (kitty_key(control, "a") == Some("T"))
+        .then(|| decode_kitty_payload(control, payload))
+        .flatten()
 }
 
 /// A kitty APC response (`ESC _ G i=<id>;OK ST`) so clients like `icat` don't block.
@@ -1759,6 +1768,23 @@ struct PlacedImage {
 /// in, `history` grows, so the image rides up with its text and eventually off the top.
 fn image_row(anchor: i32, base_history: usize, history: usize, offset: i32) -> i32 {
     anchor - (history as i32 - base_history as i32) + offset
+}
+
+/// Place a decoded image at the cursor: reserve vertical space (so following text flows
+/// below) and queue it for the shared store, tagged with its kitty id. Shared by the `a=T`
+/// display and `a=p` place paths.
+fn place_kitty_image(
+    g: &mut TermState,
+    image_adds: &mut Vec<(i32, usize, usize, Option<u32>, DecodedImage)>,
+    kid: Option<u32>,
+    img: DecodedImage,
+) {
+    let cur = g.term.renderable_content().cursor.point;
+    let (anchor, col) = (cur.line.0, cur.column.0);
+    let base = g.term.grid().history_size();
+    let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
+    g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
+    image_adds.push((anchor, base, col, kid, img));
 }
 
 /// Live inline images, shared between the parser thread (adds) and the renderer
@@ -1968,6 +1994,7 @@ struct TermState {
     image_scanner: ImageScanner,
     sixel: SixelScanner,
     kitty: KittyScanner,
+    kitty_images: std::collections::HashMap<u32, DecodedImage>, // transmitted, for `a=p`
     dcs: DcsScanner,
     /// Shadow set/reset state for modifiable modes the engine can't report via DECRQM.
     decrqm_shadow: std::collections::HashMap<(bool, u16), bool>,
@@ -2347,6 +2374,7 @@ fn spawn_session(
         image_scanner: ImageScanner::new(),
         sixel: SixelScanner::new(),
         kitty: KittyScanner::new(),
+        kitty_images: std::collections::HashMap::new(),
         dcs: DcsScanner::new(),
         decrqm_shadow: std::collections::HashMap::new(),
         cmd_start: None,
@@ -2504,17 +2532,38 @@ fn pump(
                     // Kitty graphics (APC): decode chunked transmissions, place, and ack.
                     for (control, payload) in g.kitty.feed(&bytes) {
                         replies.extend(kitty_response(&control));
-                        if let Some(img) = parse_kitty(&control, &payload) {
-                            let cur = g.term.renderable_content().cursor.point;
-                            let (anchor, col) = (cur.line.0, cur.column.0);
-                            let base = g.term.grid().history_size();
-                            let kid = kitty_num(&control, "i");
-                            let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
-                            g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-                            image_adds.push((anchor, base, col, kid, img));
-                        } else if kitty_key(&control, "a") == Some("d") {
+                        let kid = kitty_num(&control, "i");
+                        // Action selects behaviour (kitty default is transmit): `T` display,
+                        // `t` transmit-and-store, `p` place a stored image, `d` delete.
+                        match kitty_key(&control, "a").unwrap_or("t") {
+                            action @ ("T" | "t") => {
+                                if let Some(img) = decode_kitty_payload(&control, &payload) {
+                                    // Retain by id so a later `a=p` can place it again.
+                                    if let Some(id) = kid {
+                                        if g.kitty_images.len() >= MAX_KITTY_STORED
+                                            && !g.kitty_images.contains_key(&id)
+                                        {
+                                            if let Some(&k) = g.kitty_images.keys().next() {
+                                                g.kitty_images.remove(&k);
+                                            }
+                                        }
+                                        g.kitty_images.insert(id, img.clone());
+                                    }
+                                    if action == "T" {
+                                        place_kitty_image(&mut *g, &mut image_adds, kid, img);
+                                    }
+                                }
+                            }
+                            "p" => {
+                                // Place a previously-transmitted image by id.
+                                if let Some(img) = kid.and_then(|id| g.kitty_images.get(&id).cloned())
+                                {
+                                    place_kitty_image(&mut *g, &mut image_adds, kid, img);
+                                }
+                            }
                             // `a=d` delete request — applied to the shared store below.
-                            kitty_deletes.push(control);
+                            "d" => kitty_deletes.push(control),
+                            _ => {}
                         }
                     }
                     // Correct alacritty's DECRQM replies (§17): permanently-reset modes
@@ -9231,8 +9280,10 @@ mod tests {
 
     #[test]
     fn kitty_requires_display_action_and_acks() {
-        // a=t (transmit only, not T) isn't displayed in v1.
+        // `parse_kitty` gates on the display action: `a=t` (transmit-only) is not displayed…
         assert!(parse_kitty("a=t,f=32,s=1,v=1", b64(&[1, 2, 3, 4]).as_bytes()).is_none());
+        // …but its payload still *decodes* (the feed loop stores it for a later `a=p`).
+        assert!(decode_kitty_payload("a=t,f=32,s=1,v=1", b64(&[1, 2, 3, 4]).as_bytes()).is_some());
         // Ack carries the id; q=2 suppresses it.
         assert_eq!(kitty_response("a=T,i=7"), Some(b"\x1b_Gi=7;OK\x1b\\".to_vec()));
         assert_eq!(kitty_response("a=T,i=7,q=2"), None);
