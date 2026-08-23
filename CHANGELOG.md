@@ -5,6 +5,20 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.10.0] - 2026-08-23
+
+A native **`gh` command cheat-sheet** — type `gh` and press `Ctrl+Shift+M` and the man panel
+shows `gh`'s subcommands grouped and aligned (it has no useful `man gh`) instead of a man
+page. Plus the **Kitty graphics image lifecycle** rounds out (N5): deletion (`a=d` — clear
+all or by id) and the transmit-then-place workflow (`a=t` stores an image, `a=p` places it by
+id), on top of the existing transmit-and-display.
+
+### Features
+
+- Native gh command cheat-sheet in the man panel
+- Kitty graphics deletion (a=d) — clear all / by id
+- Kitty graphics transmit + place by id (a=t / a=p)
+
 ## [0.9.0] - 2026-08-20
 
 The `uptime` load gauge lands natively, **completing the seven-view enhance set** (`ps` / `cd`
