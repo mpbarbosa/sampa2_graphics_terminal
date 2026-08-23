@@ -1759,8 +1759,10 @@ struct PlacedImage {
     anchor: i32,
     base_history: usize,
     col: usize,
-    width: u32,
+    width: u32,           // source (texture) pixel dimensions
     height: u32,
+    disp_cols: Option<u32>, // kitty `c=`/`r=` display size in cells (None → natural pixels)
+    disp_rows: Option<u32>,
     rgba: Option<Vec<u8>>, // taken by the renderer on first upload
 }
 
@@ -1771,21 +1773,76 @@ fn image_row(anchor: i32, base_history: usize, history: usize, offset: i32) -> i
     anchor - (history as i32 - base_history as i32) + offset
 }
 
+/// One image queued by the parser thread for the shared store this frame.
+struct PendingImage {
+    anchor: i32,
+    base_history: usize,
+    col: usize,
+    kitty_id: Option<u32>,
+    disp_cols: Option<u32>, // kitty `c=` — target width in cells (else natural)
+    disp_rows: Option<u32>, // kitty `r=` — target height in cells (else natural)
+    img: DecodedImage,
+}
+
+/// Display **pixel** size for an image given optional kitty `c`(cols)/`r`(rows) targets and
+/// the cell metrics (spec §6.4 placement geometry). Both → the exact cell box; one → that
+/// axis is fixed and the other follows the source aspect ratio; neither → natural size.
+fn image_display_size(
+    native: (u32, u32),
+    cols: Option<u32>,
+    rows: Option<u32>,
+    cell_w: f32,
+    line_h: f32,
+) -> (f32, f32) {
+    let (nw, nh) = (native.0.max(1) as f32, native.1.max(1) as f32);
+    let w = match (cols, rows) {
+        (Some(c), _) => c as f32 * cell_w,
+        (None, Some(r)) => (r as f32 * line_h) * nw / nh, // aspect from the fixed height
+        (None, None) => nw,
+    };
+    let h = match (cols, rows) {
+        (_, Some(r)) => r as f32 * line_h,
+        (Some(c), None) => (c as f32 * cell_w) * nh / nw, // aspect from the fixed width
+        (None, None) => nh,
+    };
+    (w, h)
+}
+
+/// A `PendingImage` at natural size (no `c=`/`r=` scaling) — used by the OSC-1337/sixel
+/// paths, the `--capture` demo, and tests.
+fn pending_image(anchor: i32, base_history: usize, col: usize, kitty_id: Option<u32>, img: DecodedImage) -> PendingImage {
+    PendingImage { anchor, base_history, col, kitty_id, disp_cols: None, disp_rows: None, img }
+}
+
 /// Place a decoded image at the cursor: reserve vertical space (so following text flows
-/// below) and queue it for the shared store, tagged with its kitty id. Shared by the `a=T`
-/// display and `a=p` place paths.
+/// below) and queue it for the shared store, tagged with its kitty id and any `c=`/`r=`
+/// display size. Shared by the `a=T` display and `a=p` place paths.
 fn place_kitty_image(
     g: &mut TermState,
-    image_adds: &mut Vec<(i32, usize, usize, Option<u32>, DecodedImage)>,
+    image_adds: &mut Vec<PendingImage>,
     kid: Option<u32>,
+    disp_cols: Option<u32>,
+    disp_rows: Option<u32>,
     img: DecodedImage,
 ) {
     let cur = g.term.renderable_content().cursor.point;
     let (anchor, col) = (cur.line.0, cur.column.0);
     let base = g.term.grid().history_size();
-    let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
+    // Reserve `r=` rows when given (exact); otherwise fall back to the natural pixel height.
+    let rows = disp_rows
+        .map(|r| r as usize)
+        .unwrap_or_else(|| (img.height as f32 / LINE_HEIGHT).ceil() as usize)
+        .max(1);
     g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-    image_adds.push((anchor, base, col, kid, img));
+    image_adds.push(PendingImage {
+        anchor,
+        base_history: base,
+        col,
+        kitty_id: kid,
+        disp_cols,
+        disp_rows,
+        img,
+    });
 }
 
 /// Live inline images, shared between the parser thread (adds) and the renderer
@@ -1797,25 +1854,20 @@ struct ImageStore {
 }
 
 impl ImageStore {
-    fn add(
-        &mut self,
-        anchor: i32,
-        base_history: usize,
-        col: usize,
-        kitty_id: Option<u32>,
-        img: DecodedImage,
-    ) {
+    fn add(&mut self, p: PendingImage) {
         let id = self.next_id;
         self.next_id += 1;
         self.images.push(PlacedImage {
             id,
-            kitty_id,
-            anchor,
-            base_history,
-            col,
-            width: img.width,
-            height: img.height,
-            rgba: Some(img.rgba),
+            kitty_id: p.kitty_id,
+            anchor: p.anchor,
+            base_history: p.base_history,
+            col: p.col,
+            width: p.img.width,
+            height: p.img.height,
+            disp_cols: p.disp_cols,
+            disp_rows: p.disp_rows,
+            rgba: Some(p.img.rgba),
         });
         if self.images.len() > MAX_IMAGES {
             self.images.remove(0);
@@ -2411,7 +2463,7 @@ fn pump(
                 // the next output byte is processed — that's what apps block on).
                 let mut replies: Vec<Vec<u8>> = Vec::new();
                 let mut pty_resize: Option<(u16, u16)> = None;
-                let mut image_adds: Vec<(i32, usize, usize, Option<u32>, DecodedImage)> = Vec::new();
+                let mut image_adds: Vec<PendingImage> = Vec::new();
                 let mut kitty_deletes: Vec<String> = Vec::new();
                 if let Ok(mut g) = state.lock() {
                     let g = &mut *g;
@@ -2516,7 +2568,15 @@ fn pump(
                             let base = g.term.grid().history_size();
                             let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
                             g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-                            image_adds.push((anchor, base, col, None, img));
+                            image_adds.push(PendingImage {
+                                anchor,
+                                base_history: base,
+                                col,
+                                kitty_id: None,
+                                disp_cols: None,
+                                disp_rows: None,
+                                img,
+                            });
                         }
                     }
                     // Sixel graphics (DCS): rasterize + place like an inline image.
@@ -2527,13 +2587,23 @@ fn pump(
                             let base = g.term.grid().history_size();
                             let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
                             g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-                            image_adds.push((anchor, base, col, None, img));
+                            image_adds.push(PendingImage {
+                                anchor,
+                                base_history: base,
+                                col,
+                                kitty_id: None,
+                                disp_cols: None,
+                                disp_rows: None,
+                                img,
+                            });
                         }
                     }
                     // Kitty graphics (APC): decode chunked transmissions, place, and ack.
                     for (control, payload) in g.kitty.feed(&bytes) {
                         replies.extend(kitty_response(&control));
                         let kid = kitty_num(&control, "i");
+                        // `c=`/`r=` request a display size in cells (placement geometry).
+                        let (dc, dr) = (kitty_num(&control, "c"), kitty_num(&control, "r"));
                         // Action selects behaviour (kitty default is transmit): `T` display,
                         // `t` transmit-and-store, `p` place a stored image, `d` delete.
                         match kitty_key(&control, "a").unwrap_or("t") {
@@ -2551,15 +2621,15 @@ fn pump(
                                         g.kitty_images.insert(id, img.clone());
                                     }
                                     if action == "T" {
-                                        place_kitty_image(&mut *g, &mut image_adds, kid, img);
+                                        place_kitty_image(&mut *g, &mut image_adds, kid, dc, dr, img);
                                     }
                                 }
                             }
                             "p" => {
-                                // Place a previously-transmitted image by id.
+                                // Place a previously-transmitted image by id (with `c=`/`r=`).
                                 if let Some(img) = kid.and_then(|id| g.kitty_images.get(&id).cloned())
                                 {
-                                    place_kitty_image(&mut *g, &mut image_adds, kid, img);
+                                    place_kitty_image(&mut *g, &mut image_adds, kid, dc, dr, img);
                                 }
                             }
                             // `a=d` delete request — applied to the shared store below.
@@ -2580,8 +2650,8 @@ fn pump(
                 }
                 if !image_adds.is_empty() || !kitty_deletes.is_empty() {
                     if let Ok(mut store) = image_store.lock() {
-                        for (anchor, base, col, kid, img) in image_adds {
-                            store.add(anchor, base, col, kid, img);
+                        for p in image_adds {
+                            store.add(p);
                         }
                         for control in &kitty_deletes {
                             store.delete_kitty(control);
@@ -7693,11 +7763,19 @@ impl Renderer {
                 });
                 self.image_textures.insert(img.id, (tex, bind));
             }
-            // Place at (col, absolute anchor + display_offset), natural pixel size.
+            // Place at (col, absolute anchor + display_offset). Size is `c=`/`r=` scaled to
+            // the cell metrics when requested, else the natural pixel size.
             let x = PAD + img.col as f32 * self.cell_w;
             let y = top + image_row(img.anchor, img.base_history, history, offset) as f32 * self.line_h;
-            if x < w as f32 && y < h as f32 && y + img.height as f32 > 0.0 {
-                rects.push((img.id, [x, y, img.width as f32, img.height as f32]));
+            let (dw, dh) = image_display_size(
+                (img.width, img.height),
+                img.disp_cols,
+                img.disp_rows,
+                self.cell_w,
+                self.line_h,
+            );
+            if x < w as f32 && y < h as f32 && y + dh > 0.0 {
+                rects.push((img.id, [x, y, dw, dh]));
             }
         }
         rects
@@ -8911,7 +8989,7 @@ fn capture(path: &str) -> Result<()> {
         images
             .lock()
             .unwrap()
-            .add(6, 0, 2, None, DecodedImage { width: iw, height: ih, rgba });
+            .add(pending_image(6, 0, 2, None, DecodedImage { width: iw, height: ih, rgba }));
     }
     // Optional sixel demo: SAMPA_CAPTURE_SIXEL=<file> rasterizes a real sixel into view.
     if let Ok(path) = std::env::var("SAMPA_CAPTURE_SIXEL") {
@@ -8919,7 +8997,7 @@ fn capture(path: &str) -> Result<()> {
             let mut sc = SixelScanner::new();
             for payload in sc.feed(&bytes) {
                 if let Some(img) = parse_sixel(&payload) {
-                    images.lock().unwrap().add(4, 0, 30, None, img);
+                    images.lock().unwrap().add(pending_image(4, 0, 30, None, img));
                 }
             }
         }
@@ -8930,7 +9008,7 @@ fn capture(path: &str) -> Result<()> {
             let mut sc = KittyScanner::new();
             for (control, payload) in sc.feed(&bytes) {
                 if let Some(img) = parse_kitty(&control, &payload) {
-                    images.lock().unwrap().add(4, 0, 30, None, img);
+                    images.lock().unwrap().add(pending_image(4, 0, 30, None, img));
                 }
             }
         }
@@ -9365,12 +9443,26 @@ mod tests {
     }
 
     #[test]
+    fn image_display_size_scales_by_cells() {
+        // 100×50 source; cell metrics 10 wide × 20 tall.
+        let native = (100u32, 50u32);
+        // Neither c nor r → natural pixels.
+        assert_eq!(image_display_size(native, None, None, 10.0, 20.0), (100.0, 50.0));
+        // Both → exact cell box (c*cell_w × r*line_h), ignoring aspect.
+        assert_eq!(image_display_size(native, Some(6), Some(3), 10.0, 20.0), (60.0, 60.0));
+        // c only → width fixed, height by source aspect (60 * 50/100 = 30).
+        assert_eq!(image_display_size(native, Some(6), None, 10.0, 20.0), (60.0, 30.0));
+        // r only → height fixed, width by source aspect (40 * 100/50 = 80).
+        assert_eq!(image_display_size(native, None, Some(2), 10.0, 20.0), (80.0, 40.0));
+    }
+
+    #[test]
     fn kitty_delete_removes_images() {
         let px = || DecodedImage { width: 2, height: 2, rgba: vec![0u8; 16] };
         let mut store = ImageStore::default();
-        store.add(0, 0, 0, Some(7), px());
-        store.add(0, 0, 0, Some(9), px());
-        store.add(0, 0, 0, None, px()); // e.g. a sixel / OSC-1337 image (no kitty id)
+        store.add(pending_image(0, 0, 0, Some(7), px()));
+        store.add(pending_image(0, 0, 0, Some(9), px()));
+        store.add(pending_image(0, 0, 0, None, px())); // e.g. a sixel / OSC-1337 image
         assert_eq!(store.images.len(), 3);
 
         // Delete-by-id (d=i, i=7) removes only that placement.
