@@ -28,6 +28,11 @@ page. Informational; nothing is composed or run.
 - When the detected command is **`gh`**, the frontend routes to the cheat-sheet instead of
   `render_man`; any other command still shows its man page. This works on both the man
   panel's keystroke auto-update and the `Ctrl+Shift+M` toggle.
+- **Drill-in by subcommand.** The frontend reads the **subcommand path** from the typed line
+  — the leading subcommand-like tokens after `gh` (stopping at the first flag) — so `gh`
+  shows the top-level commands and **`gh repo` shows `gh repo`'s commands** (`gh repo --help`).
+  A path that has no `… COMMANDS` sections (a leaf like `gh repo view`) parses to nothing and
+  the panel simply doesn't show a list.
 - Dismissed the same way as the man panel (its ✕ / toggling off).
 
 ## 3. Data
