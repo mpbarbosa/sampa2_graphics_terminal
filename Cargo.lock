@@ -2777,6 +2777,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sampa-dockerhelp"
+version = "0.1.0"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=a8a1f1c3021bd2cdd0e4966df35958c0b8083f9f#a8a1f1c3021bd2cdd0e4966df35958c0b8083f9f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "sampa-dumap"
 version = "0.1.0"
 source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=affebda9f6de482667fc04190f95334946d00f25#affebda9f6de482667fc04190f95334946d00f25"
@@ -2833,6 +2841,7 @@ dependencies = [
  "sampa-cli",
  "sampa-config",
  "sampa-dfdec",
+ "sampa-dockerhelp",
  "sampa-dumap",
  "sampa-freemem",
  "sampa-fsnav",
