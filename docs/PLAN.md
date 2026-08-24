@@ -76,8 +76,9 @@ engine is now ours to prove.
 ### N0 — Foundations + native echo ✅ **shipped**
 *Validates: cross-repo core wiring, winit+wgpu, VT engine, the collapsed seam.*
 
-- ✅ Cargo workspace (`crates/sampa-native`, bin `sampa`); depends on the seven crates
-  via **path deps** (ADR 0002) — clean build here. `sampa --smoke` is a headless
+- ✅ Cargo workspace (`crates/sampa-native`, bin `sampa`); depends on the shared crates
+  via **git-pinned deps** (ADR 0002 — the path→git migration is complete, so no sibling
+  checkout is needed and CI can build) — clean build here. `sampa --smoke` is a headless
   wiring check (config defaults, 4,461 `$PATH` exes, PTY round-trip through `shellint`).
 - ✅ `winit` 0.30 window + `wgpu` 30 surface; clear + present each frame.
 - ✅ Spawn `$SHELL` via `pty-core`; reader thread feeds `PtyEvent::Output` into an

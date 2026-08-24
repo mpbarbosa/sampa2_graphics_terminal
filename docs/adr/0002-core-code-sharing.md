@@ -56,6 +56,10 @@ preserves history); it is premature **now**.
   pinned to a rev** of `sampa_graphics_terminal` (bump the rev deliberately). Local
   N0 work may use a `path` dep against a sibling checkout, but committed builds pin a
   rev so CI is reproducible.
+  - **Status — migration complete (end of N1):** the last foundational path deps
+    (`pty-core` / `config` / `cli` / `shellint` / `palette` / `man`) are now git-pinned
+    like the feature cores, so **every** core crate resolves from a rev and no sibling
+    checkout is required — `cargo build`/`test` are reproducible anywhere, which unblocks CI.
 - If a core change is needed for the native build, make it in the origin repo, pin the
   new rev here. Keep the crates headless — no winit/wgpu/cosmic-text types leak in.
 - **Revisit trigger (end of N1/N2):** if, in practice, both repos are landing changes
