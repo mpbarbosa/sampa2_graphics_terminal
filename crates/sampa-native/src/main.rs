@@ -63,7 +63,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 // --- Fixed metrics (N1: single monospace font) -------------------------------
@@ -3111,11 +3111,15 @@ impl ApplicationHandler<UserEvent> for App {
                     self.dispatch(a, event_loop);
                     return;
                 }
-                let app_cursor = self
+                let (app_cursor, app_keypad) = self
                     .state
                     .lock()
-                    .map(|g| g.term.mode().contains(TermMode::APP_CURSOR))
-                    .unwrap_or(false);
+                    .map(|g| {
+                        let mode = g.term.mode();
+                        (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD))
+                    })
+                    .unwrap_or((false, false));
+                let numpad = event.location == KeyLocation::Numpad;
                 let bytes = encode_key(
                     &event.logical_key,
                     event.text.as_deref(),
@@ -3123,6 +3127,8 @@ impl ApplicationHandler<UserEvent> for App {
                     m.alt_key(),
                     m.control_key(),
                     app_cursor,
+                    app_keypad,
+                    numpad,
                 );
                 if !bytes.is_empty() {
                     self.schedule_preview(); // debounced safe auto-run (no-op if off)
@@ -7229,6 +7235,25 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
 /// modifiers with the xterm `CSI 1 ; <mod> <final>` / `CSI <code> ; <mod> ~` scheme
 /// (mod = 1 + shift + 2·alt + 4·ctrl). Alt acts as Meta (ESC prefix). Kitty keyboard
 /// protocol and IME/compose remain future work.
+/// DECPAM (application keypad) escape for a numeric-keypad key, or `None` if it isn't one we
+/// map. Under DECKPAM (`ESC =`) the keypad sends SS3 codes (`ESC O p`..`y` for 0–9, plus the
+/// operators and keypad Enter) instead of digits, so an app can tell numpad from the main row.
+fn app_keypad_code(key: &Key) -> Option<Vec<u8>> {
+    let fin = match key {
+        Key::Named(NamedKey::Enter) => 'M',
+        Key::Character(c) => match c.as_str() {
+            "0" => 'p', "1" => 'q', "2" => 'r', "3" => 's', "4" => 't',
+            "5" => 'u', "6" => 'v', "7" => 'w', "8" => 'x', "9" => 'y',
+            "*" => 'j', "+" => 'k', "," => 'l', "-" => 'm', "." => 'n', "/" => 'o',
+            "=" => 'X',
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(format!("\x1bO{fin}").into_bytes())
+}
+
+#[allow(clippy::too_many_arguments)] // a cohesive key→bytes encoder: key + text + mode flags
 fn encode_key(
     key: &Key,
     text: Option<&str>,
@@ -7236,8 +7261,17 @@ fn encode_key(
     alt: bool,
     ctrl: bool,
     app_cursor: bool,
+    app_keypad: bool,
+    numpad: bool,
 ) -> Vec<u8> {
     let modn: u8 = 1 + shift as u8 + 2 * alt as u8 + 4 * ctrl as u8;
+
+    // Application keypad (DECKPAM): a numpad key sends its SS3 code, before any other mapping.
+    if app_keypad && numpad {
+        if let Some(bytes) = app_keypad_code(key) {
+            return bytes;
+        }
+    }
 
     // Cursor keys: CSI form with a modifier, else SS3 under DECCKM, else CSI.
     let cursor = |fin: char| -> Vec<u8> {
@@ -10164,10 +10198,33 @@ mod tests {
 
     // --- keyboard encoding (§8.1) ---
     fn named(n: NamedKey, shift: bool, alt: bool, ctrl: bool, app: bool) -> Vec<u8> {
-        encode_key(&Key::Named(n), None, shift, alt, ctrl, app)
+        encode_key(&Key::Named(n), None, shift, alt, ctrl, app, false, false)
     }
     fn chr(s: &str, shift: bool, alt: bool, ctrl: bool) -> Vec<u8> {
-        encode_key(&Key::Character(s.into()), None, shift, alt, ctrl, false)
+        encode_key(&Key::Character(s.into()), None, shift, alt, ctrl, false, false, false)
+    }
+
+    #[test]
+    fn app_keypad_encodes_numpad_ss3() {
+        // In DECKPAM mode a numpad key sends its SS3 code (digits, operators, keypad Enter).
+        let kp = |k: Key| encode_key(&k, None, false, false, false, false, true, true);
+        assert_eq!(kp(Key::Character("0".into())), b"\x1bOp");
+        assert_eq!(kp(Key::Character("1".into())), b"\x1bOq");
+        assert_eq!(kp(Key::Character("9".into())), b"\x1bOy");
+        assert_eq!(kp(Key::Character("+".into())), b"\x1bOk");
+        assert_eq!(kp(Key::Character("-".into())), b"\x1bOm");
+        assert_eq!(kp(Key::Character(".".into())), b"\x1bOn");
+        assert_eq!(kp(Key::Named(NamedKey::Enter)), b"\x1bOM");
+        // Not in keypad mode → a numpad digit is just the digit (falls through to the char path).
+        assert_eq!(
+            encode_key(&Key::Character("1".into()), Some("1"), false, false, false, false, false, true),
+            b"1",
+        );
+        // Keypad mode on but the key is NOT from the numpad → unaffected (main-row `1`).
+        assert_eq!(
+            encode_key(&Key::Character("1".into()), Some("1"), false, false, false, false, true, false),
+            b"1",
+        );
     }
 
     #[test]
