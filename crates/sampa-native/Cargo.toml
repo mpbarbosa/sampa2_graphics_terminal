@@ -66,6 +66,11 @@ sampa-uptimedec = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal"
 # subcommands; no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native man panel:
 # a typed `gh` + Ctrl+Shift+M routes to gh_cheatsheet_lines instead of a man page (informational).
 sampa-ghhelp   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "4208c7a33b49a50d9c19875ced1ac660a5562942" }
+# cargo command cheat-sheet core (docs/spec-cargo-cheatsheet.md). parse_cargo_help -> the
+# `Commands:` list (name + optional alias); no shell, no Tauri. Git-pinned per ADR 0002.
+# Consumed by the native man panel like ghhelp: a typed `cargo` + Ctrl+Shift+M routes to
+# cargo_cheatsheet_lines instead of a man page, a leaf (`cargo build`) shows raw help.
+sampa-cargohelp = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "7cfdbec034f7532689e0d97c5c3fa22783ca32cb" }
 # netstat connections table core (docs/spec-netstat-table.md). parse_ss -> sockets from
 # `ss -tunap` (ss is the data source: net-tools netstat is deprecated + drops the udp State
 # column); no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native connections
