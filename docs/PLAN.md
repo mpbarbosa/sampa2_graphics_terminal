@@ -320,9 +320,12 @@ refuses writes (file provably untouched) and clears on Enter.
   confirm/preview modal** — Ctrl+click raises a centered card showing the **real target**
   (the visible OSC-8 text can differ from the URI) resolved by **Enter/`o`** (open via
   `xdg-open`) or **Esc/`n`** (cancel), replacing the old open-and-retitle. ✅ **hover
-  affordance** — Ctrl+hover over a safe link shows a **pointing-hand cursor** (recomputed on
-  move and on Ctrl press/release; only touches the grid lock while Ctrl is down). 3 unit
-  tests + PNG; confirm modal + no-auto-open Xephyr-verified.
+  affordance** — Ctrl+hover over a safe link shows a **pointing-hand cursor** *and*
+  **accent-underlines the whole link** (`link_at` spans the OSC-8 run or the plain-URL
+  substring via `url_span_at`; drawn even for plain URLs, whose cells carry no underline flag),
+  so it's clear which link will open. Recomputed on move and on Ctrl press/release; only
+  touches the grid lock while Ctrl is down. `url_span_at` unit-tested; the accent underline is
+  Xephyr-verified (the link — not the surrounding words — lights up on Ctrl+hover).
 - 🔨 **IME / dead keys / compose:** IME is enabled (`set_ime_allowed`) and winit's `Ime`
   events are wired — **Preedit** is stored and drawn **underlined at the cursor** (a
   cursor-tinted strip + accent underline; CJK renders via `cosmic-text` fallback),

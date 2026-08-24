@@ -774,6 +774,8 @@ struct PaneRender<'a> {
     x: f32,
     w: f32,
     focused: bool,
+    /// `(row, start_col, end_col)` of a Ctrl-hovered link to accent-underline (focused pane).
+    hovered_link: Option<(usize, usize, usize)>,
 }
 
 /// The `du` disk-usage treemap overlay for one frame (spec-du-treemap.md): the laid-out
@@ -2331,6 +2333,7 @@ fn main() -> Result<()> {
         osc52_prompt: None,
         link_confirm: None,
         link_hover: false,
+        hovered_link: None,
         title: win_title,
         class: wm_class,
         hold,
@@ -2739,6 +2742,7 @@ struct App {
     osc52_prompt: Option<String>,     // a pending OSC-52 write awaiting consent (the payload)
     link_confirm: Option<String>,     // a hyperlink awaiting the open/cancel confirm modal
     link_hover: bool,                 // cursor is over a link with Ctrl held (hand cursor shown)
+    hovered_link: Option<(usize, usize, usize)>, // (row, start_col, end_col) to accent-underline
     title: String,
     /// WM_CLASS / app id (`--class`, default `sampa2`).
     class: String,
@@ -3948,23 +3952,39 @@ impl App {
     /// scanned from the row. Read-only (no `&mut self`) so hover can call it every move; the
     /// scheme gate (§13 — http/https only, never `file:`/`javascript:`) is applied here.
     fn link_uri_at(&self, col: usize, row: usize) -> Option<String> {
-        let uri = match self.state.lock() {
-            Ok(g) => {
-                let d = g.term.grid().display_offset() as i32;
-                let line = Line(row as i32 - d);
-                let grid = g.term.grid();
-                grid[line][Column(col)]
-                    .hyperlink()
-                    .map(|h| h.uri().to_string())
-                    .or_else(|| {
-                        let text: String =
-                            (0..grid.columns()).map(|c| grid[line][Column(c)].c).collect();
-                        url_at(&text, col)
-                    })
-            }
-            Err(_) => None,
+        self.link_at(col, row).map(|(uri, _, _)| uri)
+    }
+
+    /// The safe link under a cell **and its column span** on that row: `(uri, start, end_incl)`.
+    /// An OSC-8 link spans the contiguous run of cells sharing its URI; a plain URL spans the
+    /// detected substring. Used both for the target (hover/click) and to underline the link.
+    fn link_at(&self, col: usize, row: usize) -> Option<(String, usize, usize)> {
+        let Ok(g) = self.state.lock() else {
+            return None;
         };
-        uri.filter(|u| is_safe_url(u))
+        let d = g.term.grid().display_offset() as i32;
+        let line = Line(row as i32 - d);
+        let grid = g.term.grid();
+        let cols = grid.columns();
+        if let Some(h) = grid[line][Column(col)].hyperlink() {
+            let uri = h.uri().to_string();
+            if !is_safe_url(&uri) {
+                return None;
+            }
+            // Expand over the run of cells that carry the same OSC-8 URI.
+            let same = |c: usize| grid[line][Column(c)].hyperlink().is_some_and(|x| x.uri() == uri);
+            let mut start = col;
+            while start > 0 && same(start - 1) {
+                start -= 1;
+            }
+            let mut end = col;
+            while end + 1 < cols && same(end + 1) {
+                end += 1;
+            }
+            return Some((uri, start, end));
+        }
+        let text: String = (0..cols).map(|c| grid[line][Column(c)].c).collect();
+        url_span_at(&text, col)
     }
 
     /// Ctrl+click on a hyperlink: instead of opening straight away, raise a **confirm modal**
@@ -3999,12 +4019,22 @@ impl App {
         self.request_redraw();
     }
 
-    /// Hover affordance: when Ctrl is held over a safe link, show a pointing-hand cursor so it
-    /// reads as clickable; otherwise the default cursor. Cheap — only locks the grid while
-    /// Ctrl is down, and only calls `set_cursor` when the state actually flips.
+    /// Hover affordance: when Ctrl is held over a safe link, show a pointing-hand cursor and
+    /// **accent-underline the link** so it reads as clickable and it's clear which link will
+    /// open; otherwise the default cursor and no highlight. Cheap — only locks the grid while
+    /// Ctrl is down, and only redraws / calls `set_cursor` when the state actually flips.
     fn update_link_hover(&mut self) {
-        let over = self.modifiers.control_key()
-            && self.link_uri_at(self.mouse_col, self.mouse_row).is_some();
+        let link = self
+            .modifiers
+            .control_key()
+            .then(|| self.link_at(self.mouse_col, self.mouse_row))
+            .flatten();
+        let range = link.map(|(_, s, e)| (self.mouse_row, s, e));
+        if range != self.hovered_link {
+            self.hovered_link = range;
+            self.request_redraw(); // repaint so the accent underline tracks the cursor
+        }
+        let over = range.is_some();
         if over != self.link_hover {
             self.link_hover = over;
             if let Some(w) = &self.window {
@@ -7295,7 +7325,14 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let pane_views: Vec<PaneRender> = pane_snaps
             .iter()
             .enumerate()
-            .map(|(pi, s)| PaneRender { snap: s, x: pi as f32 * (col_w + DIVIDER), w: col_w, focused: pi == fidx })
+            .map(|(pi, s)| PaneRender {
+                snap: s,
+                x: pi as f32 * (col_w + DIVIDER),
+                w: col_w,
+                focused: pi == fidx,
+                // The hover highlight belongs to the focused pane the mouse reads from.
+                hovered_link: if pi == fidx { self.hovered_link } else { None },
+            })
             .collect();
         // Screenshot-analysis (spec-window-analysis): if a capture is armed, grab this
         // frame to a PNG off the same GPU. Captured WITHOUT the AI card (it's showing
@@ -7708,6 +7745,12 @@ fn is_safe_url(uri: &str) -> bool {
 /// don't emit OSC-8). Takes the whitespace-delimited token under the cursor, extracts
 /// the URL within it, and trims trailing punctuation.
 fn url_at(row: &str, col: usize) -> Option<String> {
+    url_span_at(row, col).map(|(u, _, _)| u)
+}
+
+/// Like [`url_at`], but also returns the URL's **char-column span** on the row:
+/// `(url, start_col, end_col_inclusive)` — used to highlight the hovered link.
+fn url_span_at(row: &str, col: usize) -> Option<(String, usize, usize)> {
     let chars: Vec<char> = row.chars().collect();
     if col >= chars.len() || chars[col].is_whitespace() {
         return None;
@@ -7724,7 +7767,13 @@ fn url_at(row: &str, col: usize) -> Option<String> {
     let url = token[pos..].trim_end_matches(|c: char| {
         matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '"' | '\'' | '!' | '?')
     });
-    is_safe_url(url).then(|| url.to_string())
+    if !is_safe_url(url) {
+        return None;
+    }
+    // `pos` is a byte offset into `token`; convert the prefix to a char count for the column.
+    let url_start = start + token[..pos].chars().count();
+    let url_end = url_start + url.chars().count() - 1;
+    Some((url.to_string(), url_start, url_end))
 }
 
 fn rgb_arr(c: Rgb) -> [u8; 3] {
@@ -8542,7 +8591,14 @@ impl Renderer {
                     if cell.bg != self.theme.bg {
                         bg_quads.push(QuadInstance { rect: [x, y, self.cell_w + 0.5, self.line_h], color: self.color4(cell.bg) });
                     }
-                    if row_visible && !hits_card(x, y) && (cell.underline || cell.hyperlink) {
+                    // Ctrl-hovered link: a brighter, thicker accent underline over the whole
+                    // link (drawn even for plain URLs, whose cells carry no underline flag).
+                    let hovered = pane
+                        .hovered_link
+                        .is_some_and(|(hr, cs, ce)| r == hr && c >= cs && c <= ce);
+                    if row_visible && !hits_card(x, y) && hovered {
+                        deco_quads.push(QuadInstance { rect: [x, y + self.line_h - 2.5, self.cell_w, 2.0], color: self.color4(self.theme.cursor) });
+                    } else if row_visible && !hits_card(x, y) && (cell.underline || cell.hyperlink) {
                         deco_quads.push(QuadInstance { rect: [x, y + self.line_h - 2.0, self.cell_w, 1.5], color: self.color4(cell.fg) });
                     }
                     if row_visible && !hits_card(x, y) && cell.strike {
@@ -9527,7 +9583,7 @@ fn capture(path: &str) -> Result<()> {
         Some(PanelView { title: &man_title, body: &man_body, body_spans: None })
     };
     r.paint(
-        &[PaneRender { snap: &snap, x: 0.0, w: w as f32, focused: true }],
+        &[PaneRender { snap: &snap, x: 0.0, w: w as f32, focused: true, hovered_link: None }],
         &view,
         w,
         h,
@@ -10379,6 +10435,23 @@ mod tests {
         // Non-URL token / whitespace → None.
         assert!(url_at("hello world", 2).is_none());
         assert!(url_at("a https://x.io", 1).is_none());
+    }
+
+    #[test]
+    fn url_span_covers_the_link_for_highlighting() {
+        // The span is the URL's own char columns (not the surrounding token) so the accent
+        // underline lands exactly on the link.
+        let row = "see https://rust-lang.org x";
+        let (url, s, e) = url_span_at(row, 6).unwrap();
+        assert_eq!(url, "https://rust-lang.org");
+        assert_eq!(&row[..s], "see ");
+        assert_eq!(s, 4);
+        assert_eq!(e, 4 + "https://rust-lang.org".len() - 1);
+        // Trailing punctuation is excluded from the span, and a leading `(` shifts the start.
+        let (url2, s2, e2) = url_span_at("(https://x.io).", 5).unwrap();
+        assert_eq!(url2, "https://x.io");
+        assert_eq!(s2, 1); // after the '('
+        assert_eq!(e2, 1 + "https://x.io".len() - 1); // before the ')'
     }
 
     #[test]
