@@ -397,6 +397,7 @@ struct Snapshot {
     cells: Vec<CellVis>, // row-major, len == cols * rows
     cursor: Option<(usize, usize)>, // (row, col) for bar/underline cursors (block inverts the cell)
     cursor_rc: Option<(usize, usize)>, // (row, col) of the cursor for ANY style (IME preedit anchor)
+    cursor_style: CursorStyle, // effective shape (DECSCUSR-or-config) — how the renderer draws it
     history: usize, // scrollback depth now — pairs with each image's base_history
 }
 
@@ -2442,6 +2443,9 @@ fn spawn_session(
     let mut term = Term::new(
         alacritty_terminal::term::Config {
             scrolling_history: cfg.scrollback.lines as usize,
+            // Seed the cursor shape from config so `term.cursor_style()` starts there; DECSCUSR
+            // (e.g. vim insert mode) overrides it live, and the renderer reads the effective shape.
+            default_cursor_style: seed_cursor_style(cfg.cursor.style, cfg.cursor.blink),
             ..TermConfig::default()
         },
         &TermSize::new(cols as usize, rows as usize),
@@ -4789,7 +4793,7 @@ impl App {
         let Ok(g) = self.state.lock() else {
             return String::new();
         };
-        let snap = build_snapshot(&g.term, &self.theme, self.cursor_style, false);
+        let snap = build_snapshot(&g.term, &self.theme, cursor_style_of(&g.term), false);
         drop(g);
         let text = snap.to_text();
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -6784,7 +6788,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let proxy = self.proxy.clone();
         let cwd = self.session_cwd();
         let state = std::sync::Arc::clone(&self.state);
-        let (theme, cstyle) = (self.theme, self.cursor_style);
+        let theme = self.theme;
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(PREVIEW_DEBOUNCE_MS));
             // Superseded by newer input → don't even run the (possibly costly) command.
@@ -6802,7 +6806,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                 .ok()
                 .and_then(|g| {
                     (!g.term.mode().contains(TermMode::ALT_SCREEN)).then(|| {
-                        let snap = build_snapshot(&g.term, &theme, cstyle, true);
+                        let snap = build_snapshot(&g.term, &theme, cursor_style_of(&g.term), true);
                         command_at_prompt(&snap, g.cmd_start)
                     })
                 })
@@ -6833,7 +6837,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             return String::new();
         }
         // cursor_on=true so cursor_rc is populated; prefer the OSC 133 command-start.
-        let snap = build_snapshot(&g.term, &self.theme, self.cursor_style, true);
+        let snap = build_snapshot(&g.term, &self.theme, cursor_style_of(&g.term), true);
         let cmd_start = g.cmd_start;
         drop(g);
         command_at_prompt(&snap, cmd_start)
@@ -7033,7 +7037,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let built = self
                 .sessions
                 .get(si)
-                .and_then(|s| s.state.lock().ok().map(|g| build_snapshot(&g.term, &self.theme, self.cursor_style, self.cursor_on && focused)));
+                .and_then(|s| s.state.lock().ok().map(|g| build_snapshot(&g.term, &self.theme, cursor_style_of(&g.term), self.cursor_on && focused)));
             let Some(mut s) = built else { continue };
             if focused {
                 self.apply_ps_inplace(&mut s);
@@ -7490,6 +7494,29 @@ fn focus_report(focused: bool) -> &'static [u8] {
     }
 }
 
+/// Seed a `Term`'s `default_cursor_style` from our config cursor style + blink. `Term::cursor_style()`
+/// returns this until an app overrides it with **DECSCUSR** (`CSI Ps SP q`), so the config default
+/// is honoured and the app's runtime choice wins — e.g. vim's bar cursor in insert mode.
+fn seed_cursor_style(style: CursorStyle, blink: bool) -> alacritty_terminal::vte::ansi::CursorStyle {
+    let shape = match style {
+        CursorStyle::Block => CursorShape::Block,
+        CursorStyle::Underline => CursorShape::Underline,
+        CursorStyle::Bar => CursorShape::Beam,
+    };
+    alacritty_terminal::vte::ansi::CursorStyle { shape, blinking: blink }
+}
+
+/// The effective render cursor style for a term: its **live** shape (DECSCUSR, else our seeded
+/// config default), mapped to the render enum. `Hidden`/`HollowBlock` fall back to `Block`
+/// (visibility is handled separately, via `cursor_on` and the `Hidden` check in build_snapshot).
+fn cursor_style_of<L: EventListener>(term: &Term<L>) -> CursorStyle {
+    match term.cursor_style().shape {
+        CursorShape::Underline => CursorStyle::Underline,
+        CursorShape::Beam => CursorStyle::Bar,
+        _ => CursorStyle::Block,
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // a cohesive key→bytes encoder: key + text + mode flags
 fn encode_key(
     key: &Key,
@@ -7706,7 +7733,7 @@ fn build_snapshot<L: EventListener>(
             ));
         }
     }
-    Snapshot { cols, rows, offset, cells, cursor: cursor_cell, cursor_rc, history: grid.history_size() }
+    Snapshot { cols, rows, offset, cells, cursor: cursor_cell, cursor_rc, cursor_style, history: grid.history_size() }
 }
 
 /// AccessKit node ids: a `Window` root containing one `Terminal` node whose value is
@@ -8692,7 +8719,7 @@ impl Renderer {
                 y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5
             }) {
                 let (x, y) = (vp_x + PAD + c as f32 * self.cell_w, top + r as f32 * self.line_h);
-                let rect = match self.cursor_style {
+                let rect = match snap.cursor_style {
                     CursorStyle::Bar => Some([x, y, 2.0, self.line_h]),
                     CursorStyle::Underline => Some([x, y + self.line_h - 2.0, self.cell_w, 2.0]),
                     CursorStyle::Block => None,
@@ -10578,6 +10605,29 @@ mod tests {
         // XTFOCUS (DECSET 1004): CSI I on focus-in, CSI O on focus-out.
         assert_eq!(focus_report(true), b"\x1b[I");
         assert_eq!(focus_report(false), b"\x1b[O");
+    }
+
+    #[test]
+    fn decscusr_drives_cursor_shape() {
+        // The seeded config default is honoured until an app sends DECSCUSR (`CSI Ps SP q`).
+        let seeded = |style, blink| {
+            Term::new(
+                TermConfig { default_cursor_style: seed_cursor_style(style, blink), ..TermConfig::default() },
+                &TermSize::new(10, 3),
+                VoidListener,
+            )
+        };
+        assert_eq!(cursor_style_of(&seeded(CursorStyle::Bar, true)), CursorStyle::Bar); // config seed
+        // Then DECSCUSR overrides it live: 6=steady bar, 4=underline, 2=block.
+        let mut parser: Processor = Processor::new();
+        let mut term = seeded(CursorStyle::Block, false);
+        assert_eq!(cursor_style_of(&term), CursorStyle::Block);
+        parser.advance(&mut term, b"\x1b[6 q");
+        assert_eq!(cursor_style_of(&term), CursorStyle::Bar);
+        parser.advance(&mut term, b"\x1b[4 q");
+        assert_eq!(cursor_style_of(&term), CursorStyle::Underline);
+        parser.advance(&mut term, b"\x1b[2 q");
+        assert_eq!(cursor_style_of(&term), CursorStyle::Block);
     }
 
     #[test]
