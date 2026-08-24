@@ -26,10 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # winit/wayland build helpers. Most of the display stack is dlopened at runtime, so
-      # this is a small, conservative set; trim if a run shows it's unneeded.
+      # winit/wayland build helpers (most of the display stack is dlopened at runtime, so this
+      # is a small, conservative set). `zsh` is the shell `sampa-preview` runs previews under —
+      # the `preview_never_mutates_the_filesystem` test needs it to exercise the "cat runs" path.
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev zsh
 
       - uses: dtolnay/rust-toolchain@stable
         with:
