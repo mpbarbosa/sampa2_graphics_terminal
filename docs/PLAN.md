@@ -107,8 +107,12 @@ engine is now ours to prove.
   **Alt=Meta** (ESC prefix), arrows/Home/End honoring **DECCKM**, editing keys
   (Ins/Del/PgUp/PgDn), **F1–F12**, back-tab, and xterm **modifier encoding**
   (`CSI 1;<mod> <fin>` / `CSI <code>;<mod> ~`). 5 unit tests + a DECCKM-tracking test.
-  ⬜ still: **kitty keyboard protocol**, keypad-application numpad, IME/compose,
-  **bracketed paste** (2004, lands with clipboard).
+  ✅ **application keypad (DECKPAM)** — a numpad key (detected by `KeyLocation::Numpad`)
+  sends its SS3 code (`ESC O p`–`y` for 0–9, `ESC O j/k/l/m/n/o` for the operators, `ESC O M`
+  for keypad Enter) when the app has enabled `TermMode::APP_KEYPAD`, else the plain digit.
+  `app_keypad_code` unit-tested; Xephyr-verified with `cat -v` (numpad `1 2 + Enter` →
+  `^[Oq ^[Or ^[Ok ^[OM`). ⬜ still: **kitty keyboard protocol**, IME/compose sequences
+  beyond what the IM handles.
 - ✅ **Mouse (§8.2):** **SGR 1006** (+ X10 fallback) reporting for press/release/drag/
   wheel when the app enables a mouse mode (1000/1002/1003); button + Shift/Alt/Ctrl
   modifier bits; **Shift** forces local selection over app grab. 3 unit tests.
