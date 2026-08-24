@@ -143,8 +143,12 @@ engine is now ours to prove.
   frame, so a flood parses eagerly but renders at most once per frame — intermediate
   frames dropped, never intermediate state. ⬜ still: *per-cell* damage tracking (today
   each frame rebuilds the glyph buffer); explicit vsync frame-pacing/benchmarks.
-- ✅ **Underline / strikethrough** decorations — drawn as thin quads over the glyphs
-  (all underline variants collapse to a single underline for now); unit test + PNG.
+- ✅ **Underline / strikethrough** decorations — drawn as thin quads over the glyphs.
+  ✅ **Styled underlines** (SGR `4:2`/`4:3`/`4:4`/`4:5`): single, **double**, **curly**
+  (undercurl), **dotted**, and **dashed** each render distinctly (`UnderlineKind` +
+  `push_underline`), and **SGR 58** colours the underline independently of the text
+  (`cell.underline_color`, `None` → the glyph's fg) — nvim's LSP-diagnostic undercurls now
+  read correctly. Unit tests (`sgr_styled_underlines`) + Xephyr PNG.
 - 🔨 **App-matrix + contract smokes (§17, §3)** — headless harnesses (`#[ignore]`,
   `cargo test -- --ignored`) run real programs through real PTYs:
   - `app_matrix_smoke` — rendering: **echo, ls (color), seq (wrap+scrollback),
