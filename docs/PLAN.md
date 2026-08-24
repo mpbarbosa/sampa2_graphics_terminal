@@ -104,6 +104,11 @@ engine is now ours to prove.
   4/10/11 overrides; DIM/INVERSE/HIDDEN handled; sRGB-correct. Verified by 6 unit
   tests (red/truecolor/indexed/inverse/cursor resolution) **and an offscreen PNG**
   (`sampa --capture`, a headless CI screenshot) showing all of the above painting.
+  ✅ **dynamic cursor shape (DECSCUSR, `CSI Ps SP q`)** — the renderer draws the term's
+  *live* shape (block / underline / bar, `cursor_style_of`), seeded from config
+  (`default_cursor_style`) so an app like vim can switch to a bar in insert mode and back;
+  carried on the `Snapshot`. `decscusr_drives_cursor_shape` unit-tested; Xephyr-verified.
+  (Config cursor-style *live-reload* applies to new sessions; DECSCUSR is always live.)
 - ✅ **Keyboard→bytes (§8.1):** printable, C0 controls (Ctrl-letter/Space/`[\]^_`),
   **Alt=Meta** (ESC prefix), arrows/Home/End honoring **DECCKM**, editing keys
   (Ins/Del/PgUp/PgDn), **F1–F12**, back-tab, and xterm **modifier encoding**
