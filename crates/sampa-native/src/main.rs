@@ -9574,6 +9574,40 @@ mod tests {
     }
 
     #[test]
+    fn cjk_and_emoji_are_double_width() {
+        // A CJK ideograph (一) and an emoji (🚀) are double-width: each fills one cell and
+        // reserves the next as a spacer, so following text lands two columns over — the width
+        // contract the renderer's column math and cursor placement rely on.
+        for (wide, label) in [('一', "cjk"), ('🚀', "emoji")] {
+            let (term,) = drive(format!("{wide}X").as_bytes(), 10);
+            let g = term.grid();
+            assert_eq!(g[Line(0)][Column(0)].c, wide, "{label}: wide char at col 0");
+            assert!(g[Line(0)][Column(0)].flags.contains(Flags::WIDE_CHAR), "{label}: col 0 is WIDE_CHAR");
+            assert!(
+                g[Line(0)][Column(1)].flags.contains(Flags::WIDE_CHAR_SPACER),
+                "{label}: col 1 is the wide-char spacer",
+            );
+            assert_eq!(g[Line(0)][Column(2)].c, 'X', "{label}: following text lands at col 2");
+        }
+    }
+
+    #[test]
+    fn snapshot_preserves_unicode() {
+        // The grid → snapshot round-trip keeps accented / CJK / emoji glyphs intact (what the
+        // a11y tree, search, and grid dumps read) — no mojibake, no dropped code points.
+        let (term,) = drive("café 日本 🎉".as_bytes(), 20);
+        let first = build_snapshot(&term, &Theme::default(), CursorStyle::Block, false)
+            .to_text()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        for ch in ['é', '日', '本', '🎉'] {
+            assert!(first.contains(ch), "snapshot dropped {ch:?}: {first:?}");
+        }
+    }
+
+    #[test]
     fn inverse_swaps_fg_and_bg() {
         let (term,) = drive(b"\x1b[7mX", 10);
         let cell = cell_vis(&term.grid()[Line(0)][Column(0)], term.renderable_content().colors, false, false, SELECTION_BG);
