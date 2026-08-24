@@ -10968,6 +10968,13 @@ mod tests {
             ("python", "python3", &["-c", "print('py-ok-42')"], b"", 900, &["py-ok-42"]),
             ("vim/alt-screen", "vim", &["-u", "NONE", "-N"], b"", 1100, &["~"]),
             ("htop", "htop", &[], b"", 1300, &["CPU", "Mem", "Load", "PID", "Tasks"]),
+            // §17 real-app matrix (skipped when a program isn't installed).
+            ("nvim/alt-screen", "nvim", &["-u", "NONE", "-n"], b"", 1400, &["~"]),
+            ("tmux/status", "tmux", &["-f", "/dev/null", "new", "-A", "-s", "m"], b"", 1400, &["[m]", "\"", "0:"]),
+            ("less/pager", "less", &["/etc/os-release"], b"", 900, &["NAME", "ID=", "VERSION"]),
+            ("mc", "mc", &[], b"", 1500, &["Left", "File", "Right", "Help"]),
+            ("emacs -nw", "emacs", &["-nw", "-Q"], b"", 1600, &["GNU Emacs", "scratch", "Buffers"]),
+            ("weechat", "weechat", &["-r", "/quit"], b"", 1500, &["WeeChat"]),
         ];
 
         let mut failed = Vec::new();
