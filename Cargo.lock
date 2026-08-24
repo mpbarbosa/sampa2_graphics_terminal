@@ -2835,6 +2835,7 @@ dependencies = [
  "sampa-ghhelp",
  "sampa-man",
  "sampa-netdec",
+ "sampa-npmhelp",
  "sampa-palette",
  "sampa-pingdec",
  "sampa-preview",
@@ -2849,6 +2850,14 @@ dependencies = [
 name = "sampa-netdec"
 version = "0.1.0"
 source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=b6d24e99a0418f9c6eb1a590afa2c7946de21712#b6d24e99a0418f9c6eb1a590afa2c7946de21712"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "sampa-npmhelp"
+version = "0.1.0"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=b3d29e3ac9317540640754eab34b38b834c8fafb#b3d29e3ac9317540640754eab34b38b834c8fafb"
 dependencies = [
  "serde",
 ]

@@ -50,6 +50,7 @@ use sampa_dumap::{parse_du, DuNode};
 use sampa_freemem::{parse_free, FreeInfo};
 use sampa_ghhelp::{parse_gh_help, GhCommand};
 use sampa_cargohelp::{parse_cargo_help, CargoCommand};
+use sampa_npmhelp::parse_npm_help;
 use sampa_uptimedec::{parse_uptime, UptimeInfo};
 use sampa_netdec::{parse_ss, Conn};
 use sampa_pingdec::{parse_ping, PingReport};
@@ -3506,6 +3507,27 @@ fn cargo_cheatsheet_lines(cmds: &[CargoCommand]) -> Vec<String> {
     lines
 }
 
+/// The npm command list as aligned man-panel lines: a `COMMANDS` header, then the bare names
+/// (npm has no per-command descriptions) laid out in padded columns that fit a nominal 76-col
+/// panel — a flat one-per-line list would waste space with 68 short names.
+fn npm_cheatsheet_lines(names: &[String]) -> Vec<String> {
+    if names.is_empty() {
+        return vec!["COMMANDS".to_string()];
+    }
+    let width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+    let cols = (76 / (width + 2)).max(1);
+    let mut lines = vec!["COMMANDS".to_string()];
+    for chunk in names.chunks(cols) {
+        let row: String = chunk
+            .iter()
+            .map(|n| format!("{n:<width$}", width = width))
+            .collect::<Vec<_>>()
+            .join("  ");
+        lines.push(format!("  {}", row.trim_end()));
+    }
+    lines
+}
+
 /// The sub-command path to drill into, from a typed line whose command is `program`: the
 /// leading **non-flag** tokens after it, stopping at the first flag (spec-gh-cheatsheet.md /
 /// spec-cargo-cheatsheet.md). `gh` → `[]`; `gh repo view --web` → `["repo","view"]`;
@@ -4916,6 +4938,39 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                         }
                     }
                     Err(_) => vec!["cargo not found on PATH.".to_string()],
+                };
+                let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
+            });
+        } else if cmd == "npm" {
+            // `npm` has a paged `--help` — show its command list instead
+            // (spec-npm-cheatsheet.md), like `gh`/`cargo`. Drill in by the typed subcommand
+            // path; a leaf (`npm install`, no `All commands:` list) shows its own raw help.
+            let subs = subcommand_path(&line, "npm");
+            let display = if subs.is_empty() {
+                "npm".to_string()
+            } else {
+                format!("npm {}", subs.join(" "))
+            };
+            self.man_cmd = display.clone();
+            self.man_loading = true;
+            self.man_lines.clear();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let mut command = std::process::Command::new("npm");
+                command.args(&subs).arg("--help");
+                let lines = match command.output() {
+                    Ok(o) => {
+                        // `npm … --help` prints to stdout; fold in stderr just in case.
+                        let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                        text.push_str(&String::from_utf8_lossy(&o.stderr));
+                        match parse_npm_help(&text) {
+                            Some(names) => npm_cheatsheet_lines(&names),
+                            // A leaf (no `All commands:` list) → show its raw help text.
+                            None if !text.trim().is_empty() => text.lines().map(str::to_string).collect(),
+                            None => vec!["No npm help available.".to_string()],
+                        }
+                    }
+                    Err(_) => vec!["npm not found on PATH.".to_string()],
                 };
                 let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
             });
@@ -7015,9 +7070,10 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let start = self.man_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
             panel_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
-            // `gh`/`cargo` (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
+            // `gh`/`cargo`/`npm` (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
             let is_cheatsheet = |c: &str| {
-                c == "gh" || c.starts_with("gh ") || c == "cargo" || c.starts_with("cargo ")
+                let prog = c.split_whitespace().next().unwrap_or("");
+                matches!(prog, "gh" | "cargo" | "npm")
             };
             let label = if is_cheatsheet(&self.man_cmd) {
                 format!("{} — commands", self.man_cmd)
@@ -9998,6 +10054,22 @@ mod tests {
         assert_eq!(lines[1], "  build, b  Compile the current package"); // padded to widest name
         assert_eq!(lines[2], "  run, r    Run a binary");
         assert_eq!(cargo_cheatsheet_lines(&[]), vec!["COMMANDS".to_string()]);
+    }
+
+    #[test]
+    fn npm_cheatsheet_lays_names_in_columns() {
+        assert_eq!(subcommand_path("npm install --save", "npm"), vec!["install"]);
+        // Names-only, packed into padded columns under a COMMANDS header.
+        let names: Vec<String> = ["access", "audit", "ci", "run"].iter().map(|s| s.to_string()).collect();
+        let lines = npm_cheatsheet_lines(&names);
+        assert_eq!(lines[0], "COMMANDS");
+        // Every name appears, and no row exceeds the nominal width budget.
+        let joined = lines[1..].join(" ");
+        for n in &names {
+            assert!(joined.contains(n.as_str()), "missing {n}");
+        }
+        assert!(lines.iter().all(|l| l.chars().count() <= 78));
+        assert_eq!(npm_cheatsheet_lines(&[]), vec!["COMMANDS".to_string()]);
     }
 
     #[test]

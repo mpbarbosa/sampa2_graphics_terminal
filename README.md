@@ -31,7 +31,8 @@ run, never on its own.
   explain the typed command · `Ctrl+Shift+G` screenshot the window and ask Claude to review it.
 - **Split panes:** `Ctrl+Shift+R` split vertically · `Ctrl+Shift+O` cycle focus.
 - **Also:** command palette (`Ctrl+Shift+P`), live man-page panel (`Ctrl+Shift+M`, which
-  shows a **`gh` or `cargo` command cheat-sheet** when the typed command is `gh`/`cargo`),
+  shows a **`gh`, `cargo`, or `npm` command cheat-sheet** when the typed command is
+  `gh`/`cargo`/`npm`),
   preview-as-you-type (`Ctrl+Shift+E`), search (`Ctrl+Shift+F`), tabs, and a help overlay
   (`Ctrl+Shift+?`) that lists every binding.
 
