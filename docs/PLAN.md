@@ -393,7 +393,10 @@ and show target; a CJK/emoji/compose input test passes; a screen reader sees the
   python / **vim** + **nvim** alt-screen / **htop** / **tmux** (status bar) / **less** (pager),
   each asserted against a rendered marker and **skipped when not installed** — added cases
   for the still-absent **mc** / **emacs -nw** / **weechat** so they run wherever present.
-  ⬜ still: **vttest** manual smoke; truecolor / sixel / CJK-emoji render checks.
+  ✅ **render checks** — end-to-end VT→grid/snapshot tests for **truecolor** (`38;2` → exact
+  RGB), **256-indexed**, **inverse**, **sixel** (pixels/RLE/bands), and **CJK/emoji width**
+  (双-width cells + spacer; a `café 日本 🎉` grid→snapshot round-trip keeps every code point).
+  ⬜ still: **vttest** manual smoke.
 - 🔨 **Perf:** the native ceiling is the payoff — ✅ **VT ingest throughput** benchmark
   (`sampa2 --bench [MiB]`) measures the parse+grid hot path (the `cat 50MB` ceiling minus GPU
   present) on a deterministic representative workload, reporting MiB/s, line rate, and the
