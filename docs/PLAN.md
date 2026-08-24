@@ -388,8 +388,11 @@ and show target; a CJK/emoji/compose input test passes; a screen reader sees the
   genuine xterm feature coverage `alacritty_terminal` lacks (DECSCA protection, left-right
   margins, WM ops that need a live window manager) — ranked roadmap in
   [tools/conformance/](../tools/conformance/README.md).
-- **vttest** manual smoke; **real-app matrix** green (add mc, ssh, weechat, emacs -nw,
-  fzf, truecolor, sixel, CJK/emoji).
+- 🔨 **real-app matrix** (`app_matrix_smoke`, `--ignored`): ✅ echo / ls-color / seq-wrap /
+  python / **vim** + **nvim** alt-screen / **htop** / **tmux** (status bar) / **less** (pager),
+  each asserted against a rendered marker and **skipped when not installed** — added cases
+  for the still-absent **mc** / **emacs -nw** / **weechat** so they run wherever present.
+  ⬜ still: **vttest** manual smoke; truecolor / sixel / CJK-emoji render checks.
 - 🔨 **Perf:** the native ceiling is the payoff — ✅ **VT ingest throughput** benchmark
   (`sampa2 --bench [MiB]`) measures the parse+grid hot path (the `cat 50MB` ceiling minus GPU
   present) on a deterministic representative workload, reporting MiB/s, line rate, and the
