@@ -78,6 +78,12 @@ sampa-cargohelp = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal"
 # `npm` + Ctrl+Shift+M routes to npm_cheatsheet_lines instead of a man page, a leaf
 # (`npm install`) shows raw help.
 sampa-npmhelp  = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
+# docker command cheat-sheet core (docs/spec-docker-cheatsheet.md). parse_docker_help -> the
+# grouped `… Commands:` list (name + desc + section; plugin `*` stripped); no shell, no Tauri.
+# Git-pinned per ADR 0002. Consumed by the native man panel like the others: a typed `docker` +
+# Ctrl+Shift+M routes to docker_cheatsheet_lines instead of a man page, a leaf (`docker run`)
+# shows raw help.
+sampa-dockerhelp = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "a8a1f1c3021bd2cdd0e4966df35958c0b8083f9f" }
 # netstat connections table core (docs/spec-netstat-table.md). parse_ss -> sockets from
 # `ss -tunap` (ss is the data source: net-tools netstat is deprecated + drops the udp State
 # column); no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native connections
