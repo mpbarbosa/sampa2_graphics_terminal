@@ -3149,6 +3149,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.on_mouse_button(button, state == ElementState::Pressed)
             }
             WindowEvent::MouseWheel { delta, .. } => self.on_mouse_wheel(delta),
+            WindowEvent::Focused(focused) => self.on_focus(focused),
             _ => {}
         }
     }
@@ -4223,6 +4224,20 @@ impl App {
     fn pty_write(&self, data: &[u8]) {
         if let Ok(mut p) = self.pty.lock() {
             let _ = p.write(data);
+        }
+    }
+
+    /// Window focus changed. When the app enabled **focus reporting** (DECSET 1004,
+    /// `TermMode::FOCUS_IN_OUT` — nvim/tmux use it for autoread / pane focus), send the
+    /// XTFOCUS report (`CSI I` in, `CSI O` out) to the active session.
+    fn on_focus(&mut self, focused: bool) {
+        let wants = self
+            .state
+            .lock()
+            .map(|g| g.term.mode().contains(TermMode::FOCUS_IN_OUT))
+            .unwrap_or(false);
+        if wants {
+            self.pty_write(focus_report(focused));
         }
     }
 
@@ -7466,6 +7481,15 @@ fn app_keypad_code(key: &Key) -> Option<Vec<u8>> {
     Some(format!("\x1bO{fin}").into_bytes())
 }
 
+/// XTFOCUS report for a focus change (DECSET 1004): `CSI I` on focus-in, `CSI O` on focus-out.
+fn focus_report(focused: bool) -> &'static [u8] {
+    if focused {
+        b"\x1b[I"
+    } else {
+        b"\x1b[O"
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // a cohesive key→bytes encoder: key + text + mode flags
 fn encode_key(
     key: &Key,
@@ -10547,6 +10571,13 @@ mod tests {
     }
     fn chr(s: &str, shift: bool, alt: bool, ctrl: bool) -> Vec<u8> {
         encode_key(&Key::Character(s.into()), None, shift, alt, ctrl, false, false, false)
+    }
+
+    #[test]
+    fn focus_report_bytes() {
+        // XTFOCUS (DECSET 1004): CSI I on focus-in, CSI O on focus-out.
+        assert_eq!(focus_report(true), b"\x1b[I");
+        assert_eq!(focus_report(false), b"\x1b[O");
     }
 
     #[test]

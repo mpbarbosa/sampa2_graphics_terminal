@@ -117,6 +117,11 @@ engine is now ours to prove.
 - ✅ **Mouse (§8.2):** **SGR 1006** (+ X10 fallback) reporting for press/release/drag/
   wheel when the app enables a mouse mode (1000/1002/1003); button + Shift/Alt/Ctrl
   modifier bits; **Shift** forces local selection over app grab. 3 unit tests.
+- ✅ **Focus reporting (XTFOCUS / DECSET 1004):** when the app enables it
+  (`TermMode::FOCUS_IN_OUT`), a `winit` `WindowEvent::Focused` sends `CSI I` (focus-in) /
+  `CSI O` (focus-out) to the active session — nvim/tmux use it for autoread & pane focus;
+  gated so nothing is sent otherwise. `focus_report` unit-tested; Xephyr-verified (enable
+  `?1004h`, toggle focus via a second window → `^[[O ^[[I`).
 - ✅ **Selection + clipboard (§8.3, first pass):** click-drag **Simple** selection via
   `alacritty_terminal::Selection`, highlighted in the render; **Ctrl-Shift-C** /
   auto-copy-on-release and **Ctrl-Shift-V** / **middle-click** paste via `arboard`;
