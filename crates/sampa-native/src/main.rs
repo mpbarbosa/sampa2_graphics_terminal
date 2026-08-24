@@ -49,6 +49,7 @@ use sampa_dfdec::{parse_df, FsUsage};
 use sampa_dumap::{parse_du, DuNode};
 use sampa_freemem::{parse_free, FreeInfo};
 use sampa_ghhelp::{parse_gh_help, GhCommand};
+use sampa_cargohelp::{parse_cargo_help, CargoCommand};
 use sampa_uptimedec::{parse_uptime, UptimeInfo};
 use sampa_netdec::{parse_ss, Conn};
 use sampa_pingdec::{parse_ping, PingReport};
@@ -62,7 +63,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 // --- Fixed metrics (N1: single monospace font) -------------------------------
@@ -3488,18 +3489,30 @@ fn gh_cheatsheet_lines(cmds: &[GhCommand]) -> Vec<String> {
     lines
 }
 
-/// The `gh` sub-command path to drill into, from a typed line whose command is `gh`: the
-/// leading **non-flag** tokens after `gh`, stopping at the first flag (spec-gh-cheatsheet.md).
-/// `gh` → `[]` (top level); `gh repo view --web` → `["repo","view"]`; skips a `sudo` prefix.
-fn gh_subcommands(line: &str) -> Vec<String> {
+/// The cargo `Commands:` cheat-sheet as aligned man-panel lines: a `COMMANDS` header then
+/// `  <name padded>  <desc>` rows. cargo has no sections (unlike gh), so the list is flat.
+fn cargo_cheatsheet_lines(cmds: &[CargoCommand]) -> Vec<String> {
+    let width = cmds.iter().map(|c| c.name.chars().count()).max().unwrap_or(0);
+    let mut lines = vec!["COMMANDS".to_string()];
+    for c in cmds {
+        lines.push(format!("  {:<width$}  {}", c.name, c.desc, width = width));
+    }
+    lines
+}
+
+/// The sub-command path to drill into, from a typed line whose command is `program`: the
+/// leading **non-flag** tokens after it, stopping at the first flag (spec-gh-cheatsheet.md /
+/// spec-cargo-cheatsheet.md). `gh` → `[]`; `gh repo view --web` → `["repo","view"]`;
+/// `cargo build` → `["build"]`; skips a `sudo` prefix.
+fn subcommand_path(line: &str, program: &str) -> Vec<String> {
     let mut found = false;
     let mut path = Vec::new();
     for t in line.split_whitespace() {
         if !found {
-            if t.strip_prefix('\\').unwrap_or(t) == "gh" {
+            if t.strip_prefix('\\').unwrap_or(t) == program {
                 found = true;
             }
-            continue; // skip everything up to and including the `gh` token
+            continue; // skip everything up to and including the program token
         }
         if t.starts_with('-') {
             break; // a flag ends the sub-command path
@@ -3507,6 +3520,11 @@ fn gh_subcommands(line: &str) -> Vec<String> {
         path.push(t.to_string());
     }
     path
+}
+
+/// The `gh` sub-command drill path (thin wrapper over [`subcommand_path`]).
+fn gh_subcommands(line: &str) -> Vec<String> {
+    subcommand_path(line, "gh")
 }
 
 fn first_command_token(line: &str) -> &str {
@@ -4859,6 +4877,39 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                         }
                     }
                     Err(_) => vec!["gh not found on PATH.".to_string()],
+                };
+                let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
+            });
+        } else if cmd == "cargo" {
+            // `cargo` has a dense `man cargo` — show its subcommand list instead
+            // (spec-cargo-cheatsheet.md), like `gh`. Drill in by the typed subcommand path; a
+            // leaf (`cargo build`, no `Commands:` section) shows its own raw help.
+            let subs = subcommand_path(&line, "cargo");
+            let display = if subs.is_empty() {
+                "cargo".to_string()
+            } else {
+                format!("cargo {}", subs.join(" "))
+            };
+            self.man_cmd = display.clone();
+            self.man_loading = true;
+            self.man_lines.clear();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let mut command = std::process::Command::new("cargo");
+                command.args(&subs).arg("--help").env("LC_ALL", "C");
+                let lines = match command.output() {
+                    Ok(o) => {
+                        // `cargo … --help` prints to stdout; fold in stderr just in case.
+                        let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                        text.push_str(&String::from_utf8_lossy(&o.stderr));
+                        match parse_cargo_help(&text) {
+                            Some(cmds) => cargo_cheatsheet_lines(&cmds),
+                            // A leaf (no `Commands:` section) → show its raw help text.
+                            None if !text.trim().is_empty() => text.lines().map(str::to_string).collect(),
+                            None => vec!["No cargo help available.".to_string()],
+                        }
+                    }
+                    Err(_) => vec!["cargo not found on PATH.".to_string()],
                 };
                 let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
             });
@@ -6958,8 +7009,11 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let start = self.man_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
             panel_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
-            // `gh` (and `gh <sub>` drill-ins) show a cheat-sheet, not a man page.
-            let label = if self.man_cmd == "gh" || self.man_cmd.starts_with("gh ") {
+            // `gh`/`cargo` (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
+            let is_cheatsheet = |c: &str| {
+                c == "gh" || c.starts_with("gh ") || c == "cargo" || c.starts_with("cargo ")
+            };
+            let label = if is_cheatsheet(&self.man_cmd) {
                 format!("{} — commands", self.man_cmd)
             } else {
                 format!("man {}", self.man_cmd)
@@ -9894,6 +9948,22 @@ mod tests {
         assert!(lines.iter().any(|l| l.is_empty()));
         assert!(lines.iter().any(|l| l == "GITHUB ACTIONS COMMANDS"));
         assert!(gh_cheatsheet_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn cargo_subcommand_path_and_cheatsheet() {
+        // The drill path is generic over the program token.
+        assert_eq!(subcommand_path("cargo", "cargo"), Vec::<String>::new());
+        assert_eq!(subcommand_path("cargo build --release", "cargo"), vec!["build"]);
+        assert_eq!(subcommand_path("cargo", "gh"), Vec::<String>::new()); // wrong program
+        // The cargo cheat-sheet is flat: a single COMMANDS header, then aligned rows.
+        let cc = |n: &str, d: &str| CargoCommand { name: n.into(), desc: d.into() };
+        let cmds = vec![cc("build, b", "Compile the current package"), cc("run, r", "Run a binary")];
+        let lines = cargo_cheatsheet_lines(&cmds);
+        assert_eq!(lines[0], "COMMANDS");
+        assert_eq!(lines[1], "  build, b  Compile the current package"); // padded to widest name
+        assert_eq!(lines[2], "  run, r    Run a binary");
+        assert_eq!(cargo_cheatsheet_lines(&[]), vec!["COMMANDS".to_string()]);
     }
 
     #[test]
