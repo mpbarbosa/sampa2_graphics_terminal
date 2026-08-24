@@ -52,6 +52,7 @@ use sampa_ghhelp::{parse_gh_description, parse_gh_help, GhCommand};
 use sampa_cargohelp::{parse_cargo_help, CargoCommand};
 use sampa_npmhelp::parse_npm_help;
 use sampa_dockerhelp::{parse_docker_help, DockerCommand};
+use sampa_kubectlhelp::{parse_kubectl_help, KubectlCommand};
 use sampa_uptimedec::{parse_uptime, UptimeInfo};
 use sampa_netdec::{parse_ss, Conn};
 use sampa_pingdec::{parse_ping, PingReport};
@@ -3549,6 +3550,26 @@ fn docker_cheatsheet_lines(cmds: &[DockerCommand]) -> Vec<String> {
     lines
 }
 
+/// The kubectl command list as aligned man-panel lines: each section header (upper-cased), then
+/// `  <name padded>  <desc>` rows. Grouped like docker; kubectl's sections carry qualifiers
+/// (`Basic Commands (Beginner)`, `Available Commands`) but render the same way.
+fn kubectl_cheatsheet_lines(cmds: &[KubectlCommand]) -> Vec<String> {
+    let width = cmds.iter().map(|c| c.name.chars().count()).max().unwrap_or(0);
+    let mut lines: Vec<String> = Vec::new();
+    let mut section = String::new();
+    for c in cmds {
+        if c.section != section {
+            if !lines.is_empty() {
+                lines.push(String::new()); // blank line between sections
+            }
+            lines.push(c.section.to_uppercase());
+            section = c.section.clone();
+        }
+        lines.push(format!("  {:<width$}  {}", c.name, c.desc, width = width));
+    }
+    lines
+}
+
 /// The sub-command path to drill into, from a typed line whose command is `program`: the
 /// leading **non-flag** tokens after it, stopping at the first flag (spec-gh-cheatsheet.md /
 /// spec-cargo-cheatsheet.md). `gh` → `[]`; `gh repo view --web` → `["repo","view"]`;
@@ -5036,6 +5057,40 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                         }
                     }
                     Err(_) => vec!["docker not found on PATH.".to_string()],
+                };
+                let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
+            });
+        } else if cmd == "kubectl" {
+            // `kubectl` has a long, grouped `--help` — show its command list instead
+            // (spec-kubectl-cheatsheet.md), like `docker`. Drill in by the typed subcommand path
+            // (`kubectl config` → its Available Commands:); a leaf (`kubectl get`, no command
+            // section) shows its own raw help.
+            let subs = subcommand_path(&line, "kubectl");
+            let display = if subs.is_empty() {
+                "kubectl".to_string()
+            } else {
+                format!("kubectl {}", subs.join(" "))
+            };
+            self.man_cmd = display.clone();
+            self.man_loading = true;
+            self.man_lines.clear();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let mut command = std::process::Command::new("kubectl");
+                command.args(&subs).arg("--help");
+                let lines = match command.output() {
+                    Ok(o) => {
+                        // `kubectl … --help` prints to stdout; fold in stderr just in case.
+                        let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                        text.push_str(&String::from_utf8_lossy(&o.stderr));
+                        match parse_kubectl_help(&text) {
+                            Some(cmds) => kubectl_cheatsheet_lines(&cmds),
+                            // A leaf (no command section) → show its raw help text.
+                            None if !text.trim().is_empty() => text.lines().map(str::to_string).collect(),
+                            None => vec!["No kubectl help available.".to_string()],
+                        }
+                    }
+                    Err(_) => vec!["kubectl not found on PATH.".to_string()],
                 };
                 let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
             });
@@ -7135,10 +7190,10 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let start = self.man_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
             panel_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
-            // `gh`/`cargo`/`npm`/`docker` (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
+            // gh/cargo/npm/docker/kubectl (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
             let is_cheatsheet = |c: &str| {
                 let prog = c.split_whitespace().next().unwrap_or("");
-                matches!(prog, "gh" | "cargo" | "npm" | "docker")
+                matches!(prog, "gh" | "cargo" | "npm" | "docker" | "kubectl")
             };
             let label = if is_cheatsheet(&self.man_cmd) {
                 format!("{} — commands", self.man_cmd)
@@ -10193,6 +10248,28 @@ mod tests {
         assert!(lines.iter().any(|l| l.is_empty()));
         assert!(lines.iter().any(|l| l == "MANAGEMENT COMMANDS"));
         assert!(docker_cheatsheet_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn kubectl_cheatsheet_groups_and_aligns() {
+        assert_eq!(subcommand_path("kubectl config use-context", "kubectl"), vec!["config", "use-context"]);
+        let kc = |n: &str, d: &str, s: &str| KubectlCommand {
+            name: n.into(),
+            desc: d.into(),
+            section: s.into(),
+        };
+        let cmds = vec![
+            kc("create", "Create a resource", "Basic Commands (Beginner)"),
+            kc("get", "Display one or many resources", "Basic Commands (Beginner)"),
+            kc("rollout", "Manage the rollout of a resource", "Deploy Commands"),
+        ];
+        let lines = kubectl_cheatsheet_lines(&cmds);
+        // Qualified section header (upper-cased), then rows padded to the widest name ("rollout" = 7).
+        assert_eq!(lines[0], "BASIC COMMANDS (BEGINNER)");
+        assert_eq!(lines[1], "  create   Create a resource");
+        assert!(lines.iter().any(|l| l.is_empty()));
+        assert!(lines.iter().any(|l| l == "DEPLOY COMMANDS"));
+        assert!(kubectl_cheatsheet_lines(&[]).is_empty());
     }
 
     #[test]
