@@ -1,0 +1,75 @@
+name: CI
+
+# Build, test, and lint on every push to main and every PR. This works now that the shared
+# core crates are git-pinned (ADR 0002 path→git migration) — cargo can resolve the workspace
+# in CI without a sibling checkout. The unit suite is headless (no window/GPU), so a plain
+# ubuntu-latest runner suffices; the `--ignored` app-matrix smokes (which spawn real programs)
+# are not run here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. a force-push to a PR branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build · test · clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # winit/wayland build helpers (most of the display stack is dlopened at runtime, so this
+      # is a small, conservative set). `zsh` is the shell `sampa-preview` runs previews under —
+      # the `preview_never_mutates_the_filesystem` test needs it to exercise the "cat runs" path.
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev zsh
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build -p sampa-native --locked
+
+      - name: Test
+        run: cargo test -p sampa-native --locked
+
+      # Not `-D warnings` yet: one pre-existing `too_many_arguments` (mouse_report) would fail
+      # it. Runs as a report so new lints are visible without blocking the gate.
+      - name: Clippy
+        run: cargo clippy -p sampa-native --all-targets --locked
+
+  bench:
+    name: VT ingest throughput (trend)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release -p sampa-native --locked
+
+      # Non-gating perf trend: the MiB/s lands in the run's Summary each time (docs/perf.md).
+      - name: Bench (VT ingest)
+        run: |
+          echo '### VT ingest throughput' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ./target/release/sampa2 --bench | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
