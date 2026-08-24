@@ -49,9 +49,11 @@ page. Informational; nothing is composed or run.
 
 ## 4. Display
 
-- Rendered into the man panel's `<pre>` as an aligned cheat-sheet: each `… COMMANDS` section
-  header, then `  <name padded>  <description>` rows, so names line up. Title: `gh —
-  commands`. Text reaches the DOM via `textContent` only.
+- Rendered into the man panel's `<pre>` as an aligned cheat-sheet: **the command's own
+  description first** (the intro paragraph `gh <path> --help` prints — e.g. "Secrets can be set
+  at the repository…" for `gh secret` — via `parse_gh_description`, line wrapping preserved),
+  then each `… COMMANDS` section header, then `  <name padded>  <description>` rows so names line
+  up. Title: `gh — commands`. Text reaches the DOM via `textContent` only.
 
 ## 5. Architecture mapping
 

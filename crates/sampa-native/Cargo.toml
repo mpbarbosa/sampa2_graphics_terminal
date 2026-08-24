@@ -64,9 +64,10 @@ sampa-dfdec    = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal",
 # native load-gauge UI (load_render — three core-scaled load bars); informational (no insert).
 sampa-uptimedec = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b05ded339a8448bed19552341235dd550a2dbc17" }
 # gh command cheat-sheet core (docs/spec-gh-cheatsheet.md). parse_gh_help -> grouped gh
-# subcommands; no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native man panel:
-# a typed `gh` + Ctrl+Shift+M routes to gh_cheatsheet_lines instead of a man page (informational).
-sampa-ghhelp   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "4208c7a33b49a50d9c19875ced1ac660a5562942" }
+# subcommands + parse_gh_description -> the command's intro paragraph; no shell, no Tauri.
+# Git-pinned per ADR 0002. Consumed by the native man panel: a typed `gh` + Ctrl+Shift+M routes
+# to gh_cheatsheet_lines (led by the description) instead of a man page (informational).
+sampa-ghhelp   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "2f8045d8f15d6d60466551c4fa8ada49e7ee3c7d" }
 # cargo command cheat-sheet core (docs/spec-cargo-cheatsheet.md). parse_cargo_help -> the
 # `Commands:` list (name + optional alias); no shell, no Tauri. Git-pinned per ADR 0002.
 # Consumed by the native man panel like ghhelp: a typed `cargo` + Ctrl+Shift+M routes to

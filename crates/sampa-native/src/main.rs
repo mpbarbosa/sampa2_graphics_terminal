@@ -48,7 +48,7 @@ use sampa_config::CursorStyle;
 use sampa_dfdec::{parse_df, FsUsage};
 use sampa_dumap::{parse_du, DuNode};
 use sampa_freemem::{parse_free, FreeInfo};
-use sampa_ghhelp::{parse_gh_help, GhCommand};
+use sampa_ghhelp::{parse_gh_description, parse_gh_help, GhCommand};
 use sampa_cargohelp::{parse_cargo_help, CargoCommand};
 use sampa_npmhelp::parse_npm_help;
 use sampa_dockerhelp::{parse_docker_help, DockerCommand};
@@ -4919,7 +4919,17 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                         let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
                         text.push_str(&String::from_utf8_lossy(&o.stderr));
                         match parse_gh_help(&text) {
-                            Some(cmds) => gh_cheatsheet_lines(&cmds),
+                            // Lead with the command's own description (what it does), then the
+                            // grouped subcommands (spec-gh-cheatsheet.md §4).
+                            Some(cmds) => {
+                                let mut lines = Vec::new();
+                                if let Some(desc) = parse_gh_description(&text) {
+                                    lines.extend(desc.lines().map(str::to_string));
+                                    lines.push(String::new());
+                                }
+                                lines.extend(gh_cheatsheet_lines(&cmds));
+                                lines
+                            }
                             // A leaf (no `… COMMANDS` sections) → show its raw help text.
                             None if !text.trim().is_empty() => text.lines().map(str::to_string).collect(),
                             None => vec!["No gh help available.".to_string()],
