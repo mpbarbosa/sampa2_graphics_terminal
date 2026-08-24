@@ -13,25 +13,26 @@ name = "sampa2"
 path = "src/main.rs"
 
 # --- Shared headless core (origin repo), per ADR 0002 -------------------------
-# Local N0 development uses path deps against a sibling checkout. Committed/CI
-# builds should switch to a git dep pinned to a rev, e.g.:
-#   pty-core = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "36e344b8f727fe62d94ae5fe0b9467821b26b684" }
-# (Cargo searches the repo's subdirectories for each crate.)
+# Every core crate is now **git-pinned** to a rev in the origin repo — no sibling checkout
+# needed, so `cargo build`/`test` are reproducible anywhere (this is the ADR 0002 path→git
+# migration it anticipated "at the end of N1/N2", which also unblocks CI). Cargo searches the
+# repo's subdirectories for each crate; bump a rev to pick up an origin-side change.
 [dependencies]
-pty-core       = { path = "../../../sampa_graphics_terminal/crates/pty-core" }
-sampa-config   = { path = "../../../sampa_graphics_terminal/crates/config" }
-sampa-cli      = { path = "../../../sampa_graphics_terminal/crates/cli" }
-sampa-shellint = { path = "../../../sampa_graphics_terminal/crates/shellint" }
-sampa-palette  = { path = "../../../sampa_graphics_terminal/crates/palette" }
-sampa-man      = { path = "../../../sampa_graphics_terminal/crates/man" }
-# Safe auto-run preview gate. Git-pinned per ADR 0002 (CI-reproducible), like the feature
-# cores below — pinned at the rev that dropped `du` from the allowlist (the du treemap is
-# the intended way to run du now). The other six above remain local path deps for N0.
+# The six foundational headless crates (pty / config / cli / shellint / palette / man) —
+# formerly local N0 path deps, pinned here at the same rev, GUI-free and unchanged per ADR 0002.
+pty-core       = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
+sampa-config   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
+sampa-cli      = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
+sampa-shellint = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
+sampa-palette  = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
+sampa-man      = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
+# Safe auto-run preview gate. Git-pinned per ADR 0002 (CI-reproducible), like every core
+# crate — pinned at the rev that dropped `du` from the allowlist (the du treemap is the
+# intended way to run du now).
 sampa-preview  = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b6f2123d69ad6c9a331674f8b8e8dfca6d21cc1a" }
 # Opt-in Claude-API command suggester (spec-ai-overlay.md). Headless like the rest;
 # it is the only crate that can open a socket, and only when `[ai] enabled = true`.
-# Pinned to a git rev (ADR 0002): this feature's dep is CI-reproducible rather than
-# resolved from a sibling checkout. The other seven remain local path deps for N0.
+# Pinned to a git rev (ADR 0002): CI-reproducible rather than resolved from a sibling checkout.
 sampa-ai       = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "06651037515f4fe26e746328f7ff1c697e7aa86a" }
 # ps(1) output-enhancement core (docs/spec-ps-output-enhancement.md). Headless
 # parse-and-decorate; fails safe to raw so a non-`ps` stream is never mangled. Git-pinned
