@@ -53,6 +53,7 @@ use sampa_cargohelp::{parse_cargo_help, CargoCommand};
 use sampa_npmhelp::parse_npm_help;
 use sampa_dockerhelp::{parse_docker_help, DockerCommand};
 use sampa_kubectlhelp::{parse_kubectl_help, KubectlCommand};
+use sampa_helmhelp::{parse_helm_help, HelmCommand};
 use sampa_uptimedec::{parse_uptime, UptimeInfo};
 use sampa_netdec::{parse_ss, Conn};
 use sampa_pingdec::{parse_ping, PingReport};
@@ -3574,6 +3575,26 @@ fn kubectl_cheatsheet_lines(cmds: &[KubectlCommand]) -> Vec<String> {
     lines
 }
 
+/// The helm command list as aligned man-panel lines: each section header (upper-cased), then
+/// `  <name padded>  <desc>` rows. helm is pure cobra, so this is almost always a single
+/// `Available Commands` section, rendered like docker/kubectl.
+fn helm_cheatsheet_lines(cmds: &[HelmCommand]) -> Vec<String> {
+    let width = cmds.iter().map(|c| c.name.chars().count()).max().unwrap_or(0);
+    let mut lines: Vec<String> = Vec::new();
+    let mut section = String::new();
+    for c in cmds {
+        if c.section != section {
+            if !lines.is_empty() {
+                lines.push(String::new()); // blank line between sections
+            }
+            lines.push(c.section.to_uppercase());
+            section = c.section.clone();
+        }
+        lines.push(format!("  {:<width$}  {}", c.name, c.desc, width = width));
+    }
+    lines
+}
+
 /// The sub-command path to drill into, from a typed line whose command is `program`: the
 /// leading **non-flag** tokens after it, stopping at the first flag (spec-gh-cheatsheet.md /
 /// spec-cargo-cheatsheet.md). `gh` → `[]`; `gh repo view --web` → `["repo","view"]`;
@@ -5121,6 +5142,40 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                         }
                     }
                     Err(_) => vec!["kubectl not found on PATH.".to_string()],
+                };
+                let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
+            });
+        } else if cmd == "helm" {
+            // `helm` is a cobra CLI — show its `Available Commands:` list instead
+            // (spec-helm-cheatsheet.md), like `kubectl`. Drill in by the typed subcommand path
+            // (`helm repo` → its Available Commands:); a leaf (`helm install`, no command
+            // section) shows its own raw help.
+            let subs = subcommand_path(&line, "helm");
+            let display = if subs.is_empty() {
+                "helm".to_string()
+            } else {
+                format!("helm {}", subs.join(" "))
+            };
+            self.man_cmd = display.clone();
+            self.man_loading = true;
+            self.man_lines.clear();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let mut command = std::process::Command::new("helm");
+                command.args(&subs).arg("--help");
+                let lines = match command.output() {
+                    Ok(o) => {
+                        // `helm … --help` prints to stdout; fold in stderr just in case.
+                        let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                        text.push_str(&String::from_utf8_lossy(&o.stderr));
+                        match parse_helm_help(&text) {
+                            Some(cmds) => helm_cheatsheet_lines(&cmds),
+                            // A leaf (no command section) → show its raw help text.
+                            None if !text.trim().is_empty() => text.lines().map(str::to_string).collect(),
+                            None => vec!["No helm help available.".to_string()],
+                        }
+                    }
+                    Err(_) => vec!["helm not found on PATH.".to_string()],
                 };
                 let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
             });
@@ -7220,10 +7275,10 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let start = self.man_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
             panel_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
-            // gh/cargo/npm/docker/kubectl (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
+            // gh/cargo/npm/docker/kubectl/helm (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
             let is_cheatsheet = |c: &str| {
                 let prog = c.split_whitespace().next().unwrap_or("");
-                matches!(prog, "gh" | "cargo" | "npm" | "docker" | "kubectl")
+                matches!(prog, "gh" | "cargo" | "npm" | "docker" | "kubectl" | "helm")
             };
             let label = if is_cheatsheet(&self.man_cmd) {
                 format!("{} — commands", self.man_cmd)
@@ -10326,6 +10381,27 @@ mod tests {
         assert!(lines.iter().any(|l| l.is_empty()));
         assert!(lines.iter().any(|l| l == "DEPLOY COMMANDS"));
         assert!(kubectl_cheatsheet_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn helm_cheatsheet_groups_and_aligns() {
+        assert_eq!(subcommand_path("helm repo add", "helm"), vec!["repo", "add"]);
+        let hc = |n: &str, d: &str| HelmCommand {
+            name: n.into(),
+            desc: d.into(),
+            section: "Available Commands".into(),
+        };
+        let cmds = vec![
+            hc("create", "create a new chart with the given name"),
+            hc("install", "install a chart"),
+            hc("repo", "add, list, remove, update chart repositories"),
+        ];
+        let lines = helm_cheatsheet_lines(&cmds);
+        // Cobra section header (upper-cased), then rows padded to the widest name ("install" = 7).
+        assert_eq!(lines[0], "AVAILABLE COMMANDS");
+        assert_eq!(lines[1], "  create   create a new chart with the given name");
+        assert_eq!(lines[2], "  install  install a chart");
+        assert!(helm_cheatsheet_lines(&[]).is_empty());
     }
 
     #[test]

@@ -2817,6 +2817,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sampa-helmhelp"
+version = "0.1.0"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=f9bb3ac061df6cb9dc4bc6e6f00d5e7c0ee21c8b#f9bb3ac061df6cb9dc4bc6e6f00d5e7c0ee21c8b"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "sampa-kubectlhelp"
 version = "0.1.0"
 source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=41b7dee238ba63bf7ae4307215254a178e55feaf#41b7dee238ba63bf7ae4307215254a178e55feaf"
@@ -2854,6 +2862,7 @@ dependencies = [
  "sampa-freemem",
  "sampa-fsnav",
  "sampa-ghhelp",
+ "sampa-helmhelp",
  "sampa-kubectlhelp",
  "sampa-man",
  "sampa-netdec",
