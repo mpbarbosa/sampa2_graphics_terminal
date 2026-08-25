@@ -376,6 +376,35 @@ fn load_config() -> sampa_config::Config {
     sampa_config::Config::from_toml("").expect("built-in default config parses")
 }
 
+/// A cell's underline style (SGR `4` / `4:2` / `4:3` / `4:4` / `4:5`). nvim uses undercurl +
+/// a colour for LSP diagnostics; the renderer draws each distinctly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UnderlineKind {
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+/// The underline style a cell's flags encode; the specific styles win over plain `UNDERLINE`.
+fn underline_kind(flags: Flags) -> UnderlineKind {
+    if flags.contains(Flags::UNDERCURL) {
+        UnderlineKind::Curly
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        UnderlineKind::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        UnderlineKind::Dashed
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        UnderlineKind::Double
+    } else if flags.contains(Flags::UNDERLINE) {
+        UnderlineKind::Single
+    } else {
+        UnderlineKind::None
+    }
+}
+
 /// A single displayable cell after VT-state + attribute resolution.
 #[derive(Clone)]
 struct CellVis {
@@ -384,7 +413,8 @@ struct CellVis {
     bg: [u8; 3],
     bold: bool,
     italic: bool,
-    underline: bool,
+    underline: UnderlineKind,
+    underline_color: Option<[u8; 3]>, // SGR 58; None → draw in `fg`
     strike: bool,
     hyperlink: bool,
 }
@@ -7818,13 +7848,9 @@ fn cell_vis(
     if selected {
         bg = selection_bg;
     }
-    let underline = flags.intersects(
-        Flags::UNDERLINE
-            | Flags::DOUBLE_UNDERLINE
-            | Flags::UNDERCURL
-            | Flags::DOTTED_UNDERLINE
-            | Flags::DASHED_UNDERLINE,
-    );
+    let underline = underline_kind(flags);
+    // SGR 58 underline colour, if set; resolved like any other colour (else the renderer uses fg).
+    let underline_color = cell.underline_color().map(|c| resolve(c, colors, fg, false));
     CellVis {
         // Never hand a control character to the glyph shaper — it renders as a tofu box.
         // Cells can carry `\0` (empty) or a raw `\t` (the column a tab advanced over); both
@@ -7835,6 +7861,7 @@ fn cell_vis(
         bold,
         italic: flags.contains(Flags::ITALIC),
         underline,
+        underline_color,
         strike: flags.contains(Flags::STRIKEOUT),
         hyperlink: cell.hyperlink().is_some(),
     }
@@ -8589,6 +8616,46 @@ impl Renderer {
         labels
     }
 
+    /// Emit the decoration quads for a cell's underline `kind` at `(x, y)` in `color`. Single is
+    /// one line; double is two; dotted/dashed are runs of short segments; curly is a coarse
+    /// zigzag (the solid-quad approximation of an undercurl).
+    fn push_underline(&self, kind: UnderlineKind, x: f32, y: f32, color: [f32; 4], out: &mut Vec<QuadInstance>) {
+        let w = self.cell_w;
+        let base = y + self.line_h - 2.0;
+        match kind {
+            UnderlineKind::None => {}
+            UnderlineKind::Single => out.push(QuadInstance { rect: [x, base, w, 1.5], color }),
+            UnderlineKind::Double => {
+                out.push(QuadInstance { rect: [x, base - 1.5, w, 1.0], color });
+                out.push(QuadInstance { rect: [x, base + 1.0, w, 1.0], color });
+            }
+            UnderlineKind::Dotted => {
+                let mut i = 0.0;
+                while i < w {
+                    out.push(QuadInstance { rect: [x + i, base, 1.5, 1.5], color });
+                    i += 3.0;
+                }
+            }
+            UnderlineKind::Dashed => {
+                let mut i = 0.0;
+                while i < w {
+                    out.push(QuadInstance { rect: [x + i, base, 3.0, 1.5], color });
+                    i += 5.0;
+                }
+            }
+            UnderlineKind::Curly => {
+                // Alternate the segment's y each step so it reads as a wave.
+                let (mut i, mut up) = (0.0, true);
+                while i < w {
+                    let yy = if up { base - 1.0 } else { base + 1.0 };
+                    out.push(QuadInstance { rect: [x + i, yy, 2.5, 1.5], color });
+                    i += 2.0;
+                    up = !up;
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paint(&mut self, panes: &[PaneRender], view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
@@ -8704,8 +8771,19 @@ impl Renderer {
                         .is_some_and(|(hr, cs, ce)| r == hr && c >= cs && c <= ce);
                     if row_visible && !hits_card(x, y) && hovered {
                         deco_quads.push(QuadInstance { rect: [x, y + self.line_h - 2.5, self.cell_w, 2.0], color: self.color4(self.theme.cursor) });
-                    } else if row_visible && !hits_card(x, y) && (cell.underline || cell.hyperlink) {
-                        deco_quads.push(QuadInstance { rect: [x, y + self.line_h - 2.0, self.cell_w, 1.5], color: self.color4(cell.fg) });
+                    } else if row_visible && !hits_card(x, y) {
+                        // SGR underline (any of the five styles); a hyperlink underlines plain.
+                        let kind = if cell.underline != UnderlineKind::None {
+                            cell.underline
+                        } else if cell.hyperlink {
+                            UnderlineKind::Single
+                        } else {
+                            UnderlineKind::None
+                        };
+                        if kind != UnderlineKind::None {
+                            let col = self.color4(cell.underline_color.unwrap_or(cell.fg));
+                            self.push_underline(kind, x, y, col, &mut deco_quads);
+                        }
                     }
                     if row_visible && !hits_card(x, y) && cell.strike {
                         deco_quads.push(QuadInstance { rect: [x, y + self.line_h * 0.45, self.cell_w, 1.5], color: self.color4(cell.fg) });
@@ -10588,8 +10666,21 @@ mod tests {
         let colors = term.renderable_content().colors;
         let u = cell_vis(&term.grid()[Line(0)][Column(0)], colors, false, false, SELECTION_BG);
         let s = cell_vis(&term.grid()[Line(0)][Column(1)], colors, false, false, SELECTION_BG);
-        assert!(u.underline && !u.strike, "cell 0 should be underlined only");
-        assert!(s.strike && !s.underline, "cell 1 should be struck only");
+        assert!(u.underline == UnderlineKind::Single && !u.strike, "cell 0 single-underlined only");
+        assert!(s.strike && s.underline == UnderlineKind::None, "cell 1 struck only");
+    }
+
+    #[test]
+    fn sgr_styled_underlines() {
+        // 4:2 double, 4:3 curly, 4:4 dotted, 4:5 dashed, then 58 sets the underline colour.
+        let (term,) = drive(b"\x1b[4:2mD\x1b[4:3mC\x1b[4:4mO\x1b[4:5mA\x1b[58:2::255:0:0mR", 10);
+        let colors = term.renderable_content().colors;
+        let k = |col| cell_vis(&term.grid()[Line(0)][Column(col)], colors, false, false, SELECTION_BG);
+        assert_eq!(k(0).underline, UnderlineKind::Double, "4:2 -> double");
+        assert_eq!(k(1).underline, UnderlineKind::Curly, "4:3 -> curly");
+        assert_eq!(k(2).underline, UnderlineKind::Dotted, "4:4 -> dotted");
+        assert_eq!(k(3).underline, UnderlineKind::Dashed, "4:5 -> dashed");
+        assert_eq!(k(4).underline_color, Some([255, 0, 0]), "SGR 58 sets underline colour");
     }
 
     // --- keyboard encoding (§8.1) ---
