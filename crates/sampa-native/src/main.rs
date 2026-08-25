@@ -54,6 +54,7 @@ use sampa_npmhelp::parse_npm_help;
 use sampa_dockerhelp::{parse_docker_help, DockerCommand};
 use sampa_kubectlhelp::{parse_kubectl_help, KubectlCommand};
 use sampa_helmhelp::{parse_helm_help, HelmCommand};
+use sampa_awshelp::{parse_aws_help, strip as aws_strip};
 use sampa_uptimedec::{parse_uptime, UptimeInfo};
 use sampa_netdec::{parse_ss, Conn};
 use sampa_pingdec::{parse_ping, PingReport};
@@ -3630,6 +3631,27 @@ fn helm_cheatsheet_lines(cmds: &[HelmCommand]) -> Vec<String> {
     lines
 }
 
+/// The aws service/command names as aligned man-panel lines: a `COMMANDS` header, then the
+/// bare names (aws lists names only) in padded columns that fit a nominal 76-col panel — same
+/// layout as npm, since aws exposes no per-command descriptions.
+fn aws_cheatsheet_lines(names: &[String]) -> Vec<String> {
+    if names.is_empty() {
+        return vec!["COMMANDS".to_string()];
+    }
+    let width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+    let cols = (76 / (width + 2)).max(1);
+    let mut lines = vec!["COMMANDS".to_string()];
+    for chunk in names.chunks(cols) {
+        let row: String = chunk
+            .iter()
+            .map(|n| format!("{n:<width$}", width = width))
+            .collect::<Vec<_>>()
+            .join("  ");
+        lines.push(format!("  {}", row.trim_end()));
+    }
+    lines
+}
+
 /// The sub-command path to drill into, from a typed line whose command is `program`: the
 /// leading **non-flag** tokens after it, stopping at the first flag (spec-gh-cheatsheet.md /
 /// spec-cargo-cheatsheet.md). `gh` → `[]`; `gh repo view --web` → `["repo","view"]`;
@@ -5225,6 +5247,52 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                         }
                     }
                     Err(_) => vec!["helm not found on PATH.".to_string()],
+                };
+                let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
+            });
+        } else if cmd == "aws" {
+            // `aws` has a long, groff man-page help — show its service/command list instead
+            // (spec-aws-cheatsheet.md). aws uses a `help` pseudo-subcommand (not `--help`), and
+            // its output carries ANSI/overstrike, so strip it. Drill in by the typed path
+            // (`aws s3` → its AVAILABLE COMMANDS); a leaf (`aws s3 ls`, no AVAILABLE list) shows
+            // its own raw (stripped) help.
+            let subs = subcommand_path(&line, "aws");
+            let display = if subs.is_empty() {
+                "aws".to_string()
+            } else {
+                format!("aws {}", subs.join(" "))
+            };
+            self.man_cmd = display.clone();
+            self.man_loading = true;
+            self.man_lines.clear();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let mut command = std::process::Command::new("aws");
+                command
+                    .args(&subs)
+                    .arg("help")
+                    .env("AWS_PAGER", "")
+                    .env("PAGER", "cat")
+                    .env("MANPAGER", "cat")
+                    .env("LC_ALL", "C");
+                let lines = match command.output() {
+                    Ok(o) => {
+                        let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                        text.push_str(&String::from_utf8_lossy(&o.stderr));
+                        match parse_aws_help(&text) {
+                            Some(names) => aws_cheatsheet_lines(&names),
+                            // A leaf (no AVAILABLE list) → its own help, man-page decoration stripped.
+                            None => {
+                                let clean = aws_strip(&text);
+                                if clean.trim().is_empty() {
+                                    vec!["No aws help available.".to_string()]
+                                } else {
+                                    clean.lines().map(str::to_string).collect()
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => vec!["aws not found on PATH.".to_string()],
                 };
                 let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
             });
@@ -7324,10 +7392,10 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let start = self.man_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
             panel_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
-            // gh/cargo/npm/docker/kubectl/helm (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
+            // gh/cargo/npm/docker/kubectl/helm/aws (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
             let is_cheatsheet = |c: &str| {
                 let prog = c.split_whitespace().next().unwrap_or("");
-                matches!(prog, "gh" | "cargo" | "npm" | "docker" | "kubectl" | "helm")
+                matches!(prog, "gh" | "cargo" | "npm" | "docker" | "kubectl" | "helm" | "aws")
             };
             let label = if is_cheatsheet(&self.man_cmd) {
                 format!("{} — commands", self.man_cmd)
@@ -10531,6 +10599,21 @@ mod tests {
         assert_eq!(lines[1], "  create   create a new chart with the given name");
         assert_eq!(lines[2], "  install  install a chart");
         assert!(helm_cheatsheet_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn aws_cheatsheet_lays_names_in_columns() {
+        assert_eq!(subcommand_path("aws s3 ls", "aws"), vec!["s3", "ls"]);
+        // Names-only, packed into padded columns under a COMMANDS header (like npm).
+        let names: Vec<String> = ["acm", "dynamodb", "ec2", "s3"].iter().map(|s| s.to_string()).collect();
+        let lines = aws_cheatsheet_lines(&names);
+        assert_eq!(lines[0], "COMMANDS");
+        let joined = lines[1..].join(" ");
+        for n in &names {
+            assert!(joined.contains(n.as_str()), "missing {n}");
+        }
+        assert!(lines.iter().all(|l| l.chars().count() <= 78));
+        assert_eq!(aws_cheatsheet_lines(&[]), vec!["COMMANDS".to_string()]);
     }
 
     #[test]

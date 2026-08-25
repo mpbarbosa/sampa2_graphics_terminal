@@ -96,6 +96,11 @@ sampa-kubectlhelp = { git = "https://github.com/mpbarbosa/sampa_graphics_termina
 # 0002. Consumed by the native man panel like the others: a typed `helm` + Ctrl+Shift+M routes
 # to helm_cheatsheet_lines, a leaf (`helm install`) shows raw help.
 sampa-helmhelp = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "f9bb3ac061df6cb9dc4bc6e6f00d5e7c0ee21c8b" }
+# aws command cheat-sheet core (docs/spec-aws-cheatsheet.md). strip() (ANSI/overstrike) +
+# parse_aws_help -> the `AVAILABLE SERVICES/COMMANDS` bullet names (names only, groff man-page
+# source); no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native man panel: a typed
+# `aws` + Ctrl+Shift+M routes to aws_cheatsheet_lines (via `aws … help`), a leaf shows raw help.
+sampa-awshelp  = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "6eaee04ab0cb78ba883e737e327b7ecd761e9bd4" }
 # netstat connections table core (docs/spec-netstat-table.md). parse_ss -> sockets from
 # `ss -tunap` (ss is the data source: net-tools netstat is deprecated + drops the udp State
 # column); no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native connections
