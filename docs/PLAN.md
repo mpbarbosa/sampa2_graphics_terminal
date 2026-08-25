@@ -325,8 +325,13 @@ refuses writes (file provably untouched) and clears on Enter.
   → that axis fixed and the other by source aspect, neither → natural), and `r=` rows are
   reserved exactly; the source texture stays native and the quad samples it.
   `image_display_size` unit-tested; Xephyr-verified (an 80×80 square placed `c=30,r=3` renders
-  as a wide 30×3-cell strip with text flowing below). ⬜ still: z-index (`z=`) and relative
-  placement.
+  as a wide 30×3-cell strip with text flowing below). ✅ **z-index (`z=`)** — a placement's
+  signed `z` (`kitty_inum`) drives the stacking order: images composite in ascending z so a
+  higher z draws on top (ties keep insertion order = ascending id, per kitty), and a
+  **negative z draws *under* the text** (its quad batch runs before the glyph pass, the rest
+  after). `image_draw_order` unit-tested; Xephyr-verified (two exactly-overlapping squares —
+  the higher-z colour wins, and the result flips when the z values swap). ⬜ still: relative
+  placement (`P=`/`Q=` parent-relative offsets).
 - ✅ **OSC 8 hyperlinks:** OSC-8 tracked (via `alacritty_terminal`), rendered
   **underlined**, with a strict **http/https scheme gate** (§13 — never `file:`/`javascript:`);
   auto-opens nothing. ✅ **plain-URL detection** too (`url_at`: whitespace token under the
