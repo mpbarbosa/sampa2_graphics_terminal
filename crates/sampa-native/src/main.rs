@@ -1656,6 +1656,11 @@ fn kitty_num(control: &str, key: &str) -> Option<u32> {
     kitty_key(control, key)?.parse().ok()
 }
 
+/// Signed control value — the kitty `z=` z-index is an `i32` (negative = under the text).
+fn kitty_inum(control: &str, key: &str) -> Option<i32> {
+    kitty_key(control, key)?.parse().ok()
+}
+
 /// Decode a kitty payload (base64 → RGBA) by **format**, enforcing the shared dimension/byte
 /// caps. Formats: `f=100` PNG (default here), `f=32` raw RGBA, `f=24` raw RGB; raw needs the
 /// pixel dimensions `s`×`v`. Format-only — the caller decides what the *action* means
@@ -1818,6 +1823,7 @@ struct PlacedImage {
     height: u32,
     disp_cols: Option<u32>, // kitty `c=`/`r=` display size in cells (None → natural pixels)
     disp_rows: Option<u32>,
+    z: i32,                 // kitty `z=` z-index: higher draws on top, negative draws under text
     rgba: Option<Vec<u8>>, // taken by the renderer on first upload
 }
 
@@ -1836,6 +1842,7 @@ struct PendingImage {
     kitty_id: Option<u32>,
     disp_cols: Option<u32>, // kitty `c=` — target width in cells (else natural)
     disp_rows: Option<u32>, // kitty `r=` — target height in cells (else natural)
+    z: i32,                 // kitty `z=` z-index (0 for the OSC-1337/sixel paths)
     img: DecodedImage,
 }
 
@@ -1863,21 +1870,33 @@ fn image_display_size(
     (w, h)
 }
 
+/// Stacking order for the current frame's images (kitty `z=`): stable-sorted by ascending
+/// z, so a higher z-index draws on top; ties keep insertion order (which is ascending id —
+/// matching kitty's "same z → increasing id"). Returns indices into the input so the caller
+/// can also read each image's z (negative → drawn under the text). Pure, so it's unit-tested.
+fn image_draw_order(zs: &[i32]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..zs.len()).collect();
+    order.sort_by_key(|&i| zs[i]); // stable: equal z stays in insertion (ascending-id) order
+    order
+}
+
 /// A `PendingImage` at natural size (no `c=`/`r=` scaling) — used by the OSC-1337/sixel
 /// paths, the `--capture` demo, and tests.
 fn pending_image(anchor: i32, base_history: usize, col: usize, kitty_id: Option<u32>, img: DecodedImage) -> PendingImage {
-    PendingImage { anchor, base_history, col, kitty_id, disp_cols: None, disp_rows: None, img }
+    PendingImage { anchor, base_history, col, kitty_id, disp_cols: None, disp_rows: None, z: 0, img }
 }
 
 /// Place a decoded image at the cursor: reserve vertical space (so following text flows
 /// below) and queue it for the shared store, tagged with its kitty id and any `c=`/`r=`
 /// display size. Shared by the `a=T` display and `a=p` place paths.
+#[allow(clippy::too_many_arguments)]
 fn place_kitty_image(
     g: &mut TermState,
     image_adds: &mut Vec<PendingImage>,
     kid: Option<u32>,
     disp_cols: Option<u32>,
     disp_rows: Option<u32>,
+    z: i32,
     img: DecodedImage,
 ) {
     let cur = g.term.renderable_content().cursor.point;
@@ -1896,6 +1915,7 @@ fn place_kitty_image(
         kitty_id: kid,
         disp_cols,
         disp_rows,
+        z,
         img,
     });
 }
@@ -1922,6 +1942,7 @@ impl ImageStore {
             height: p.img.height,
             disp_cols: p.disp_cols,
             disp_rows: p.disp_rows,
+            z: p.z,
             rgba: Some(p.img.rgba),
         });
         if self.images.len() > MAX_IMAGES {
@@ -2637,6 +2658,7 @@ fn pump(
                                 kitty_id: None,
                                 disp_cols: None,
                                 disp_rows: None,
+                                z: 0,
                                 img,
                             });
                         }
@@ -2656,6 +2678,7 @@ fn pump(
                                 kitty_id: None,
                                 disp_cols: None,
                                 disp_rows: None,
+                                z: 0,
                                 img,
                             });
                         }
@@ -2664,8 +2687,10 @@ fn pump(
                     for (control, payload) in g.kitty.feed(&bytes) {
                         replies.extend(kitty_response(&control));
                         let kid = kitty_num(&control, "i");
-                        // `c=`/`r=` request a display size in cells (placement geometry).
+                        // `c=`/`r=` request a display size in cells (placement geometry);
+                        // `z=` is the stacking order (higher on top, negative under the text).
                         let (dc, dr) = (kitty_num(&control, "c"), kitty_num(&control, "r"));
+                        let z = kitty_inum(&control, "z").unwrap_or(0);
                         // Action selects behaviour (kitty default is transmit): `T` display,
                         // `t` transmit-and-store, `p` place a stored image, `d` delete.
                         match kitty_key(&control, "a").unwrap_or("t") {
@@ -2683,7 +2708,7 @@ fn pump(
                                         g.kitty_images.insert(id, img.clone());
                                     }
                                     if action == "T" {
-                                        place_kitty_image(&mut *g, &mut image_adds, kid, dc, dr, img);
+                                        place_kitty_image(&mut *g, &mut image_adds, kid, dc, dr, z, img);
                                     }
                                 }
                             }
@@ -2691,7 +2716,7 @@ fn pump(
                                 // Place a previously-transmitted image by id (with `c=`/`r=`).
                                 if let Some(img) = kid.and_then(|id| g.kitty_images.get(&id).cloned())
                                 {
-                                    place_kitty_image(&mut *g, &mut image_adds, kid, dc, dr, img);
+                                    place_kitty_image(&mut *g, &mut image_adds, kid, dc, dr, z, img);
                                 }
                             }
                             // `a=d` delete request — applied to the shared store below.
@@ -8305,7 +8330,7 @@ impl Renderer {
 
     /// Upload any newly-added images to GPU textures and drop textures for evicted
     /// images. Returns the per-image draw rects (in pixels) for the current frame.
-    fn sync_images(&mut self, offset: i32, history: usize, top: f32, w: u32, h: u32) -> Vec<(u64, [f32; 4])> {
+    fn sync_images(&mut self, offset: i32, history: usize, top: f32, w: u32, h: u32) -> Vec<(u64, [f32; 4], i32)> {
         let mut rects = Vec::new();
         let Ok(mut store) = self.images.lock() else {
             return rects;
@@ -8375,7 +8400,7 @@ impl Renderer {
                 self.line_h,
             );
             if x < w as f32 && y < h as f32 && y + dh > 0.0 {
-                rects.push((img.id, [x, y, dw, dh]));
+                rects.push((img.id, [x, y, dw, dh], img.z));
             }
         }
         rects
@@ -9307,17 +9332,23 @@ impl Renderer {
         // Inline images track the focused pane's scroll state (per-session image layer).
         let fsnap = panes.iter().find(|p| p.focused).map(|p| p.snap).unwrap_or(panes[0].snap);
         let image_rects = self.sync_images(fsnap.offset, fsnap.history, top, w, h);
-        let image_bufs: Vec<(u64, wgpu::Buffer)> = image_rects
+        let image_bufs: Vec<(u64, wgpu::Buffer, i32)> = image_rects
             .iter()
-            .map(|(id, rect)| {
+            .map(|(id, rect, z)| {
                 let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("image-quad"),
                     contents: bytemuck::bytes_of(rect),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-                (*id, buf)
+                (*id, buf, *z)
             })
             .collect();
+        // Kitty `z=` stacking: draw in ascending z (higher on top), and images with a
+        // negative z go *under* the text (drawn before the glyph pass), the rest over it.
+        let zs: Vec<i32> = image_bufs.iter().map(|(_, _, z)| *z).collect();
+        let image_order = image_draw_order(&zs);
+        let (under_text, over_text): (Vec<usize>, Vec<usize>) =
+            image_order.into_iter().partition(|&i| zs[i] < 0);
         let mk_buf = |device: &wgpu::Device, quads: &[QuadInstance]| {
             (!quads.is_empty()).then(|| {
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -9363,6 +9394,29 @@ impl Renderer {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..4, 0..bg_quads.len() as u32);
             }
+            // Inline images composite scissored to the visible grid area so they never bleed
+            // into the tab bar, palette dropdown, or search bar. A macro draws one z-ordered
+            // batch: negative-z images go here (under the glyphs), the rest after decorations.
+            let y0 = (grid_top as u32).min(h);
+            let gh = ((grid_bottom - grid_top).max(0.0) as u32).min(h - y0);
+            macro_rules! draw_images {
+                ($order:expr) => {
+                    if !$order.is_empty() && gh > 0 {
+                        pass.set_scissor_rect(0, y0, w, gh);
+                        pass.set_pipeline(&self.image_pipeline);
+                        pass.set_bind_group(0, &self.quad_bind_group, &[]);
+                        for &i in &$order {
+                            let (id, buf, _) = &image_bufs[i];
+                            if let Some((_, bind)) = self.image_textures.get(id) {
+                                pass.set_bind_group(1, bind, &[]);
+                                pass.set_vertex_buffer(0, buf.slice(..));
+                                pass.draw(0..4, 0..1);
+                            }
+                        }
+                    }
+                };
+            }
+            draw_images!(under_text); // z < 0 — behind the text
             let _ = self
                 .text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass);
@@ -9373,22 +9427,7 @@ impl Renderer {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..4, 0..deco_quads.len() as u32);
             }
-            // Inline images composite on top — but scissored to the visible grid area
-            // so they never bleed into the tab bar, palette dropdown, or search bar.
-            let y0 = (grid_top as u32).min(h);
-            let gh = ((grid_bottom - grid_top).max(0.0) as u32).min(h - y0);
-            if !image_bufs.is_empty() && gh > 0 {
-                pass.set_scissor_rect(0, y0, w, gh);
-                pass.set_pipeline(&self.image_pipeline);
-                pass.set_bind_group(0, &self.quad_bind_group, &[]);
-                for (id, buf) in &image_bufs {
-                    if let Some((_, bind)) = self.image_textures.get(id) {
-                        pass.set_bind_group(1, bind, &[]);
-                        pass.set_vertex_buffer(0, buf.slice(..));
-                        pass.draw(0..4, 0..1);
-                    }
-                }
-            }
+            draw_images!(over_text); // z >= 0 — on top of the text
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         self.atlas.trim();
@@ -10146,6 +10185,22 @@ mod tests {
         assert_eq!(image_display_size(native, Some(6), None, 10.0, 20.0), (60.0, 30.0));
         // r only → height fixed, width by source aspect (40 * 100/50 = 80).
         assert_eq!(image_display_size(native, None, Some(2), 10.0, 20.0), (80.0, 40.0));
+    }
+
+    #[test]
+    fn kitty_z_index_parse_and_order() {
+        // `z=` is signed (negative = under the text); other controls stay unsigned.
+        assert_eq!(kitty_inum("a=T,z=5", "z"), Some(5));
+        assert_eq!(kitty_inum("a=T,z=-3", "z"), Some(-3));
+        assert_eq!(kitty_inum("a=T,f=32", "z"), None);
+
+        // Draw order: ascending z (higher on top); equal z keeps insertion order.
+        //             index:  0  1  2  3
+        let zs = [0i32, -1, 5, 0];
+        assert_eq!(image_draw_order(&zs), vec![1, 0, 3, 2]);
+        // Empty / single are trivial.
+        assert_eq!(image_draw_order(&[]), Vec::<usize>::new());
+        assert_eq!(image_draw_order(&[7]), vec![0]);
     }
 
     #[test]
