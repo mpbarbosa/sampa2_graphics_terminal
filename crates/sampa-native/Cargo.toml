@@ -21,7 +21,7 @@ path = "src/main.rs"
 # The six foundational headless crates (pty / config / cli / shellint / palette / man) —
 # formerly local N0 path deps, pinned here at the same rev, GUI-free and unchanged per ADR 0002.
 pty-core       = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
-sampa-config   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
+sampa-config   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "07a4b666b778e2a6d2b9254b6833a647f309e731" }
 sampa-cli      = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
 sampa-shellint = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
 sampa-palette  = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b3d29e3ac9317540640754eab34b38b834c8fafb" }
@@ -101,6 +101,10 @@ sampa-helmhelp = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal",
 # source); no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native man panel: a typed
 # `aws` + Ctrl+Shift+M routes to aws_cheatsheet_lines (via `aws … help`), a leaf shows raw help.
 sampa-awshelp  = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "6eaee04ab0cb78ba883e737e327b7ecd761e9bd4" }
+# URL link-preview core (docs/spec-url-preview.md). fetch_preview<Fetch> unfurl + the pure SSRF
+# predicates (http_host / ip_is_public); no shell, no Tauri, no socket. Git-pinned per ADR 0002.
+# The native fetcher (GuardedFetch + GuardedResolver, ureq) lives in main.rs, like origin's bridge.
+sampa-urlpreview = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "07a4b666b778e2a6d2b9254b6833a647f309e731" }
 # netstat connections table core (docs/spec-netstat-table.md). parse_ss -> sockets from
 # `ss -tunap` (ss is the data source: net-tools netstat is deprecated + drops the udp State
 # column); no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native connections
@@ -108,6 +112,9 @@ sampa-awshelp  = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal",
 sampa-netdec   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b6d24e99a0418f9c6eb1a590afa2c7946de21712" }
 
 anyhow = "1"
+# URL-preview fetcher — the native GuardedFetch/GuardedResolver open a socket only when
+# `[url_preview] enabled = true` (spec §13), mirroring origin's bridge.
+ureq = "2"
 winit = "0.30.13"
 alacritty_terminal = "0.26.0"
 glyphon = "0.12.0"

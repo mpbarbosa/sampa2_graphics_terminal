@@ -2766,7 +2766,7 @@ source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=b3d29e3ac
 [[package]]
 name = "sampa-config"
 version = "0.1.0"
-source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=b3d29e3ac9317540640754eab34b38b834c8fafb#b3d29e3ac9317540640754eab34b38b834c8fafb"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=07a4b666b778e2a6d2b9254b6833a647f309e731#07a4b666b778e2a6d2b9254b6833a647f309e731"
 dependencies = [
  "anyhow",
  "serde",
@@ -2879,6 +2879,8 @@ dependencies = [
  "sampa-ps-decorate",
  "sampa-shellint",
  "sampa-uptimedec",
+ "sampa-urlpreview",
+ "ureq",
  "wgpu",
  "winit",
 ]
@@ -2937,6 +2939,14 @@ source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=b3d29e3ac
 name = "sampa-uptimedec"
 version = "0.1.0"
 source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=b05ded339a8448bed19552341235dd550a2dbc17#b05ded339a8448bed19552341235dd550a2dbc17"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "sampa-urlpreview"
+version = "0.1.0"
+source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=07a4b666b778e2a6d2b9254b6833a647f309e731#07a4b666b778e2a6d2b9254b6833a647f309e731"
 dependencies = [
  "serde",
 ]

@@ -29,6 +29,9 @@ run, never on its own.
     inspector, by width). `Ctrl+Shift+I` decorates `ps` output **in place** in the scrollback.
 - **AI (opt-in, one network surface):** `Ctrl+Shift+A` suggest a command · `Ctrl+Shift+X`
   explain the typed command · `Ctrl+Shift+G` screenshot the window and ask Claude to review it.
+- **URL preview (opt-in, second network surface):** `Ctrl+Shift+U` unfurl an `http(s)` URL on the
+  line into a title/description card — guarded fetch (http(s)-only, SSRF-vetted, size/timeout
+  bounded); off by default (`[url_preview] enabled`).
 - **Split panes:** `Ctrl+Shift+R` split vertically · `Ctrl+Shift+O` cycle focus.
 - **Also:** command palette (`Ctrl+Shift+P`), live man-page panel (`Ctrl+Shift+M`, which
   shows a **`gh`, `cargo`, `npm`, `docker`, `kubectl`, `helm`, or `aws` command cheat-sheet** when
