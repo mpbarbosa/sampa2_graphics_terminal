@@ -55,6 +55,7 @@ use sampa_dockerhelp::{parse_docker_help, DockerCommand};
 use sampa_kubectlhelp::{parse_kubectl_help, KubectlCommand};
 use sampa_helmhelp::{parse_helm_help, HelmCommand};
 use sampa_awshelp::{parse_aws_help, strip as aws_strip};
+use sampa_urlpreview::{fetch_preview, Fetch, Fetched, Preview, PreviewKind};
 use sampa_uptimedec::{parse_uptime, UptimeInfo};
 use sampa_netdec::{parse_ss, Conn};
 use sampa_pingdec::{parse_ping, PingReport};
@@ -160,6 +161,7 @@ enum Action {
     Ai,
     Explain,
     AnalyzeWindow,
+    PreviewUrl,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -189,6 +191,7 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
     (Action::Explain, "explain", "Explain the command line", "Ctrl+Shift+X"),
     (Action::AnalyzeWindow, "analyze_window", "Screenshot the window & ask AI to review it", "Ctrl+Shift+G"),
+    (Action::PreviewUrl, "preview_url", "Preview a URL on the line", "Ctrl+Shift+U"),
     (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
     (Action::ZoomOut, "zoom_out", "Zoom out", "Ctrl+Minus"),
     (Action::ZoomReset, "zoom_reset", "Reset zoom", "Ctrl+0"),
@@ -2151,6 +2154,8 @@ enum UserEvent {
     AiExplainReady { gen: u64, command: String, result: Result<String, String> },
     /// A background AI screenshot-analysis call finished; `gen` drops stale replies.
     AiAnalyzeReady { gen: u64, result: Result<String, String> },
+    /// A URL preview came back: `Ok((final_url, card_text))` or an error message.
+    UrlPreviewReady { gen: u64, result: Result<(String, String), String> },
     /// A background `du` scan finished (or failed/timed out); `gen` drops stale replies.
     DuReady { gen: u64, result: Result<DuNode, String> },
     /// A background `df` run finished (or failed/timed out); `gen` drops stale replies.
@@ -2173,6 +2178,9 @@ enum AiState {
     /// A command explanation came back (read-only — nothing to insert or run). `c` copies
     /// the explanation; Esc closes.
     Explanation { command: String, text: String },
+    /// A URL unfurl came back (read-only). `url` is the final (post-redirect) URL, `text` the
+    /// formatted card. `c` copies the text; Esc closes.
+    UrlPreview { url: String, text: String },
     /// The call was gated off, missing a key, or failed. Enter returns to Editing.
     Error(String),
 }
@@ -2985,6 +2993,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AiExplainReady { gen, command, result } => {
                 self.ai_explain_ready(gen, command, result)
             }
+            UserEvent::UrlPreviewReady { gen, result } => self.url_preview_ready(gen, result),
             UserEvent::AiAnalyzeReady { gen, result } => self.ai_analyze_ready(gen, result),
             UserEvent::DuReady { gen, result } => self.du_ready(gen, result),
             UserEvent::DfReady { gen, result } => self.df_ready(gen, result),
@@ -3714,6 +3723,123 @@ fn first_command_token(line: &str) -> &str {
     }
 }
 
+// --- URL link-preview (opt-in second network surface — docs/spec-url-preview.md) ------------
+
+/// The first `http(s)` URL on the line: a bare URL token, or the argument of a fetch-like
+/// command (curl/wget/open/xdg-open). Returns `None` if there's nothing to preview.
+fn detect_url(line: &str) -> Option<String> {
+    for tok in line.split_whitespace() {
+        let t = tok.trim_matches(|c| c == '\'' || c == '"');
+        let l = t.to_ascii_lowercase();
+        if l.starts_with("http://") || l.starts_with("https://") {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+/// The native URL-preview fetcher: the one place this build opens a socket for a preview.
+/// Mirrors origin's bridge — http(s) only, a byte cap, a timeout, a manual re-vetted redirect
+/// loop, and the SSRF IP-vet inside [`GuardedResolver`] so ureq connects to exactly the vetted
+/// IPs (closing the DNS-rebind window). Only reached when `[url_preview] enabled = true`.
+struct GuardedFetch {
+    max_bytes: u64,
+    timeout: std::time::Duration,
+    max_redirects: u8,
+}
+
+/// A ureq resolver that hands back only vetted, globally-routable addresses (rejecting if any
+/// resolved IP is non-public) — the SSRF guard, applied at connect time on every hop.
+struct GuardedResolver;
+
+impl ureq::Resolver for GuardedResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::io::{Error, ErrorKind};
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+        if addrs.is_empty() {
+            return Err(Error::new(ErrorKind::Other, "host did not resolve"));
+        }
+        if let Some(bad) = addrs.iter().find(|a| !sampa_urlpreview::ip_is_public(a.ip())) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("refusing to connect to a non-public address ({})", bad.ip()),
+            ));
+        }
+        Ok(addrs)
+    }
+}
+
+impl Fetch for GuardedFetch {
+    fn get(&self, url: &str) -> Result<Fetched, String> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(self.timeout)
+            .redirects(0)
+            .resolver(GuardedResolver)
+            .build();
+        let mut current = url.to_string();
+        for _ in 0..=self.max_redirects {
+            sampa_urlpreview::http_host(&current)?; // http(s)-only per hop
+            let follow = |resp: ureq::Response| -> Result<String, String> {
+                let loc = resp.header("location").ok_or("redirect without Location")?;
+                sampa_urlpreview::resolve_url(&resp.get_url().to_string(), loc)
+                    .ok_or_else(|| "redirect to a non-http(s) target".to_string())
+            };
+            match agent.get(&current).call() {
+                Ok(resp) if (300..400).contains(&resp.status()) => current = follow(resp)?,
+                Ok(resp) => {
+                    let content_type = resp.header("content-type").map(str::to_string);
+                    let final_url = resp.get_url().to_string();
+                    let mut body = Vec::new();
+                    use std::io::Read;
+                    resp.into_reader()
+                        .take(self.max_bytes)
+                        .read_to_end(&mut body)
+                        .map_err(|e| format!("read error: {e}"))?;
+                    return Ok(Fetched { final_url, content_type, body });
+                }
+                Err(ureq::Error::Status(code, resp)) if (300..400).contains(&code) => {
+                    current = follow(resp)?
+                }
+                Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {code}")),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err("too many redirects".into())
+    }
+}
+
+/// Format a [`Preview`] into the read-only card text shown in the AI overlay. Image resources
+/// show a note; the preview image (if any) is listed as a URL — inline image is deferred on the
+/// native build (no unguarded webview here, but the wgpu blit is a separate follow-up).
+fn format_preview(p: &Preview) -> String {
+    let mut out = String::new();
+    if let Some(t) = &p.title {
+        out.push_str(t);
+        out.push('\n');
+    }
+    if let Some(s) = &p.site_name {
+        out.push_str(s);
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    if let Some(d) = p.description.as_ref().or(p.text_snippet.as_ref()) {
+        out.push_str(d);
+        out.push('\n');
+    } else if p.kind == PreviewKind::Image {
+        out.push_str("(image)\n");
+    } else if p.title.is_none() {
+        out.push_str("(no preview text)\n");
+    }
+    let img = if p.kind == PreviewKind::Image { Some(&p.url) } else { p.image_url.as_ref() };
+    if let Some(i) = img {
+        out.push_str(&format!("\n🖼 {i}"));
+    }
+    out.trim_end().to_string()
+}
+
 /// Extract the command at the shell prompt directly from the grid `snap`: the text on the
 /// cursor's row up to the cursor column, with the prompt stripped. Reading up to the cursor
 /// (not the whole row) yields exactly what pressing Enter would run — it captures paste,
@@ -4423,6 +4549,7 @@ impl App {
             Action::Ai => self.ai_open(),
             Action::Explain => self.explain_open(),
             Action::AnalyzeWindow => self.analyze_window_open(),
+            Action::PreviewUrl => self.preview_url_open(),
             Action::SplitRight => self.split_right(),
             Action::FocusPane => self.focus_pane(),
             Action::ZoomIn => self.zoom_by(1.0),
@@ -4796,7 +4923,7 @@ impl App {
                     self.scroll(Scroll::Bottom);
                     self.ai_close();
                 }
-                AiState::Explanation { .. } => self.ai_close(), // read-only — nothing to insert
+                AiState::Explanation { .. } | AiState::UrlPreview { .. } => self.ai_close(), // read-only
                 AiState::Pending => {} // in flight — ignore
                 _ => self.ai_submit(),
             },
@@ -4808,7 +4935,9 @@ impl App {
                 // 'c' copies: the suggested command (Result) or the explanation (Explanation).
                 let copy = match &self.ai_state {
                     AiState::Result { command, .. } => Some(command.clone()),
-                    AiState::Explanation { text, .. } => Some(text.clone()),
+                    AiState::Explanation { text, .. } | AiState::UrlPreview { text, .. } => {
+                        Some(text.clone())
+                    }
                     _ => None,
                 };
                 if text == Some("c") {
@@ -4973,6 +5102,60 @@ impl App {
         }
         self.ai_state = match result {
             Ok(text) => AiState::Explanation { command, text },
+            Err(e) => AiState::Error(e),
+        };
+        self.request_redraw();
+    }
+
+    /// URL link-preview (spec-url-preview): unfurl the first http(s) URL on the line via the
+    /// guarded fetcher and show the card in the AI overlay (read-only). Opt-in — inert unless
+    /// `[url_preview] enabled = true`. Egress happens only on this keypress; nothing is run.
+    fn preview_url_open(&mut self) {
+        self.ai_on = true;
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+
+        let url = match detect_url(&self.grid_command_line()) {
+            Some(u) => u,
+            None => {
+                self.ai_state = AiState::Error("No http(s) URL on the line to preview.".into());
+                self.request_redraw();
+                return;
+            }
+        };
+        let cfg = load_config().url_preview;
+        if !cfg.enabled {
+            self.ai_state = AiState::Error(
+                "URL preview is off — set [url_preview] enabled = true in config.toml.".into(),
+            );
+            self.request_redraw();
+            return;
+        }
+        let gen = self.ai_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.ai_query = url.clone();
+        self.ai_state = AiState::Pending;
+        self.request_redraw();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let fetcher = GuardedFetch {
+                max_bytes: cfg.max_bytes,
+                timeout: std::time::Duration::from_millis(cfg.timeout_ms),
+                max_redirects: cfg.max_redirects,
+            };
+            let result = fetch_preview(&fetcher, &url).map(|p| (p.url.clone(), format_preview(&p)));
+            let _ = proxy.send_event(UserEvent::UrlPreviewReady { gen, result });
+        });
+    }
+
+    /// Deliver a background URL preview, unless it's stale (gen bumped) or the overlay closed.
+    fn url_preview_ready(&mut self, gen: u64, result: Result<(String, String), String>) {
+        if !self.ai_on || gen != self.ai_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.ai_state = match result {
+            Ok((url, text)) => AiState::UrlPreview { url, text },
             Err(e) => AiState::Error(e),
         };
         self.request_redraw();
@@ -7397,6 +7580,13 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                     ai_title = "Explain".to_string();
                     spans.push(("$ ".into(), muted, false, false));
                     spans.push((command.clone(), accent, true, false));
+                    spans.push((format!("\n\n{text}"), fg, false, false));
+                    spans.push(("\n\nc copies · Esc closes".into(), muted, false, false));
+                }
+                AiState::UrlPreview { url, text } => {
+                    ai_title = "URL preview".to_string();
+                    spans.push(("🔗 ".into(), muted, false, false));
+                    spans.push((url.clone(), accent, true, false));
                     spans.push((format!("\n\n{text}"), fg, false, false));
                     spans.push(("\n\nc copies · Esc closes".into(), muted, false, false));
                 }
@@ -10669,6 +10859,28 @@ mod tests {
         }
         assert!(lines.iter().all(|l| l.chars().count() <= 78));
         assert_eq!(aws_cheatsheet_lines(&[]), vec!["COMMANDS".to_string()]);
+    }
+
+    #[test]
+    fn url_preview_detect_and_format() {
+        assert_eq!(detect_url("https://example.com/a").as_deref(), Some("https://example.com/a"));
+        assert_eq!(detect_url("curl -s 'http://x.test/p'").as_deref(), Some("http://x.test/p"));
+        assert_eq!(detect_url("ls -la"), None);
+        assert_eq!(detect_url("ftp://nope.test"), None);
+        let p = Preview {
+            url: "https://example.com/final".into(),
+            kind: PreviewKind::Html,
+            content_type: Some("text/html".into()),
+            title: Some("Title".into()),
+            description: Some("A page.".into()),
+            site_name: Some("Example".into()),
+            image_url: Some("https://cdn.example.com/i.png".into()),
+            text_snippet: None,
+        };
+        let text = format_preview(&p);
+        assert!(text.starts_with("Title\nExample\n"));
+        assert!(text.contains("A page."));
+        assert!(text.contains("🖼 https://cdn.example.com/i.png"));
     }
 
     #[test]
