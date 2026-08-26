@@ -1922,6 +1922,84 @@ fn place_kitty_image(
     });
 }
 
+/// Where a placement sits, so a **relative** child (kitty `P=`/`H`/`V`) can be pinned to it.
+#[derive(Clone, Copy)]
+struct Placement {
+    anchor: i32,
+    col: usize,
+    base_history: usize,
+}
+
+/// Find the most recent placement of kitty image `pid` — first among this write's pending
+/// adds (a parent placed earlier in the same write), then the live store — so a relative
+/// placement can anchor to it. `None` if that image was never placed (caller falls back).
+fn find_placement(pid: u32, pending: &[PendingImage], store: &Mutex<ImageStore>) -> Option<Placement> {
+    if let Some(p) = pending.iter().rev().find(|p| p.kitty_id == Some(pid)) {
+        return Some(Placement { anchor: p.anchor, col: p.col, base_history: p.base_history });
+    }
+    let store = store.lock().ok()?;
+    store
+        .images
+        .iter()
+        .rev()
+        .find(|im| im.kitty_id == Some(pid))
+        .map(|im| Placement { anchor: im.anchor, col: im.col, base_history: im.base_history })
+}
+
+/// Queue a placement positioned relative to `parent` by the kitty `H`/`V` cell offsets — a
+/// floating overlay pinned to the parent's content, so it neither reserves rows nor moves
+/// the cursor (unlike [`place_kitty_image`]). Sharing the parent's `base_history` makes it
+/// ride up and scroll with the parent.
+#[allow(clippy::too_many_arguments)]
+fn place_kitty_relative(
+    image_adds: &mut Vec<PendingImage>,
+    kid: Option<u32>,
+    disp_cols: Option<u32>,
+    disp_rows: Option<u32>,
+    z: i32,
+    parent: Placement,
+    h: i32,
+    v: i32,
+    img: DecodedImage,
+) {
+    image_adds.push(PendingImage {
+        anchor: parent.anchor + v,
+        base_history: parent.base_history,
+        col: (parent.col as i32 + h).max(0) as usize,
+        kitty_id: kid,
+        disp_cols,
+        disp_rows,
+        z,
+        img,
+    });
+}
+
+/// Place a kitty image: relative to a parent placement when `P=` names one (offset by the
+/// `H`/`V` cells), else at the cursor. Fails safe to a normal cursor placement when the named
+/// parent isn't found. Shared by the `a=T` display and `a=p` place paths.
+#[allow(clippy::too_many_arguments)]
+fn place_kitty(
+    g: &mut TermState,
+    image_adds: &mut Vec<PendingImage>,
+    store: &Mutex<ImageStore>,
+    control: &str,
+    kid: Option<u32>,
+    disp_cols: Option<u32>,
+    disp_rows: Option<u32>,
+    z: i32,
+    img: DecodedImage,
+) {
+    if let Some(pid) = kitty_num(control, "P") {
+        if let Some(parent) = find_placement(pid, image_adds, store) {
+            let h = kitty_inum(control, "H").unwrap_or(0);
+            let v = kitty_inum(control, "V").unwrap_or(0);
+            place_kitty_relative(image_adds, kid, disp_cols, disp_rows, z, parent, h, v, img);
+            return;
+        }
+    }
+    place_kitty_image(g, image_adds, kid, disp_cols, disp_rows, z, img);
+}
+
 /// Live inline images, shared between the parser thread (adds) and the renderer
 /// (uploads + composites). Capped at `MAX_IMAGES`, oldest evicted.
 #[derive(Default)]
@@ -2710,15 +2788,16 @@ fn pump(
                                         g.kitty_images.insert(id, img.clone());
                                     }
                                     if action == "T" {
-                                        place_kitty_image(&mut *g, &mut image_adds, kid, dc, dr, z, img);
+                                        place_kitty(&mut *g, &mut image_adds, &image_store, &control, kid, dc, dr, z, img);
                                     }
                                 }
                             }
                             "p" => {
-                                // Place a previously-transmitted image by id (with `c=`/`r=`).
+                                // Place a previously-transmitted image by id (with `c=`/`r=`),
+                                // relative to a parent placement when `P=` names one.
                                 if let Some(img) = kid.and_then(|id| g.kitty_images.get(&id).cloned())
                                 {
-                                    place_kitty_image(&mut *g, &mut image_adds, kid, dc, dr, z, img);
+                                    place_kitty(&mut *g, &mut image_adds, &image_store, &control, kid, dc, dr, z, img);
                                 }
                             }
                             // `a=d` delete request — applied to the shared store below.
@@ -10324,6 +10403,35 @@ mod tests {
         // Empty / single are trivial.
         assert_eq!(image_draw_order(&[]), Vec::<usize>::new());
         assert_eq!(image_draw_order(&[7]), vec![0]);
+    }
+
+    #[test]
+    fn kitty_relative_placement() {
+        let px = || DecodedImage { width: 2, height: 2, rgba: vec![0u8; 16] };
+        // Parent (kitty id 1) placed at anchor row 5, col 10, over 2 lines of scrollback.
+        let store = Mutex::new(ImageStore::default());
+        store.lock().unwrap().add(PendingImage {
+            anchor: 5, base_history: 2, col: 10, kitty_id: Some(1),
+            disp_cols: None, disp_rows: None, z: 0, img: px(),
+        });
+
+        // A child placed relative to it (P=1) is offset by H/V cells and rides with the
+        // parent's content (shares base_history), without reserving rows of its own.
+        let parent = find_placement(1, &[], &store).expect("parent found in store");
+        assert_eq!((parent.anchor, parent.col, parent.base_history), (5, 10, 2));
+        let mut adds = Vec::new();
+        place_kitty_relative(&mut adds, Some(2), None, None, 3, parent, 2, -1, px());
+        let c = &adds[0];
+        assert_eq!((c.anchor, c.col, c.base_history, c.z), (4, 12, 2, 3)); // V=-1, H=+2
+
+        // A parent placed earlier in the *same* write (pending adds) is found before the store.
+        let pending = vec![PendingImage {
+            anchor: 9, base_history: 0, col: 4, kitty_id: Some(1),
+            disp_cols: None, disp_rows: None, z: 0, img: px(),
+        }];
+        assert_eq!(find_placement(1, &pending, &store).unwrap().anchor, 9);
+        // An unknown parent id → None (caller falls back to a normal cursor placement).
+        assert!(find_placement(99, &[], &store).is_none());
     }
 
     #[test]
