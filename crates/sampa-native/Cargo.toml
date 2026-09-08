@@ -110,6 +110,11 @@ sampa-urlpreview = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal
 # column); no shell, no Tauri. Git-pinned per ADR 0002. Consumed by the native connections
 # panel (net_render — a state-coloured, listening-first socket table); informational (no insert).
 sampa-netdec   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "b6d24e99a0418f9c6eb1a590afa2c7946de21712" }
+# git status preview core (sampa-gitdec). parse_status -> a GitStatus
+# (branch/ahead/behind + staged/unstaged/untracked/conflicted groups) from porcelain v1
+# (`git status --porcelain -b`); no shell, no Tauri, no git invocation. Git-pinned per ADR 0002.
+# Consumed by the native git-status panel (git_render — colour-coded groups); informational (no insert).
+sampa-gitdec   = { git = "https://github.com/mpbarbosa/sampa_graphics_terminal", rev = "6297b5312eadf6b473646a22236366b1ac45ebc5" }
 
 anyhow = "1"
 # URL-preview fetcher — the native GuardedFetch/GuardedResolver open a socket only when
