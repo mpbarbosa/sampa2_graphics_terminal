@@ -58,6 +58,7 @@ use sampa_awshelp::{parse_aws_help, strip as aws_strip};
 use sampa_urlpreview::{fetch_preview, Fetch, Fetched, Preview, PreviewKind};
 use sampa_uptimedec::{parse_uptime, UptimeInfo};
 use sampa_netdec::{parse_ss, Conn};
+use sampa_gitdec::{parse_status, Change, GitStatus};
 use sampa_pingdec::{parse_ping, PingReport};
 use sampa_fsnav::{list_subdirs, relativize, Dir};
 use sampa_ps_decorate::{
@@ -2477,6 +2478,9 @@ fn main() -> Result<()> {
         net_on: false,
         net_conns: None,
         net_msg: None,
+        git_on: false,
+        git_status: None,
+        git_msg: None,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2913,6 +2917,9 @@ struct App {
     net_on: bool,
     net_conns: Option<Vec<Conn>>, // parsed sockets (None on failure)
     net_msg: Option<String>,      // status line when ss is unavailable/unparseable
+    git_on: bool,
+    git_status: Option<GitStatus>, // parsed working-tree status (None on failure)
+    git_msg: Option<String>,       // status line when git is unavailable/not a repo/unparseable
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -3145,6 +3152,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if self.net_on {
                     self.net_key(&event.logical_key);
+                    return;
+                }
+                if self.git_on {
+                    self.git_key(&event.logical_key);
                     return;
                 }
                 if self.palette_on {
@@ -4532,7 +4543,7 @@ impl App {
                 // Overloaded on the typed command (spec §2): `cd` → tree picker, `du` →
                 // disk-usage treemap, `free` → memory gauge, `df` → disk-free gauge, `ping` →
                 // latency chart, `uptime` → load gauge, `netstat`/`ss` → connections table,
-                // anything else → the ps decorator.
+                // `git` → status preview, anything else → the ps decorator.
                 match first_command_token(&self.grid_command_line()) {
                     "cd" => self.cd_open(),
                     "du" => self.du_open(),
@@ -4541,6 +4552,7 @@ impl App {
                     "ping" => self.ping_open(),
                     "uptime" => self.load_open(),
                     "netstat" | "ss" => self.net_open(),
+                    "git" => self.git_open(),
                     _ => self.ps_open(),
                 }
             }
@@ -6860,6 +6872,102 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         (title, body, spans)
     }
 
+    // --- git status preview (sampa-gitdec; porcelain v1) ---------------------------------
+    /// Open the git-status panel: run a **read-only** `git -C <cwd> status --porcelain -b`
+    /// (porcelain v1 is git's stable machine format) with `LC_ALL=C`, parse it, and show the
+    /// changed paths grouped the way `git status` presents them. Display-only — nothing runs.
+    fn git_open(&mut self) {
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+        self.du_on = false;
+        self.free_on = false;
+        self.df_on = false;
+        self.ping_on = false;
+        self.load_on = false;
+        self.net_on = false;
+        self.git_on = true;
+        let cwd = self.session_cwd().unwrap_or_else(|| ".".into());
+        // A non-zero exit is how git reports "not a git repository" — treat it (and any
+        // unparseable output) as a status line, never a crash.
+        let parsed = std::process::Command::new("git")
+            .args(["-C", &cwd, "status", "--porcelain", "-b"])
+            .env("LC_ALL", "C")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| parse_status(&String::from_utf8_lossy(&o.stdout)));
+        match parsed {
+            Some(st) => {
+                self.git_status = Some(st);
+                self.git_msg = None;
+            }
+            None => {
+                self.git_status = None;
+                self.git_msg = Some("not a git repository (or git unavailable).".into());
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn git_close(&mut self) {
+        self.git_on = false;
+        self.git_status = None;
+        self.git_msg = None;
+        self.request_redraw();
+    }
+
+    fn git_key(&mut self, key: &Key) {
+        // Read-only: Esc / Enter dismiss.
+        if matches!(key, Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)) {
+            self.git_close();
+        }
+    }
+
+    /// Build the git-status panel's `(title, body, spans)`: the changed paths grouped as
+    /// `git status` shows them — staged (green) / unstaged (amber) / untracked (grey) /
+    /// conflicted (red) — each row `<label>: <path>` (renames carry `orig -> path`). A clean
+    /// tree says so. Display-only — nothing is composed or run.
+    fn git_render(&self, st: &GitStatus) -> (String, String, Vec<BodySpan>) {
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        let mut spans: Vec<BodySpan> = Vec::new();
+        let mut group = |title: &str, changes: &[Change], color: [u8; 3]| {
+            if changes.is_empty() {
+                return;
+            }
+            spans.push((format!("{} ({})\n", title, changes.len()), color, true, false));
+            for c in changes {
+                let path = match &c.orig {
+                    Some(orig) => format!("{orig} -> {}", c.path),
+                    None => c.path.clone(),
+                };
+                spans.push((format!("  {}: {}\n", c.label, path), color, false, false));
+            }
+        };
+        group("Staged", &st.staged, HEAT_GREEN);
+        group("Unstaged", &st.unstaged, HEAT_YELLOW);
+        group("Untracked", &st.untracked, muted);
+        group("Conflicted", &st.conflicted, HEAT_RED);
+        if st.is_clean() {
+            spans.push(("working tree clean\n".into(), HEAT_GREEN, false, false));
+        }
+        let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
+        // Header: branch + upstream + divergence.
+        let mut head = format!("git — {}", st.branch);
+        if let Some(up) = &st.upstream {
+            head.push_str(&format!(" → {up}"));
+        }
+        if st.ahead > 0 || st.behind > 0 {
+            head.push_str(&format!(" (ahead {}, behind {})", st.ahead, st.behind));
+        }
+        if st.no_commits {
+            head.push_str(" · no commits yet");
+        }
+        let title = format!("{head}   ·  Esc / Enter closes");
+        (title, body, spans)
+    }
+
     // --- df disk-free gauge (spec-df-gauge.md) -------------------------------------------
     /// Open the df gauge: kick a **timeout-bounded** `df -k` off-thread (it can block on a
     /// stale mount) and show a status line until `DfReady` lands. Display-only.
@@ -7493,6 +7601,9 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let net_title;
         let net_body;
         let net_spans: Vec<BodySpan>;
+        let git_title;
+        let git_body;
+        let git_spans: Vec<BodySpan>;
         let ai_title;
         let ai_body_spans: Vec<BodySpan>;
         let (_, lh) = self.cell_metrics();
@@ -7734,6 +7845,21 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                     net_title = "connections — ss   ·  Esc".to_string();
                     net_body = self.net_msg.clone().unwrap_or_default();
                     Some(PanelView { title: &net_title, body: &net_body, body_spans: None })
+                }
+            }
+        } else if self.git_on {
+            match self.git_status.as_ref() {
+                Some(st) => {
+                    let (t, b, spans) = self.git_render(st);
+                    git_title = t;
+                    git_body = b;
+                    git_spans = spans;
+                    Some(PanelView { title: &git_title, body: &git_body, body_spans: Some(&git_spans) })
+                }
+                None => {
+                    git_title = "git status   ·  Esc".to_string();
+                    git_body = self.git_msg.clone().unwrap_or_default();
+                    Some(PanelView { title: &git_title, body: &git_body, body_spans: None })
                 }
             }
         } else {
@@ -10883,6 +11009,25 @@ mod tests {
         assert!(text.starts_with("Title\nExample\n"));
         assert!(text.contains("A page."));
         assert!(text.contains("🖼 https://cdn.example.com/i.png"));
+    }
+
+    #[test]
+    fn git_status_parses_and_groups() {
+        // Consumes the pinned sampa-gitdec: porcelain v1 → branch + grouped changes.
+        let porcelain = "## main...origin/main [ahead 1]\nM  staged.rs\n M unstaged.rs\n?? new.txt\n";
+        let st = parse_status(porcelain).expect("porcelain v1 parses");
+        assert_eq!(st.branch, "main");
+        assert_eq!(st.upstream.as_deref(), Some("origin/main"));
+        assert_eq!(st.ahead, 1);
+        assert_eq!(st.staged.len(), 1);
+        assert_eq!(st.unstaged.len(), 1);
+        assert_eq!(st.untracked.len(), 1);
+        assert!(!st.is_clean());
+        // A branch line with no changes is a clean, non-None status.
+        let clean = parse_status("## main\n").expect("clean repo is a real answer");
+        assert!(clean.is_clean());
+        // Non-porcelain text fails safe to None.
+        assert!(parse_status("On branch main\nnothing to commit\n").is_none());
     }
 
     #[test]
