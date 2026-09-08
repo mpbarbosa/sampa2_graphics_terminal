@@ -191,7 +191,9 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
     (Action::Explain, "explain", "Explain the command line", "Ctrl+Shift+X"),
     (Action::AnalyzeWindow, "analyze_window", "Screenshot the window & ask AI to review it", "Ctrl+Shift+G"),
-    (Action::PreviewUrl, "preview_url", "Preview a URL on the line", "Ctrl+Shift+U"),
+    // Ctrl+Shift+L, not Ctrl+Shift+U — under a GTK/IME layer the latter is grabbed for
+    // Unicode-codepoint entry (keeps the default consistent with the reference build).
+    (Action::PreviewUrl, "preview_url", "Preview a URL on the line", "Ctrl+Shift+L"),
     (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
     (Action::ZoomOut, "zoom_out", "Zoom out", "Ctrl+Minus"),
     (Action::ZoomReset, "zoom_reset", "Reset zoom", "Ctrl+0"),

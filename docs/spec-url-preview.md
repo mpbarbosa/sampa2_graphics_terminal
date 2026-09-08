@@ -21,7 +21,8 @@ fetched.
 
 ## 2. Trigger
 
-- Bound to a man-panel-family shortcut (proposed **`Ctrl+Shift+U`**), **not** auto-fired: the
+- Bound to **`keybindings.preview_url`** (default **`Ctrl+Shift+L`** — *not* `Ctrl+Shift+U`, which
+  a GTK/IME layer grabs for Unicode-codepoint entry), **not** auto-fired: the
   frontend detects a URL on the tracked line — a bare `http(s)://…` token, or the argument of a
   `curl`/`wget`/`open`/`xdg-open` command — and only fetches when the user presses the shortcut.
   Egress happens **only on that explicit keypress**, never on keystroke as-you-type.
@@ -90,7 +91,7 @@ fetched.
   one step so ureq connects to exactly the vetted IPs. `preview_image(url)` fetches a preview image
   through the same guard, accepts only `image/*`, and returns a `data:` URI for inline display. The
   pure predicates come from the core.
-- **Frontend** — `keybindings.preview_url` (default `Ctrl+Shift+U`) detects a URL on the tracked
+- **Frontend** — `keybindings.preview_url` (default `Ctrl+Shift+L`) detects a URL on the tracked
   line (`detectUrl`: a bare `http(s)` token or the arg of a `curl`/`wget`/`open`/`xdg-open`),
   calls `preview_url`, and renders the `#urlpreview` unfurl card (text via `textContent`; the
   preview image loads inline on click via `preview_image` → a `data:` URI, never a remote `<img>`
