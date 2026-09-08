@@ -25,14 +25,18 @@ run, never on its own.
   - `ping <host>` → a **latency chart** (per-packet RTT sparkline + loss ticks) — display-only
   - `uptime` → a **load gauge** (1/5/15-min load bars scaled to CPU cores) — display-only
   - `netstat` / `ss` → a **connections table** (open sockets, state-coloured, listening-first) — display-only
+  - `git` → a **status preview** (working tree grouped staged/unstaged/untracked/conflicted, colour-coded) — display-only
   - *anything else* → the **`ps` output enhancement** (quiet columns / bars + sort / grouped
     inspector, by width). `Ctrl+Shift+I` decorates `ps` output **in place** in the scrollback.
 - **AI (opt-in, one network surface):** `Ctrl+Shift+A` suggest a command · `Ctrl+Shift+X`
   explain the typed command · `Ctrl+Shift+G` screenshot the window and ask Claude to review it.
+- **URL preview (opt-in, second network surface):** `Ctrl+Shift+L` unfurl an `http(s)` URL on the
+  line into a title/description card — guarded fetch (http(s)-only, SSRF-vetted, size/timeout
+  bounded); off by default (`[url_preview] enabled`).
 - **Split panes:** `Ctrl+Shift+R` split vertically · `Ctrl+Shift+O` cycle focus.
 - **Also:** command palette (`Ctrl+Shift+P`), live man-page panel (`Ctrl+Shift+M`, which
-  shows a **`gh`, `cargo`, `npm`, `docker`, `kubectl`, or `helm` command cheat-sheet** when the
-  typed command is `gh`/`cargo`/`npm`/`docker`/`kubectl`/`helm`),
+  shows a **`gh`, `cargo`, `npm`, `docker`, `kubectl`, `helm`, or `aws` command cheat-sheet** when
+  the typed command is `gh`/`cargo`/`npm`/`docker`/`kubectl`/`helm`/`aws`),
   preview-as-you-type (`Ctrl+Shift+E`), search (`Ctrl+Shift+F`), tabs, and a help overlay
   (`Ctrl+Shift+?`) that lists every binding.
 

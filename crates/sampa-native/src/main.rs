@@ -54,8 +54,11 @@ use sampa_npmhelp::parse_npm_help;
 use sampa_dockerhelp::{parse_docker_help, DockerCommand};
 use sampa_kubectlhelp::{parse_kubectl_help, KubectlCommand};
 use sampa_helmhelp::{parse_helm_help, HelmCommand};
+use sampa_awshelp::{parse_aws_help, strip as aws_strip};
+use sampa_urlpreview::{fetch_preview, Fetch, Fetched, Preview, PreviewKind};
 use sampa_uptimedec::{parse_uptime, UptimeInfo};
 use sampa_netdec::{parse_ss, Conn};
+use sampa_gitdec::{parse_status, Change, GitStatus};
 use sampa_pingdec::{parse_ping, PingReport};
 use sampa_fsnav::{list_subdirs, relativize, Dir};
 use sampa_ps_decorate::{
@@ -159,6 +162,7 @@ enum Action {
     Ai,
     Explain,
     AnalyzeWindow,
+    PreviewUrl,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -188,6 +192,9 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
     (Action::Explain, "explain", "Explain the command line", "Ctrl+Shift+X"),
     (Action::AnalyzeWindow, "analyze_window", "Screenshot the window & ask AI to review it", "Ctrl+Shift+G"),
+    // Ctrl+Shift+L, not Ctrl+Shift+U — under a GTK/IME layer the latter is grabbed for
+    // Unicode-codepoint entry (keeps the default consistent with the reference build).
+    (Action::PreviewUrl, "preview_url", "Preview a URL on the line", "Ctrl+Shift+L"),
     (Action::ZoomIn, "zoom_in", "Zoom in", "Ctrl+Equal"),
     (Action::ZoomOut, "zoom_out", "Zoom out", "Ctrl+Minus"),
     (Action::ZoomReset, "zoom_reset", "Reset zoom", "Ctrl+0"),
@@ -2228,6 +2235,8 @@ enum UserEvent {
     AiExplainReady { gen: u64, command: String, result: Result<String, String> },
     /// A background AI screenshot-analysis call finished; `gen` drops stale replies.
     AiAnalyzeReady { gen: u64, result: Result<String, String> },
+    /// A URL preview came back: `Ok((final_url, card_text))` or an error message.
+    UrlPreviewReady { gen: u64, result: Result<(String, String), String> },
     /// A background `du` scan finished (or failed/timed out); `gen` drops stale replies.
     DuReady { gen: u64, result: Result<DuNode, String> },
     /// A background `df` run finished (or failed/timed out); `gen` drops stale replies.
@@ -2250,6 +2259,9 @@ enum AiState {
     /// A command explanation came back (read-only — nothing to insert or run). `c` copies
     /// the explanation; Esc closes.
     Explanation { command: String, text: String },
+    /// A URL unfurl came back (read-only). `url` is the final (post-redirect) URL, `text` the
+    /// formatted card. `c` copies the text; Esc closes.
+    UrlPreview { url: String, text: String },
     /// The call was gated off, missing a key, or failed. Enter returns to Editing.
     Error(String),
 }
@@ -2544,6 +2556,9 @@ fn main() -> Result<()> {
         net_on: false,
         net_conns: None,
         net_msg: None,
+        git_on: false,
+        git_status: None,
+        git_msg: None,
         ai_on: false,
         ai_query: String::new(),
         ai_state: AiState::Editing,
@@ -2981,6 +2996,9 @@ struct App {
     net_on: bool,
     net_conns: Option<Vec<Conn>>, // parsed sockets (None on failure)
     net_msg: Option<String>,      // status line when ss is unavailable/unparseable
+    git_on: bool,
+    git_status: Option<GitStatus>, // parsed working-tree status (None on failure)
+    git_msg: Option<String>,       // status line when git is unavailable/not a repo/unparseable
     // AI command suggester (opt-in; Sampa's only network surface — spec-ai-overlay.md)
     ai_on: bool,
     ai_query: String,
@@ -3063,6 +3081,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AiExplainReady { gen, command, result } => {
                 self.ai_explain_ready(gen, command, result)
             }
+            UserEvent::UrlPreviewReady { gen, result } => self.url_preview_ready(gen, result),
             UserEvent::AiAnalyzeReady { gen, result } => self.ai_analyze_ready(gen, result),
             UserEvent::DuReady { gen, result } => self.du_ready(gen, result),
             UserEvent::DfReady { gen, result } => self.df_ready(gen, result),
@@ -3212,6 +3231,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if self.net_on {
                     self.net_key(&event.logical_key);
+                    return;
+                }
+                if self.git_on {
+                    self.git_key(&event.logical_key);
                     return;
                 }
                 if self.palette_on {
@@ -3734,6 +3757,27 @@ fn helm_cheatsheet_lines(cmds: &[HelmCommand]) -> Vec<String> {
     lines
 }
 
+/// The aws service/command names as aligned man-panel lines: a `COMMANDS` header, then the
+/// bare names (aws lists names only) in padded columns that fit a nominal 76-col panel — same
+/// layout as npm, since aws exposes no per-command descriptions.
+fn aws_cheatsheet_lines(names: &[String]) -> Vec<String> {
+    if names.is_empty() {
+        return vec!["COMMANDS".to_string()];
+    }
+    let width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+    let cols = (76 / (width + 2)).max(1);
+    let mut lines = vec!["COMMANDS".to_string()];
+    for chunk in names.chunks(cols) {
+        let row: String = chunk
+            .iter()
+            .map(|n| format!("{n:<width$}", width = width))
+            .collect::<Vec<_>>()
+            .join("  ");
+        lines.push(format!("  {}", row.trim_end()));
+    }
+    lines
+}
+
 /// The sub-command path to drill into, from a typed line whose command is `program`: the
 /// leading **non-flag** tokens after it, stopping at the first flag (spec-gh-cheatsheet.md /
 /// spec-cargo-cheatsheet.md). `gh` → `[]`; `gh repo view --web` → `["repo","view"]`;
@@ -3769,6 +3813,123 @@ fn first_command_token(line: &str) -> &str {
         "" | "sudo" | "command" => it.next().unwrap_or(""),
         t => t,
     }
+}
+
+// --- URL link-preview (opt-in second network surface — docs/spec-url-preview.md) ------------
+
+/// The first `http(s)` URL on the line: a bare URL token, or the argument of a fetch-like
+/// command (curl/wget/open/xdg-open). Returns `None` if there's nothing to preview.
+fn detect_url(line: &str) -> Option<String> {
+    for tok in line.split_whitespace() {
+        let t = tok.trim_matches(|c| c == '\'' || c == '"');
+        let l = t.to_ascii_lowercase();
+        if l.starts_with("http://") || l.starts_with("https://") {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+/// The native URL-preview fetcher: the one place this build opens a socket for a preview.
+/// Mirrors origin's bridge — http(s) only, a byte cap, a timeout, a manual re-vetted redirect
+/// loop, and the SSRF IP-vet inside [`GuardedResolver`] so ureq connects to exactly the vetted
+/// IPs (closing the DNS-rebind window). Only reached when `[url_preview] enabled = true`.
+struct GuardedFetch {
+    max_bytes: u64,
+    timeout: std::time::Duration,
+    max_redirects: u8,
+}
+
+/// A ureq resolver that hands back only vetted, globally-routable addresses (rejecting if any
+/// resolved IP is non-public) — the SSRF guard, applied at connect time on every hop.
+struct GuardedResolver;
+
+impl ureq::Resolver for GuardedResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::io::{Error, ErrorKind};
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+        if addrs.is_empty() {
+            return Err(Error::new(ErrorKind::Other, "host did not resolve"));
+        }
+        if let Some(bad) = addrs.iter().find(|a| !sampa_urlpreview::ip_is_public(a.ip())) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("refusing to connect to a non-public address ({})", bad.ip()),
+            ));
+        }
+        Ok(addrs)
+    }
+}
+
+impl Fetch for GuardedFetch {
+    fn get(&self, url: &str) -> Result<Fetched, String> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(self.timeout)
+            .redirects(0)
+            .resolver(GuardedResolver)
+            .build();
+        let mut current = url.to_string();
+        for _ in 0..=self.max_redirects {
+            sampa_urlpreview::http_host(&current)?; // http(s)-only per hop
+            let follow = |resp: ureq::Response| -> Result<String, String> {
+                let loc = resp.header("location").ok_or("redirect without Location")?;
+                sampa_urlpreview::resolve_url(&resp.get_url().to_string(), loc)
+                    .ok_or_else(|| "redirect to a non-http(s) target".to_string())
+            };
+            match agent.get(&current).call() {
+                Ok(resp) if (300..400).contains(&resp.status()) => current = follow(resp)?,
+                Ok(resp) => {
+                    let content_type = resp.header("content-type").map(str::to_string);
+                    let final_url = resp.get_url().to_string();
+                    let mut body = Vec::new();
+                    use std::io::Read;
+                    resp.into_reader()
+                        .take(self.max_bytes)
+                        .read_to_end(&mut body)
+                        .map_err(|e| format!("read error: {e}"))?;
+                    return Ok(Fetched { final_url, content_type, body });
+                }
+                Err(ureq::Error::Status(code, resp)) if (300..400).contains(&code) => {
+                    current = follow(resp)?
+                }
+                Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {code}")),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err("too many redirects".into())
+    }
+}
+
+/// Format a [`Preview`] into the read-only card text shown in the AI overlay. Image resources
+/// show a note; the preview image (if any) is listed as a URL — inline image is deferred on the
+/// native build (no unguarded webview here, but the wgpu blit is a separate follow-up).
+fn format_preview(p: &Preview) -> String {
+    let mut out = String::new();
+    if let Some(t) = &p.title {
+        out.push_str(t);
+        out.push('\n');
+    }
+    if let Some(s) = &p.site_name {
+        out.push_str(s);
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    if let Some(d) = p.description.as_ref().or(p.text_snippet.as_ref()) {
+        out.push_str(d);
+        out.push('\n');
+    } else if p.kind == PreviewKind::Image {
+        out.push_str("(image)\n");
+    } else if p.title.is_none() {
+        out.push_str("(no preview text)\n");
+    }
+    let img = if p.kind == PreviewKind::Image { Some(&p.url) } else { p.image_url.as_ref() };
+    if let Some(i) = img {
+        out.push_str(&format!("\n🖼 {i}"));
+    }
+    out.trim_end().to_string()
 }
 
 /// Extract the command at the shell prompt directly from the grid `snap`: the text on the
@@ -4461,7 +4622,7 @@ impl App {
                 // Overloaded on the typed command (spec §2): `cd` → tree picker, `du` →
                 // disk-usage treemap, `free` → memory gauge, `df` → disk-free gauge, `ping` →
                 // latency chart, `uptime` → load gauge, `netstat`/`ss` → connections table,
-                // anything else → the ps decorator.
+                // `git` → status preview, anything else → the ps decorator.
                 match first_command_token(&self.grid_command_line()) {
                     "cd" => self.cd_open(),
                     "du" => self.du_open(),
@@ -4470,6 +4631,7 @@ impl App {
                     "ping" => self.ping_open(),
                     "uptime" => self.load_open(),
                     "netstat" | "ss" => self.net_open(),
+                    "git" => self.git_open(),
                     _ => self.ps_open(),
                 }
             }
@@ -4480,6 +4642,7 @@ impl App {
             Action::Ai => self.ai_open(),
             Action::Explain => self.explain_open(),
             Action::AnalyzeWindow => self.analyze_window_open(),
+            Action::PreviewUrl => self.preview_url_open(),
             Action::SplitRight => self.split_right(),
             Action::FocusPane => self.focus_pane(),
             Action::ZoomIn => self.zoom_by(1.0),
@@ -4853,7 +5016,7 @@ impl App {
                     self.scroll(Scroll::Bottom);
                     self.ai_close();
                 }
-                AiState::Explanation { .. } => self.ai_close(), // read-only — nothing to insert
+                AiState::Explanation { .. } | AiState::UrlPreview { .. } => self.ai_close(), // read-only
                 AiState::Pending => {} // in flight — ignore
                 _ => self.ai_submit(),
             },
@@ -4865,7 +5028,9 @@ impl App {
                 // 'c' copies: the suggested command (Result) or the explanation (Explanation).
                 let copy = match &self.ai_state {
                     AiState::Result { command, .. } => Some(command.clone()),
-                    AiState::Explanation { text, .. } => Some(text.clone()),
+                    AiState::Explanation { text, .. } | AiState::UrlPreview { text, .. } => {
+                        Some(text.clone())
+                    }
                     _ => None,
                 };
                 if text == Some("c") {
@@ -5030,6 +5195,60 @@ impl App {
         }
         self.ai_state = match result {
             Ok(text) => AiState::Explanation { command, text },
+            Err(e) => AiState::Error(e),
+        };
+        self.request_redraw();
+    }
+
+    /// URL link-preview (spec-url-preview): unfurl the first http(s) URL on the line via the
+    /// guarded fetcher and show the card in the AI overlay (read-only). Opt-in — inert unless
+    /// `[url_preview] enabled = true`. Egress happens only on this keypress; nothing is run.
+    fn preview_url_open(&mut self) {
+        self.ai_on = true;
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+
+        let url = match detect_url(&self.grid_command_line()) {
+            Some(u) => u,
+            None => {
+                self.ai_state = AiState::Error("No http(s) URL on the line to preview.".into());
+                self.request_redraw();
+                return;
+            }
+        };
+        let cfg = load_config().url_preview;
+        if !cfg.enabled {
+            self.ai_state = AiState::Error(
+                "URL preview is off — set [url_preview] enabled = true in config.toml.".into(),
+            );
+            self.request_redraw();
+            return;
+        }
+        let gen = self.ai_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.ai_query = url.clone();
+        self.ai_state = AiState::Pending;
+        self.request_redraw();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let fetcher = GuardedFetch {
+                max_bytes: cfg.max_bytes,
+                timeout: std::time::Duration::from_millis(cfg.timeout_ms),
+                max_redirects: cfg.max_redirects,
+            };
+            let result = fetch_preview(&fetcher, &url).map(|p| (p.url.clone(), format_preview(&p)));
+            let _ = proxy.send_event(UserEvent::UrlPreviewReady { gen, result });
+        });
+    }
+
+    /// Deliver a background URL preview, unless it's stale (gen bumped) or the overlay closed.
+    fn url_preview_ready(&mut self, gen: u64, result: Result<(String, String), String>) {
+        if !self.ai_on || gen != self.ai_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.ai_state = match result {
+            Ok((url, text)) => AiState::UrlPreview { url, text },
             Err(e) => AiState::Error(e),
         };
         self.request_redraw();
@@ -5329,6 +5548,52 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                         }
                     }
                     Err(_) => vec!["helm not found on PATH.".to_string()],
+                };
+                let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
+            });
+        } else if cmd == "aws" {
+            // `aws` has a long, groff man-page help — show its service/command list instead
+            // (spec-aws-cheatsheet.md). aws uses a `help` pseudo-subcommand (not `--help`), and
+            // its output carries ANSI/overstrike, so strip it. Drill in by the typed path
+            // (`aws s3` → its AVAILABLE COMMANDS); a leaf (`aws s3 ls`, no AVAILABLE list) shows
+            // its own raw (stripped) help.
+            let subs = subcommand_path(&line, "aws");
+            let display = if subs.is_empty() {
+                "aws".to_string()
+            } else {
+                format!("aws {}", subs.join(" "))
+            };
+            self.man_cmd = display.clone();
+            self.man_loading = true;
+            self.man_lines.clear();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let mut command = std::process::Command::new("aws");
+                command
+                    .args(&subs)
+                    .arg("help")
+                    .env("AWS_PAGER", "")
+                    .env("PAGER", "cat")
+                    .env("MANPAGER", "cat")
+                    .env("LC_ALL", "C");
+                let lines = match command.output() {
+                    Ok(o) => {
+                        let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                        text.push_str(&String::from_utf8_lossy(&o.stderr));
+                        match parse_aws_help(&text) {
+                            Some(names) => aws_cheatsheet_lines(&names),
+                            // A leaf (no AVAILABLE list) → its own help, man-page decoration stripped.
+                            None => {
+                                let clean = aws_strip(&text);
+                                if clean.trim().is_empty() {
+                                    vec!["No aws help available.".to_string()]
+                                } else {
+                                    clean.lines().map(str::to_string).collect()
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => vec!["aws not found on PATH.".to_string()],
                 };
                 let _ = proxy.send_event(UserEvent::ManReady { cmd: display, lines: Some(lines) });
             });
@@ -6686,6 +6951,102 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         (title, body, spans)
     }
 
+    // --- git status preview (sampa-gitdec; porcelain v1) ---------------------------------
+    /// Open the git-status panel: run a **read-only** `git -C <cwd> status --porcelain -b`
+    /// (porcelain v1 is git's stable machine format) with `LC_ALL=C`, parse it, and show the
+    /// changed paths grouped the way `git status` presents them. Display-only — nothing runs.
+    fn git_open(&mut self) {
+        self.man_on = false;
+        self.preview_on = false;
+        self.ps_on = false;
+        self.cd_on = false;
+        self.du_on = false;
+        self.free_on = false;
+        self.df_on = false;
+        self.ping_on = false;
+        self.load_on = false;
+        self.net_on = false;
+        self.git_on = true;
+        let cwd = self.session_cwd().unwrap_or_else(|| ".".into());
+        // A non-zero exit is how git reports "not a git repository" — treat it (and any
+        // unparseable output) as a status line, never a crash.
+        let parsed = std::process::Command::new("git")
+            .args(["-C", &cwd, "status", "--porcelain", "-b"])
+            .env("LC_ALL", "C")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| parse_status(&String::from_utf8_lossy(&o.stdout)));
+        match parsed {
+            Some(st) => {
+                self.git_status = Some(st);
+                self.git_msg = None;
+            }
+            None => {
+                self.git_status = None;
+                self.git_msg = Some("not a git repository (or git unavailable).".into());
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn git_close(&mut self) {
+        self.git_on = false;
+        self.git_status = None;
+        self.git_msg = None;
+        self.request_redraw();
+    }
+
+    fn git_key(&mut self, key: &Key) {
+        // Read-only: Esc / Enter dismiss.
+        if matches!(key, Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)) {
+            self.git_close();
+        }
+    }
+
+    /// Build the git-status panel's `(title, body, spans)`: the changed paths grouped as
+    /// `git status` shows them — staged (green) / unstaged (amber) / untracked (grey) /
+    /// conflicted (red) — each row `<label>: <path>` (renames carry `orig -> path`). A clean
+    /// tree says so. Display-only — nothing is composed or run.
+    fn git_render(&self, st: &GitStatus) -> (String, String, Vec<BodySpan>) {
+        let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+        let mut spans: Vec<BodySpan> = Vec::new();
+        let mut group = |title: &str, changes: &[Change], color: [u8; 3]| {
+            if changes.is_empty() {
+                return;
+            }
+            spans.push((format!("{} ({})\n", title, changes.len()), color, true, false));
+            for c in changes {
+                let path = match &c.orig {
+                    Some(orig) => format!("{orig} -> {}", c.path),
+                    None => c.path.clone(),
+                };
+                spans.push((format!("  {}: {}\n", c.label, path), color, false, false));
+            }
+        };
+        group("Staged", &st.staged, HEAT_GREEN);
+        group("Unstaged", &st.unstaged, HEAT_YELLOW);
+        group("Untracked", &st.untracked, muted);
+        group("Conflicted", &st.conflicted, HEAT_RED);
+        if st.is_clean() {
+            spans.push(("working tree clean\n".into(), HEAT_GREEN, false, false));
+        }
+        let body: String = spans.iter().map(|(t, _, _, _)| t.as_str()).collect();
+        // Header: branch + upstream + divergence.
+        let mut head = format!("git — {}", st.branch);
+        if let Some(up) = &st.upstream {
+            head.push_str(&format!(" → {up}"));
+        }
+        if st.ahead > 0 || st.behind > 0 {
+            head.push_str(&format!(" (ahead {}, behind {})", st.ahead, st.behind));
+        }
+        if st.no_commits {
+            head.push_str(" · no commits yet");
+        }
+        let title = format!("{head}   ·  Esc / Enter closes");
+        (title, body, spans)
+    }
+
     // --- df disk-free gauge (spec-df-gauge.md) -------------------------------------------
     /// Open the df gauge: kick a **timeout-bounded** `df -k` off-thread (it can block on a
     /// stale mount) and show a status line until `DfReady` lands. Display-only.
@@ -7319,6 +7680,9 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let net_title;
         let net_body;
         let net_spans: Vec<BodySpan>;
+        let git_title;
+        let git_body;
+        let git_spans: Vec<BodySpan>;
         let ai_title;
         let ai_body_spans: Vec<BodySpan>;
         let (_, lh) = self.cell_metrics();
@@ -7411,6 +7775,13 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                     spans.push((format!("\n\n{text}"), fg, false, false));
                     spans.push(("\n\nc copies · Esc closes".into(), muted, false, false));
                 }
+                AiState::UrlPreview { url, text } => {
+                    ai_title = "URL preview".to_string();
+                    spans.push(("🔗 ".into(), muted, false, false));
+                    spans.push((url.clone(), accent, true, false));
+                    spans.push((format!("\n\n{text}"), fg, false, false));
+                    spans.push(("\n\nc copies · Esc closes".into(), muted, false, false));
+                }
                 AiState::Error(e) => {
                     ai_title = "Ask AI — error".to_string();
                     spans.push((e.clone(), WARN, false, false));
@@ -7428,10 +7799,10 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let start = self.man_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
             panel_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
-            // gh/cargo/npm/docker/kubectl/helm (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
+            // gh/cargo/npm/docker/kubectl/helm/aws (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
             let is_cheatsheet = |c: &str| {
                 let prog = c.split_whitespace().next().unwrap_or("");
-                matches!(prog, "gh" | "cargo" | "npm" | "docker" | "kubectl" | "helm")
+                matches!(prog, "gh" | "cargo" | "npm" | "docker" | "kubectl" | "helm" | "aws")
             };
             let label = if is_cheatsheet(&self.man_cmd) {
                 format!("{} — commands", self.man_cmd)
@@ -7553,6 +7924,21 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                     net_title = "connections — ss   ·  Esc".to_string();
                     net_body = self.net_msg.clone().unwrap_or_default();
                     Some(PanelView { title: &net_title, body: &net_body, body_spans: None })
+                }
+            }
+        } else if self.git_on {
+            match self.git_status.as_ref() {
+                Some(st) => {
+                    let (t, b, spans) = self.git_render(st);
+                    git_title = t;
+                    git_body = b;
+                    git_spans = spans;
+                    Some(PanelView { title: &git_title, body: &git_body, body_spans: Some(&git_spans) })
+                }
+                None => {
+                    git_title = "git status   ·  Esc".to_string();
+                    git_body = self.git_msg.clone().unwrap_or_default();
+                    Some(PanelView { title: &git_title, body: &git_body, body_spans: None })
                 }
             }
         } else {
@@ -10694,6 +11080,62 @@ mod tests {
         assert_eq!(lines[1], "  create   create a new chart with the given name");
         assert_eq!(lines[2], "  install  install a chart");
         assert!(helm_cheatsheet_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn aws_cheatsheet_lays_names_in_columns() {
+        assert_eq!(subcommand_path("aws s3 ls", "aws"), vec!["s3", "ls"]);
+        // Names-only, packed into padded columns under a COMMANDS header (like npm).
+        let names: Vec<String> = ["acm", "dynamodb", "ec2", "s3"].iter().map(|s| s.to_string()).collect();
+        let lines = aws_cheatsheet_lines(&names);
+        assert_eq!(lines[0], "COMMANDS");
+        let joined = lines[1..].join(" ");
+        for n in &names {
+            assert!(joined.contains(n.as_str()), "missing {n}");
+        }
+        assert!(lines.iter().all(|l| l.chars().count() <= 78));
+        assert_eq!(aws_cheatsheet_lines(&[]), vec!["COMMANDS".to_string()]);
+    }
+
+    #[test]
+    fn url_preview_detect_and_format() {
+        assert_eq!(detect_url("https://example.com/a").as_deref(), Some("https://example.com/a"));
+        assert_eq!(detect_url("curl -s 'http://x.test/p'").as_deref(), Some("http://x.test/p"));
+        assert_eq!(detect_url("ls -la"), None);
+        assert_eq!(detect_url("ftp://nope.test"), None);
+        let p = Preview {
+            url: "https://example.com/final".into(),
+            kind: PreviewKind::Html,
+            content_type: Some("text/html".into()),
+            title: Some("Title".into()),
+            description: Some("A page.".into()),
+            site_name: Some("Example".into()),
+            image_url: Some("https://cdn.example.com/i.png".into()),
+            text_snippet: None,
+        };
+        let text = format_preview(&p);
+        assert!(text.starts_with("Title\nExample\n"));
+        assert!(text.contains("A page."));
+        assert!(text.contains("🖼 https://cdn.example.com/i.png"));
+    }
+
+    #[test]
+    fn git_status_parses_and_groups() {
+        // Consumes the pinned sampa-gitdec: porcelain v1 → branch + grouped changes.
+        let porcelain = "## main...origin/main [ahead 1]\nM  staged.rs\n M unstaged.rs\n?? new.txt\n";
+        let st = parse_status(porcelain).expect("porcelain v1 parses");
+        assert_eq!(st.branch, "main");
+        assert_eq!(st.upstream.as_deref(), Some("origin/main"));
+        assert_eq!(st.ahead, 1);
+        assert_eq!(st.staged.len(), 1);
+        assert_eq!(st.unstaged.len(), 1);
+        assert_eq!(st.untracked.len(), 1);
+        assert!(!st.is_clean());
+        // A branch line with no changes is a clean, non-None status.
+        let clean = parse_status("## main\n").expect("clean repo is a real answer");
+        assert!(clean.is_clean());
+        // Non-porcelain text fails safe to None.
+        assert!(parse_status("On branch main\nnothing to commit\n").is_none());
     }
 
     #[test]
