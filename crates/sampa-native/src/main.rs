@@ -160,6 +160,7 @@ enum Action {
     EnhancePs,
     EnhancePsInplace,
     SplitRight,
+    SplitDown,
     FocusPane,
     Ai,
     Explain,
@@ -190,6 +191,7 @@ const ACTIONS: &[(Action, &str, &str, &str)] = &[
     (Action::EnhancePs, "enhance_ps", "Enhance ps output (or cd tree picker)", "Ctrl+Shift+D"),
     (Action::EnhancePsInplace, "enhance_ps_inplace", "Toggle in-place ps colouring", "Ctrl+Shift+I"),
     (Action::SplitRight, "split_right", "Split pane to the right", "Ctrl+Shift+R"),
+    (Action::SplitDown, "split_down", "Split pane below", "Ctrl+Shift+B"),
     (Action::FocusPane, "focus_pane", "Focus the next split pane", "Ctrl+Shift+O"),
     (Action::Ai, "ai", "Ask AI for a command", "Ctrl+Shift+A"),
     (Action::Explain, "explain", "Explain the command line", "Ctrl+Shift+X"),
@@ -836,15 +838,42 @@ enum Osc52Policy {
     Ask,
 }
 
-/// One pane's grid to render this frame: its snapshot and the pixel column `[x, x+w]` it
-/// occupies (full width for a single pane). `focused` gets the bright cursor.
+/// How the panes are laid out: side-by-side columns (`Ctrl+Shift+R`) or stacked rows
+/// (`Ctrl+Shift+B`). Only one direction at a time (no nested layouts in v1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SplitDir {
+    Vertical,
+    Horizontal,
+}
+
+/// One pane's grid to render this frame: its snapshot, the pixel column `[x, x+w]` it occupies,
+/// and (for horizontal splits) the vertical band `[y_frac, y_frac+h_frac]` as a fraction of the
+/// grid region — paint turns that into pixels once it knows the grid's top/bottom. Vertical /
+/// single panes use the full height (`y_frac = 0`, `h_frac = 1`). `focused` gets the bright cursor.
 struct PaneRender<'a> {
     snap: &'a Snapshot,
     x: f32,
     w: f32,
+    y_frac: f32,
+    h_frac: f32,
     focused: bool,
     /// `(row, start_col, end_col)` of a Ctrl-hovered link to accent-underline (focused pane).
     hovered_link: Option<(usize, usize, usize)>,
+}
+
+/// A pane's vertical placement in pixels: `(vp_y, clip_top, clip_bottom)` — the y-origin for
+/// its row 0 and the band it's clipped to. A full-height (vertical / single) pane anchors at
+/// `top` and clips to the whole grid `[grid_top, grid_bottom]` (unchanged behaviour); a
+/// horizontal pane anchors at its band top within the grid region. Pure, so it's unit-tested.
+fn pane_band(y_frac: f32, h_frac: f32, top: f32, grid_top: f32, grid_bottom: f32) -> (f32, f32, f32) {
+    if h_frac >= 0.999 {
+        (top, grid_top, grid_bottom)
+    } else {
+        let gh = (grid_bottom - grid_top).max(0.0);
+        let vp_y = grid_top + y_frac * gh;
+        let clip_bottom = (grid_top + (y_frac + h_frac) * gh).min(grid_bottom);
+        (vp_y, vp_y.max(grid_top), clip_bottom)
+    }
 }
 
 /// The `du` disk-usage treemap overlay for one frame (spec-du-treemap.md): the laid-out
@@ -2566,6 +2595,7 @@ fn main() -> Result<()> {
         active: 0,
         panes: vec![0],
         focus: 0,
+        split_dir: SplitDir::Vertical,
         next_id: 1,
         proxy,
         state,
@@ -3047,10 +3077,12 @@ fn pump(
 struct App {
     sessions: Vec<Session>,
     active: usize,
-    // Vertical split panes: session indices, left-to-right; `focus` indexes it and
-    // `panes[focus] == active`. len()==1 is the classic single-pane view.
+    // Split panes: session indices in layout order; `focus` indexes it and
+    // `panes[focus] == active`. len()==1 is the classic single-pane view. `split_dir` is
+    // whether they tile as columns (Vertical) or rows (Horizontal).
     panes: Vec<usize>,
     focus: usize,
+    split_dir: SplitDir,
     next_id: u64,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     // Active-session pointers (Arc-clones re-pointed on switch) so existing call sites
@@ -4620,6 +4652,11 @@ impl App {
         let line = Line(row as i32 - d);
         let grid = g.term.grid();
         let cols = grid.columns();
+        // A resize (e.g. a split shrinking this pane) can leave `mouse_col`/`row` past the new
+        // grid before the next `cell_at`; guard the index so a stale hover never panics.
+        if col >= cols || row >= grid.screen_lines() {
+            return None;
+        }
         if let Some(h) = grid[line][Column(col)].hyperlink() {
             let uri = h.uri().to_string();
             if !is_safe_url(&uri) {
@@ -4917,22 +4954,33 @@ impl App {
         if let Some(gfx) = &mut self.gfx {
             gfx.resize(w, h);
         }
-        // Each split pane gets its own column width; background (non-pane) tabs stay full so
+        // Each split pane gets its own cell box; background (non-pane) tabs stay full so
         // switching to them needs no reflow. `cols`/`rows` above are the full-grid size.
-        let col_w = self.pane_col_w(w as f32);
-        let pane_cols = (((col_w - 2.0 * PAD) / cell_w).floor() as u16).max(1);
+        // Vertical splits narrow the columns (full rows); horizontal splits shorten the rows
+        // (full columns). `(pane_cols, pane_rows, col_w_px, row_h_px)` describe one pane.
+        let n = self.panes.len().max(1);
+        let (pane_cols, pane_rows, col_w, row_h) = if n <= 1 {
+            (cols, rows, w as f32, h as f32)
+        } else if self.split_dir == SplitDir::Vertical {
+            let col_w = self.pane_col_w(w as f32);
+            ((((col_w - 2.0 * PAD) / cell_w).floor() as u16).max(1), rows, col_w, h as f32)
+        } else {
+            let grid_h = (h as f32 - top - PAD).max(line_h);
+            let row_h = ((grid_h - (n as f32 - 1.0) * DIVIDER) / n as f32).max(line_h);
+            (cols, ((row_h / line_h).floor() as u16).max(1), w as f32, row_h)
+        };
         for (i, s) in self.sessions.iter().enumerate() {
-            let c = if self.panes.contains(&i) { pane_cols } else { cols };
+            let (c, r) = if self.panes.contains(&i) { (pane_cols, pane_rows) } else { (cols, rows) };
             if let Ok(mut g) = s.state.lock() {
-                g.term.resize(TermSize::new(c as usize, rows as usize));
+                g.term.resize(TermSize::new(c as usize, r as usize));
             }
             if let Ok(p) = s.pty.lock() {
-                let _ = p.resize(c, rows, col_w as u16, h as u16);
+                let _ = p.resize(c, r, col_w as u16, row_h as u16);
             }
         }
         // `self.cols`/`rows` track the *focused* pane (mouse mapping, split spawn size).
-        self.cols = if self.panes.len() > 1 { pane_cols } else { cols };
-        self.rows = rows;
+        self.cols = if n > 1 { pane_cols } else { cols };
+        self.rows = if n > 1 { pane_rows } else { rows };
     }
 
     fn request_redraw(&self) {
@@ -5043,7 +5091,8 @@ impl App {
             Action::Explain => self.explain_open(),
             Action::AnalyzeWindow => self.analyze_window_open(),
             Action::PreviewUrl => self.preview_url_open(),
-            Action::SplitRight => self.split_right(),
+            Action::SplitRight => self.split(SplitDir::Vertical),
+            Action::SplitDown => self.split(SplitDir::Horizontal),
             Action::FocusPane => self.focus_pane(),
             Action::ZoomIn => self.zoom_by(1.0),
             Action::ZoomOut => self.zoom_by(-1.0),
@@ -5086,7 +5135,10 @@ impl App {
 
     /// Split the focused pane vertically: spawn a new shell as a pane to its right and focus
     /// it. Any other session op (new tab, tab switch, close) collapses the split (v1).
-    fn split_right(&mut self) {
+    /// Split the focused pane, tiling the panes as columns (`Vertical`) or rows (`Horizontal`).
+    /// The direction applies to the whole set (no nested layouts in v1), so splitting the other
+    /// way re-tiles the existing panes in the new direction.
+    fn split(&mut self, dir: SplitDir) {
         let cfg = load_config();
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let cwd = self.session_cwd();
@@ -5095,10 +5147,11 @@ impl App {
                 self.next_id += 1;
                 self.sessions.push(session);
                 let new_idx = self.sessions.len() - 1;
+                self.split_dir = dir;
                 self.panes.insert(self.focus + 1, new_idx);
                 self.focus += 1;
                 self.switch_to(new_idx); // mirrors state/pty/images; leaves `panes` intact
-                self.reflow();           // re-size every pane to its column
+                self.reflow();           // re-size every pane to its column/row
             }
             Err(e) => eprintln!("split: {e}"),
         }
@@ -8493,17 +8546,31 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let bell = self.bell_until.is_some_and(|t| std::time::Instant::now() < t);
         // Lay the panes into columns (single pane → full width).
         let win_w = self.window.as_ref().map(|win| win.inner_size().width as f32).unwrap_or(0.0);
+        // Columns (Vertical / single pane) tile across the width; rows (Horizontal) tile the
+        // grid's vertical band, expressed as fractions that paint resolves to pixels.
+        let n = pane_snaps.len().max(1);
+        let vertical = self.split_dir == SplitDir::Vertical || n <= 1;
         let col_w = self.pane_col_w(win_w);
         let pane_views: Vec<PaneRender> = pane_snaps
             .iter()
             .enumerate()
-            .map(|(pi, s)| PaneRender {
-                snap: s,
-                x: pi as f32 * (col_w + DIVIDER),
-                w: col_w,
-                focused: pi == fidx,
-                // The hover highlight belongs to the focused pane the mouse reads from.
-                hovered_link: if pi == fidx { self.hovered_link } else { None },
+            .map(|(pi, s)| {
+                let (x, w, y_frac, h_frac) = if vertical {
+                    (pi as f32 * (col_w + DIVIDER), col_w, 0.0, 1.0)
+                } else {
+                    let frac = 1.0 / n as f32;
+                    (0.0, win_w, pi as f32 * frac, frac)
+                };
+                PaneRender {
+                    snap: s,
+                    x,
+                    w,
+                    y_frac,
+                    h_frac,
+                    focused: pi == fidx,
+                    // The hover highlight belongs to the focused pane the mouse reads from.
+                    hovered_link: if pi == fidx { self.hovered_link } else { None },
+                }
             })
             .collect();
         // Screenshot-analysis (spec-window-analysis): if a capture is armed, grab this
@@ -9877,9 +9944,10 @@ impl Renderer {
         // inside its column [vp_x, vp_x + vp_w] (full width when there's a single pane).
         for pane in panes {
             let (vp_x, snap) = (pane.x, pane.snap);
+            let (vp_y, clip_top, clip_bot) = pane_band(pane.y_frac, pane.h_frac, top, grid_top, grid_bottom);
             for r in 0..snap.rows {
-                let y = top + r as f32 * self.line_h;
-                let row_visible = y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5;
+                let y = vp_y + r as f32 * self.line_h;
+                let row_visible = y >= clip_top - 0.5 && y + self.line_h <= clip_bot + 0.5;
                 for c in 0..snap.cols {
                     let cell = snap.cell(r, c);
                     let x = vp_x + PAD + c as f32 * self.cell_w;
@@ -9915,10 +9983,10 @@ impl Renderer {
             // Bar/underline cursor (block inverts its cell in build_snapshot). The focused
             // pane's cursor is bright; an unfocused pane fades it toward the background.
             if let Some((r, c)) = snap.cursor.filter(|(r, _)| {
-                let y = top + *r as f32 * self.line_h;
-                y >= grid_top - 0.5 && y + self.line_h <= grid_bottom + 0.5
+                let y = vp_y + *r as f32 * self.line_h;
+                y >= clip_top - 0.5 && y + self.line_h <= clip_bot + 0.5
             }) {
-                let (x, y) = (vp_x + PAD + c as f32 * self.cell_w, top + r as f32 * self.line_h);
+                let (x, y) = (vp_x + PAD + c as f32 * self.cell_w, vp_y + r as f32 * self.line_h);
                 let rect = match snap.cursor_style {
                     CursorStyle::Bar => Some([x, y, 2.0, self.line_h]),
                     CursorStyle::Underline => Some([x, y + self.line_h - 2.0, self.cell_w, 2.0]),
@@ -9930,12 +9998,16 @@ impl Renderer {
                 }
             }
         }
-        // Divider quads between adjacent panes.
+        // Divider quads between adjacent panes: a vertical rule between columns, a horizontal
+        // rule between stacked rows.
         for pane in panes.iter().skip(1) {
-            bg_quads.push(QuadInstance {
-                rect: [pane.x - DIVIDER, top, DIVIDER, h as f32 - top],
-                color: self.color4(blend(self.theme.bg, self.theme.fg, 0.28)),
-            });
+            let div = self.color4(blend(self.theme.bg, self.theme.fg, 0.28));
+            if pane.h_frac >= 0.999 {
+                bg_quads.push(QuadInstance { rect: [pane.x - DIVIDER, top, DIVIDER, h as f32 - top], color: div });
+            } else {
+                let (vp_y, _, _) = pane_band(pane.y_frac, pane.h_frac, top, grid_top, grid_bottom);
+                bg_quads.push(QuadInstance { rect: [0.0, vp_y - DIVIDER, w as f32, DIVIDER], color: div });
+            }
         }
         // Search bar: an opaque strip at the bottom (drawn over the grid) + a top rule.
         if search.is_some() {
@@ -10242,12 +10314,13 @@ impl Renderer {
             }
         } else {
             for (pi, pane) in panes.iter().enumerate() {
+                let (vp_y, ct, cb) = pane_band(pane.y_frac, pane.h_frac, top, grid_top, grid_bottom);
                 text_areas.push(TextArea {
                     buffer: &self.pane_buffers[pi],
                     left: pane.x + PAD,
-                    top,
+                    top: vp_y,
                     scale: 1.0,
-                    bounds: TextBounds { left: pane.x as i32, top: grid_top as i32, right: (pane.x + pane.w) as i32, bottom: grid_bottom as i32 },
+                    bounds: TextBounds { left: pane.x as i32, top: ct as i32, right: (pane.x + pane.w) as i32, bottom: cb as i32 },
                     default_color: gfg,
                     custom_glyphs: &[],
                 });
@@ -10903,7 +10976,7 @@ fn capture(path: &str) -> Result<()> {
         Some(PanelView { title: &man_title, body: &man_body, body_spans: None })
     };
     r.paint(
-        &[PaneRender { snap: &snap, x: 0.0, w: w as f32, focused: true, hovered_link: None }],
+        &[PaneRender { snap: &snap, x: 0.0, w: w as f32, y_frac: 0.0, h_frac: 1.0, focused: true, hovered_link: None }],
         &view,
         w,
         h,
@@ -12310,6 +12383,21 @@ mod tests {
         assert_eq!(scroll_offset(2, 3, false, 10), 0);
         // A body that fits (max 0) never scrolls.
         assert_eq!(scroll_offset(0, 3, true, 0), 0);
+    }
+
+    #[test]
+    fn pane_band_places_horizontal_rows() {
+        // Grid region is [top=30, grid_bottom=630] here (grid_top may differ under overlays).
+        let (top, gt, gb) = (30.0, 30.0, 630.0); // gh = 600
+        // A full-height pane (h_frac 1) anchors at `top` and clips to the whole grid — the
+        // unchanged vertical/single behaviour, independent of y_frac.
+        assert_eq!(pane_band(0.0, 1.0, top, gt, gb), (30.0, 30.0, 630.0));
+        // Two horizontal panes (h_frac 0.5): top band [30,330], bottom band [330,630].
+        assert_eq!(pane_band(0.0, 0.5, top, gt, gb), (30.0, 30.0, 330.0));
+        assert_eq!(pane_band(0.5, 0.5, top, gt, gb), (330.0, 330.0, 630.0));
+        // The bottom clip never exceeds grid_bottom (rounding-safe).
+        let (_, _, cb) = pane_band(0.66, 0.34, top, gt, gb);
+        assert!(cb <= gb + 0.01);
     }
 
     #[test]

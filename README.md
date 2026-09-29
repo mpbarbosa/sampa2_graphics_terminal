@@ -33,7 +33,8 @@ run, never on its own.
 - **URL preview (opt-in, second network surface):** `Ctrl+Shift+L` unfurl an `http(s)` URL on the
   line into a title/description card — guarded fetch (http(s)-only, SSRF-vetted, size/timeout
   bounded); off by default (`[url_preview] enabled`).
-- **Split panes:** `Ctrl+Shift+R` split vertically · `Ctrl+Shift+O` cycle focus.
+- **Split panes:** `Ctrl+Shift+R` split into columns · `Ctrl+Shift+B` split into rows ·
+  `Ctrl+Shift+O` cycle focus.
 - **Also:** command palette (`Ctrl+Shift+P`), live man-page panel (`Ctrl+Shift+M`, which
   shows a **`gh`, `cargo`, `npm`, `docker`, `kubectl`, `helm`, or `aws` command cheat-sheet** when
   the typed command is `gh`/`cargo`/`npm`/`docker`/`kubectl`/`helm`/`aws`),
