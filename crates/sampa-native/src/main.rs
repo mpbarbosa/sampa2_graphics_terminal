@@ -2633,6 +2633,7 @@ fn main() -> Result<()> {
         preview_on: false,
         preview_text: String::new(),
         preview_ran: false,
+        preview_scroll: 0,
         preview_line: String::new(),
         preview_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ps_on: false,
@@ -3127,6 +3128,7 @@ struct App {
     preview_on: bool,
     preview_text: String,
     preview_ran: bool,
+    preview_scroll: usize, // first visible output line (mouse-wheel scroll); reset on new output
     preview_line: String, // the command the current preview_text is for
     /// Debounce/supersede token: only the newest scheduled preview runs + is accepted.
     preview_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -4758,6 +4760,12 @@ impl App {
             MouseScrollDelta::LineDelta(_, y) => y > 0.0,
             MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
         };
+        // While the preview panel is open it owns the wheel — scroll its (possibly long)
+        // output rather than the scrollback (the panel isn't modal, so keys still type).
+        if self.preview_on && self.preview_ran {
+            self.preview_scroll_by(3, !up);
+            return;
+        }
         if !self.modifiers.shift_key() && self.report_mouse(if up { 64 } else { 65 }, true, false) {
             return; // app is in mouse mode → wheel goes to it
         }
@@ -7779,6 +7787,15 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.preview_line = line;
         self.preview_ran = ran;
         self.preview_text = text;
+        self.preview_scroll = 0; // new output → back to the top
+        self.request_redraw();
+    }
+
+    /// Scroll the preview panel's output by `delta` lines (mouse wheel); the render clamps the
+    /// window to what fits, so we only bound it to the last line here.
+    fn preview_scroll_by(&mut self, delta: usize, down: bool) {
+        let max = self.preview_text.lines().count().saturating_sub(1);
+        self.preview_scroll = scroll_offset(self.preview_scroll, delta, down, max);
         self.request_redraw();
     }
 
@@ -8222,13 +8239,20 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         } else if self.preview_on {
             let visible = fit(PREVIEW_VISIBLE);
             // The body is the command output (only when it actually ran); a rejection's
-            // reason lives in the header instead.
+            // reason lives in the header instead. The mouse wheel scrolls a long output.
             let src = if self.preview_ran { self.preview_text.as_str() } else { "" };
             let lines: Vec<&str> = src.lines().collect();
-            let shown = lines.len().min(visible);
-            panel_body = lines[..shown].join("\n");
-            let more = if lines.len() > shown { format!("  (+{} lines)", lines.len() - shown) } else { String::new() };
-            panel_title = format!("{}{}   ·  Ctrl+Shift+E hides", self.preview_status(), more);
+            let total = lines.len();
+            let start = self.preview_scroll.min(total.saturating_sub(1));
+            let end = (start + visible).min(total);
+            panel_body = lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
+            // Show the scroll position + a wheel hint only when the output overflows.
+            let pos = if total > visible {
+                format!("  {}–{}/{} · wheel scrolls", start + 1, end, total)
+            } else {
+                String::new()
+            };
+            panel_title = format!("{}{}   ·  Ctrl+Shift+E hides", self.preview_status(), pos);
             Some(PanelView { title: &panel_title, body: &panel_body, body_spans: None })
         } else if self.ps_on {
             match self.ps_view.as_ref() {
@@ -8754,6 +8778,16 @@ fn next_click_count(prev: u8, same_cell: bool, elapsed_ms: u128) -> u8 {
         prev + 1
     } else {
         1
+    }
+}
+
+/// New scroll offset after moving `delta` lines in a scrollable bottom panel: `down` grows
+/// toward `max` (the last line), up shrinks toward 0. Pure, so the clamping is unit-tested.
+fn scroll_offset(cur: usize, delta: usize, down: bool, max: usize) -> usize {
+    if down {
+        (cur + delta).min(max)
+    } else {
+        cur.saturating_sub(delta)
     }
 }
 
@@ -12124,6 +12158,19 @@ mod tests {
         assert!(matches!(selection_type_for(1), SelectionType::Simple));
         assert!(matches!(selection_type_for(2), SelectionType::Semantic));
         assert!(matches!(selection_type_for(3), SelectionType::Lines));
+    }
+
+    #[test]
+    fn scroll_offset_clamps_both_ends() {
+        // Down grows toward max (last line), never past it.
+        assert_eq!(scroll_offset(0, 3, true, 10), 3);
+        assert_eq!(scroll_offset(9, 3, true, 10), 10);
+        assert_eq!(scroll_offset(10, 3, true, 10), 10);
+        // Up shrinks toward 0, never below.
+        assert_eq!(scroll_offset(5, 3, false, 10), 2);
+        assert_eq!(scroll_offset(2, 3, false, 10), 0);
+        // A body that fits (max 0) never scrolls.
+        assert_eq!(scroll_offset(0, 3, true, 0), 0);
     }
 
     #[test]
