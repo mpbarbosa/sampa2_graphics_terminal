@@ -81,6 +81,8 @@ const PAD: f32 = 6.0;
 const TAB_BAR_H: f32 = 26.0;
 /// Width of the "+" new-tab button at the right of the tab bar (a square cell).
 const NEW_TAB_W: f32 = TAB_BAR_H;
+/// Size of the help overlay's ✕ close button (a square in the top-right corner).
+const HELP_CLOSE_W: f32 = 20.0;
 /// Height of the search bar (overlaid at the bottom while search is open).
 const SEARCH_H: f32 = 22.0;
 /// Highlight backgrounds for search matches (all) and the current match.
@@ -9446,6 +9448,7 @@ struct Renderer {
     panel_title_buffer: Buffer, // bottom-panel header (man/preview)
     panel_body_buffer: Buffer,  // bottom-panel body (multi-line)
     help_buffer: Buffer,        // keyboard-shortcut help overlay (title + rows)
+    help_close_buffer: Buffer,  // the help overlay's ✕ close button glyph
     preedit_buffer: Buffer,     // IME preedit (composition) text
     du_title_buffer: Buffer,    // du treemap breadcrumb / status strip
     du_buffers: Vec<Buffer>,    // one per treemap box label, grown lazily
@@ -9500,6 +9503,7 @@ impl Renderer {
         let panel_title_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let panel_body_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let help_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+        let help_close_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let preedit_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let du_title_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
 
@@ -9663,6 +9667,7 @@ impl Renderer {
             panel_title_buffer,
             panel_body_buffer,
             help_buffer,
+            help_close_buffer,
             preedit_buffer,
             du_title_buffer,
             du_buffers: Vec::new(),
@@ -9784,6 +9789,7 @@ impl Renderer {
         self.panel_title_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.panel_body_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.help_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.help_close_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.preedit_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.du_title_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.du_buffers.clear();
@@ -10465,6 +10471,12 @@ impl Renderer {
                 None,
             );
             buf.shape_until_scroll(&mut self.font_system, false);
+            // The ✕ close button, shaped into its own buffer for top-right placement.
+            let muted = blend(self.theme.bg, self.theme.fg, 0.62);
+            let close_attrs = Attrs::new().family(fam).color(Color::rgb(muted[0], muted[1], muted[2]));
+            self.help_close_buffer.set_size(Some(HELP_CLOSE_W), Some(HELP_CLOSE_W));
+            self.help_close_buffer.set_rich_text([("\u{2715}", close_attrs)], &Attrs::new(), Shaping::Advanced, None);
+            self.help_close_buffer.shape_until_scroll(&mut self.font_system, false);
         }
         if let Some((text, _, _, _)) = preedit {
             let fg = self.theme.fg;
@@ -10570,6 +10582,17 @@ impl Renderer {
                 top: help_top + 8.0,
                 scale: 1.0,
                 bounds: TextBounds { left: 0, top: help_top as i32, right: w as i32, bottom: help_bottom as i32 },
+                default_color: fg,
+                custom_glyphs: &[],
+            });
+            // The ✕ close button in the top-right corner.
+            let cx = w as f32 - HELP_CLOSE_W - PAD;
+            text_areas.push(TextArea {
+                buffer: &self.help_close_buffer,
+                left: cx,
+                top: help_top + 6.0,
+                scale: 1.0,
+                bounds: TextBounds { left: cx as i32, top: help_top as i32, right: w as i32, bottom: (help_top + HELP_CLOSE_W + 6.0) as i32 },
                 default_color: fg,
                 custom_glyphs: &[],
             });
