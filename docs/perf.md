@@ -12,9 +12,15 @@ that a fast `cat`/build-log dump actually hits.)
 ## Running it
 
 ```bash
-cargo run --release -- --bench        # default 50 MiB workload
-cargo run --release -- --bench 100    # 100 MiB
+cargo run --release -- --bench             # default 50 MiB workload
+cargo run --release -- --bench 100         # 100 MiB
+cargo run --release -- --bench 50 \
+  --baseline 85 --out metrics.json         # print a %Δ trend vs 85 MiB/s; write metrics JSON
 ```
+
+`--baseline <MiB/s>` adds a trend line comparing this run to an earlier throughput, and
+`--out <file>` writes the metrics as one JSON line (`mib_per_s`, `lines_per_s`, `rss_kib`, …).
+Both are what the CI trend job uses (below); neither changes the measurement.
 
 It builds a **deterministic** workload representative of real output — plain text, `ls
 --color`-style SGR runs, log lines, a compiler error, and mixed-width UTF-8 (accents / CJK /
@@ -49,8 +55,21 @@ Notes:
   *added-input-latency < one frame*, measured with a typometer against the live window), and
   glyph shaping/atlas upload (amortized by the render cache). Those are separate metrics.
 
-## Wiring into CI (follow-up)
+## Wiring into CI (trend, non-gating)
 
-The intent (PLAN.md §N6) is to **trend** this in CI rather than gate on it. A non-blocking job
-that runs `sampa2 --bench` on a fixed runner and records the MiB/s into a trend artifact is the
-natural next step; this page is the reference the trend is read against.
+The `bench` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) **trends** this
+rather than gating on it:
+
+1. It runs `sampa2 --bench 50 --out perf-metrics.json` on `ubuntu-latest` and uploads
+   `perf-metrics.json` as an artifact every run.
+2. Before benching, it downloads the most recent **successful run on the base branch** (same
+   runner class, so the numbers are comparable) and passes that run's `mib_per_s` as
+   `--baseline`. The run Summary then shows the signed %Δ.
+3. A drop of more than **10 %** is marked `⚠ regression (advisory)` — printed, never failed on.
+   The job carries no `-D`/exit-on-regression; it is a signal, not a gate.
+
+Because the baseline is the previous CI run (not a number baked into the repo), the trend
+follows the runner's own hardware and needs no manual upkeep. The **first** run on a branch —
+and a fork PR whose token can't read Actions — simply has no baseline and skips the trend line.
+The `~82–87 MiB/s` figure above is the local reference; CI's absolute numbers depend on the
+runner and are meaningful **relative to the previous run**, which is the point of a trend.
