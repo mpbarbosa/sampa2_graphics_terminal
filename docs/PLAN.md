@@ -259,7 +259,10 @@ interactive pass + wider program coverage outstanding.)*
   diagnostics** — a `[keybindings]` entry naming an unknown action, or a chord that doesn't
   parse (a typo like `Ctrl+Shft+C`), is printed to stderr at startup and on live reload
   (`keybinding_diagnostics`, unit-tested) instead of being silently ignored / left unbound; a
-  valid override stays quiet. ⬜ still: a ✕ button.
+  valid override stays quiet. ✅ **✕ close button** — a muted `✕` in the help overlay's
+  top-right corner (`HELP_CLOSE_W`, its own shaped buffer) gives the modal a discoverable
+  close affordance; clicking it dismisses the overlay via the existing backdrop-to-close.
+  Xephyr-verified (the ✕ renders and clicking it closes the help).
 
 **Exit:** a config edit hot-reloads theme/font/cursor; a Powerline + truecolor prompt
 renders; tabs run independent shells; search highlights scrollback matches.
