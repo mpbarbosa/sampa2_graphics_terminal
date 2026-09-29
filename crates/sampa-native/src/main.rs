@@ -2590,6 +2590,9 @@ fn main() -> Result<()> {
         palette_all: Vec::new(),
         palette_filtered: Vec::new(),
         palette_idx: 0,
+        palette_frecency: PaletteFrecency::path()
+            .map(|p| PaletteFrecency::load(&p))
+            .unwrap_or_default(),
         man_on: false,
         man_cmd: String::new(),
         man_lines: Vec::new(),
@@ -3081,6 +3084,7 @@ struct App {
     palette_all: Vec<String>,
     palette_filtered: Vec<PaletteMatch>,
     palette_idx: usize,
+    palette_frecency: PaletteFrecency, // recency-weighted use counts for palette ordering
     // man panel
     man_on: bool,
     man_cmd: String,
@@ -3598,28 +3602,132 @@ fn score_command(cmd: &str, tokens: &[Vec<char>]) -> Option<(f64, Vec<usize>)> {
 /// Rank `all` against `query` per the palette-search spec: whitespace-split into tokens
 /// (AND), tiered scoring, best-first (stable so ties keep input order), capped at `max`.
 /// An empty query returns the head of the list with no hits (the full command list).
-fn filter_commands(all: &[String], query: &str, max: usize) -> Vec<PaletteMatch> {
+/// Recency-weighted use count for palette **frecency** ordering: a command's raw `count`
+/// scaled by how recently it was last picked, so a command used a lot long ago still yields
+/// to one used a little just now. Buckets (like Firefox's frecency): <1h ×4, <1d ×2, <1wk ×1,
+/// older ×0.3. Pure, so the ranking is unit-tested. A `last` in the future clamps to "just now".
+fn frecency_score(count: u32, last_unix: u64, now_unix: u64) -> f64 {
+    if count == 0 {
+        return 0.0;
+    }
+    let age = now_unix.saturating_sub(last_unix);
+    let recency = if age < 3_600 {
+        4.0
+    } else if age < 86_400 {
+        2.0
+    } else if age < 604_800 {
+        1.0
+    } else {
+        0.3
+    };
+    count as f64 * recency
+}
+
+/// Persistent palette usage for frecency ordering: command name → (pick count, last-used unix).
+/// Stored as one `name\tcount\tlast` TSV row per command under `$XDG_STATE_HOME/sampa2/`.
+#[derive(Default)]
+struct PaletteFrecency {
+    uses: std::collections::HashMap<String, (u32, u64)>,
+}
+
+impl PaletteFrecency {
+    /// Frecency file path: `$XDG_STATE_HOME/sampa2/palette-frecency.tsv`, falling back to
+    /// `$HOME/.local/state/sampa2/…` (XDG state dir — usage data, not config or cache).
+    fn path() -> Option<std::path::PathBuf> {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state")))?;
+        Some(base.join("sampa2").join("palette-frecency.tsv"))
+    }
+
+    /// Load from the given TSV path; fails safe to empty (missing file, unreadable, bad rows).
+    fn load(path: &std::path::Path) -> Self {
+        let mut uses = std::collections::HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for line in text.lines() {
+                let mut f = line.split('\t');
+                if let (Some(name), Some(c), Some(l)) = (f.next(), f.next(), f.next()) {
+                    if let (Ok(count), Ok(last)) = (c.parse::<u32>(), l.parse::<u64>()) {
+                        if !name.is_empty() {
+                            uses.insert(name.to_string(), (count, last));
+                        }
+                    }
+                }
+            }
+        }
+        PaletteFrecency { uses }
+    }
+
+    /// Record one pick of `name` at `now` (increment count, refresh the timestamp).
+    fn bump(&mut self, name: &str, now: u64) {
+        let e = self.uses.entry(name.to_string()).or_insert((0, now));
+        e.0 = e.0.saturating_add(1);
+        e.1 = now;
+    }
+
+    /// Frecency of `name` at `now` (0 if never picked).
+    fn score(&self, name: &str, now: u64) -> f64 {
+        self.uses.get(name).map_or(0.0, |&(c, l)| frecency_score(c, l, now))
+    }
+
+    /// Write the TSV back (creating the parent dir). Best-effort; a write failure is ignored so
+    /// the palette never breaks on a read-only state dir.
+    fn save(&self, path: &std::path::Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut out = String::new();
+        for (name, (c, l)) in &self.uses {
+            out.push_str(&format!("{name}\t{c}\t{l}\n"));
+        }
+        let _ = std::fs::write(path, out);
+    }
+}
+
+/// Current unix time in seconds (0 if the clock is before the epoch — only affects ordering).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Filter + rank commands for the palette. `frec` gives each command's frecency (recency-
+/// weighted use count). With no query, the list is ordered by frecency (used commands first,
+/// the rest in input order). With a query, fuzzy relevance is primary and frecency only breaks
+/// ties — a used command outranks an equally-good unused one, but never a better match.
+fn filter_commands(all: &[String], query: &str, max: usize, frec: impl Fn(&str) -> f64) -> Vec<PaletteMatch> {
     let tokens: Vec<Vec<char>> = query
         .split_whitespace()
         .map(|t| t.chars().map(|c| c.to_ascii_lowercase()).collect())
         .collect();
     if tokens.is_empty() {
-        return all
-            .iter()
+        // Stable sort by frecency desc; unused commands (score 0) keep input (alphabetical) order.
+        let mut ranked: Vec<&String> = all.iter().collect();
+        ranked.sort_by(|a, b| {
+            frec(b).partial_cmp(&frec(a)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        return ranked
+            .into_iter()
             .take(max)
             .map(|c| PaletteMatch { name: c.clone(), hits: Vec::new() })
             .collect();
     }
-    let mut scored: Vec<(f64, &String, Vec<usize>)> = all
+    let mut scored: Vec<(f64, f64, &String, Vec<usize>)> = all
         .iter()
-        .filter_map(|c| score_command(c, &tokens).map(|(s, h)| (s, c, h)))
+        .filter_map(|c| score_command(c, &tokens).map(|(s, h)| (s, frec(c), c, h)))
         .collect();
-    // Stable sort by score desc; equal scores retain input order (spec §5.2).
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Fuzzy score primary (desc), frecency secondary (desc), then input order (spec §5.2).
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
     scored
         .into_iter()
         .take(max)
-        .map(|(_, c, h)| PaletteMatch { name: c.clone(), hits: h })
+        .map(|(_, _, c, h)| PaletteMatch { name: c.clone(), hits: h })
         .collect()
 }
 
@@ -5132,8 +5240,12 @@ impl App {
     }
 
     /// Re-run the fuzzy filter for the current query and reset the selection to the top.
+    /// Frecency (recency-weighted use count) orders an empty query and breaks fuzzy-score ties.
     fn palette_refilter(&mut self) {
-        self.palette_filtered = filter_commands(&self.palette_all, &self.palette_query, PALETTE_MAX);
+        let now = now_unix();
+        let frec = &self.palette_frecency;
+        self.palette_filtered =
+            filter_commands(&self.palette_all, &self.palette_query, PALETTE_MAX, |c| frec.score(c, now));
         self.palette_idx = 0;
         self.request_redraw();
     }
@@ -5156,9 +5268,14 @@ impl App {
     /// Deliberately does not append a newline — the user reviews/adds args and runs it.
     fn palette_run(&mut self) {
         if let Some(m) = self.palette_filtered.get(self.palette_idx) {
-            let bytes = format!("{} ", m.name).into_bytes();
-            self.pty_write(&bytes);
+            let name = m.name.clone();
+            self.pty_write(format!("{name} ").as_bytes());
             self.scroll(Scroll::Bottom);
+            // Record the pick so it ranks higher next time, and persist it.
+            self.palette_frecency.bump(&name, now_unix());
+            if let Some(p) = PaletteFrecency::path() {
+                self.palette_frecency.save(&p);
+            }
         }
         self.palette_close();
     }
@@ -10520,7 +10637,7 @@ fn capture(path: &str) -> Result<()> {
     let demo_search = std::env::var("SAMPA_CAPTURE_SEARCH").ok().filter(|s| !s.is_empty());
     // Rank the demo rows against the demo query so highlighting shows in the capture.
     let demo_matches: Vec<PaletteMatch> = if demo_pal.len() > 1 {
-        filter_commands(&demo_pal[1..], &demo_pal[0], PALETTE_MAX)
+        filter_commands(&demo_pal[1..], &demo_pal[0], PALETTE_MAX, |_| 0.0)
     } else {
         Vec::new()
     };
@@ -10744,7 +10861,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let out = filter_commands(&all, "grep", PALETTE_MAX);
+        let out = filter_commands(&all, "grep", PALETTE_MAX, |_| 0.0);
         let names: Vec<&str> = out.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names[0], "grep", "exact match first: {names:?}");
         assert_eq!(names[1], "grepdiff", "prefix next: {names:?}");
@@ -10764,15 +10881,64 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         // Both tokens must match; hits are the union.
-        let out = filter_commands(&all, "git grep", PALETTE_MAX);
+        let out = filter_commands(&all, "git grep", PALETTE_MAX, |_| 0.0);
         assert_eq!(out.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["git-grep"]);
-        assert_eq!(filter_commands(&all, "doc comp", PALETTE_MAX)[0].name, "docker-compose");
+        assert_eq!(filter_commands(&all, "doc comp", PALETTE_MAX, |_| 0.0)[0].name, "docker-compose");
         // Empty query lists all with no hits.
-        let empty = filter_commands(&all, "", PALETTE_MAX);
+        let empty = filter_commands(&all, "", PALETTE_MAX, |_| 0.0);
         assert_eq!(empty.len(), all.len());
         assert!(empty.iter().all(|m| m.hits.is_empty()));
         // Case-insensitive.
-        assert_eq!(filter_commands(&all, "GREP", PALETTE_MAX)[0].name, "grep");
+        assert_eq!(filter_commands(&all, "GREP", PALETTE_MAX, |_| 0.0)[0].name, "grep");
+    }
+
+    #[test]
+    fn frecency_weights_recency_over_raw_count() {
+        let now = 1_000_000u64;
+        // Used once a minute ago (×4) beats used twice a week+ ago (×0.3).
+        assert!(frecency_score(1, now - 60, now) > frecency_score(2, now - 700_000, now));
+        // Same recency bucket → more uses ranks higher.
+        assert!(frecency_score(5, now - 10, now) > frecency_score(1, now - 10, now));
+        // Never-used is zero; a future timestamp clamps to "just now" (age 0), never negative.
+        assert_eq!(frecency_score(0, now, now), 0.0);
+        assert_eq!(frecency_score(3, now + 999, now), 3.0 * 4.0);
+    }
+
+    #[test]
+    fn palette_frecency_orders_and_breaks_ties() {
+        let all: Vec<String> = ["alpha", "beta", "grep", "gron"].iter().map(|s| s.to_string()).collect();
+        let now = 1_000u64;
+        let mut f = PaletteFrecency::default();
+        f.bump("beta", now); // beta was picked → floats to the top of an empty query
+        let frec = |c: &str| f.score(c, now);
+        let empty = filter_commands(&all, "", PALETTE_MAX, frec);
+        assert_eq!(empty[0].name, "beta");
+        // The unused commands keep their input (alphabetical) order after it.
+        assert_eq!(empty[1].name, "alpha");
+        // With a query, fuzzy relevance stays primary: "gro" matches only "gron" regardless of
+        // frecency; but between two equally-good matches, the used one wins the tie.
+        let mut f2 = PaletteFrecency::default();
+        f2.bump("gron", now);
+        let out = filter_commands(&all, "gr", PALETTE_MAX, |c| f2.score(c, now));
+        // both "grep" and "gron" match "gr" as a prefix (equal score) → the picked "gron" leads.
+        assert_eq!(out[0].name, "gron");
+    }
+
+    #[test]
+    fn palette_frecency_tsv_round_trips() {
+        let dir = std::env::temp_dir().join(format!("sampa-frec-{}", std::process::id()));
+        let path = dir.join("palette-frecency.tsv");
+        let mut f = PaletteFrecency::default();
+        f.bump("cargo", 111);
+        f.bump("cargo", 222); // count 2, last 222
+        f.bump("git", 150);
+        f.save(&path);
+        let loaded = PaletteFrecency::load(&path);
+        assert_eq!(loaded.uses.get("cargo"), Some(&(2, 222)));
+        assert_eq!(loaded.uses.get("git"), Some(&(1, 150)));
+        // A missing file loads empty (fail-safe), never errors.
+        assert!(PaletteFrecency::load(&dir.join("nope.tsv")).uses.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // §17 exit criterion: a command previewed by the native build never mutates the
