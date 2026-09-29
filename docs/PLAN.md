@@ -145,7 +145,13 @@ engine is now ours to prove.
   render (`in_selection` block membership) and copy (`selection_to_string`) were already
   block-aware, so it's the drag-start type that changed (`selection_type_for_click`).
   Unit-tested (rectangular membership + modifier-wins-over-count); Xephyr-verified (Alt-drag
-  over a column copies just that column). ⬜ still: X11 PRIMARY split.
+  over a column copies just that column). ✅ **PRIMARY selection** — a selection now also owns
+  the X11/Wayland **PRIMARY** selection (`set_primary`, via `arboard`'s `LinuxClipboardKind`),
+  and **middle-click pastes PRIMARY** (`paste_primary`, falling back to CLIPBOARD), so
+  select-to-copy / middle-click-paste interop with other apps works both ways; CLIPBOARD is
+  still set on select (a Sampa nicety) and both paste sources share the multi-line confirm
+  guard. Xephyr-verified (select in Sampa → `xclip -selection primary` reads it; an external
+  PRIMARY → middle-click pastes it).
 - ✅ **Scrollback scrolling** (10k-line history): **wheel** (3 lines/notch) and
   **Shift+PageUp/PageDown**; display-offset-aware rendering (negative lines = history);
   typing snaps to the live prompt; disabled on the alt screen. Unit test covers the

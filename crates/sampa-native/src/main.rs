@@ -4716,7 +4716,7 @@ impl App {
                 self.request_redraw();
             }
             MouseButton::Left => self.copy_selection(), // release: auto-copy
-            MouseButton::Middle if pressed => self.paste_clipboard(),
+            MouseButton::Middle if pressed => self.paste_primary(), // X11 middle-click paste
             _ => {}
         }
     }
@@ -4734,22 +4734,68 @@ impl App {
 
     fn copy_selection(&mut self) {
         let text = self.state.lock().ok().and_then(|g| g.term.selection_to_string());
-        if let (Some(text), Some(clip)) = (text, self.clipboard.as_mut()) {
+        if let Some(text) = text {
             if !text.is_empty() {
-                let _ = clip.set_text(text);
+                if let Some(clip) = self.clipboard.as_mut() {
+                    let _ = clip.set_text(text.clone());
+                }
+                // Also own the X11/Wayland PRIMARY selection so other apps (and our own
+                // middle-click) can paste the highlight without an explicit copy — the
+                // select-to-copy / middle-click-paste convention.
+                self.set_primary(&text);
             }
         }
     }
 
+    /// Publish `text` to the PRIMARY selection (the middle-click paste source), separate from
+    /// the CLIPBOARD. Linux-only; a no-op elsewhere. Our `arboard::Clipboard` holds the
+    /// selection for as long as the app runs, so other X clients can request it.
+    fn set_primary(&mut self, text: &str) {
+        #[cfg(target_os = "linux")]
+        if let Some(clip) = self.clipboard.as_mut() {
+            use arboard::{LinuxClipboardKind, SetExtLinux};
+            let _ = clip.set().clipboard(LinuxClipboardKind::Primary).text(text.to_owned());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = text;
+    }
+
+    /// Read the PRIMARY selection (middle-click paste), falling back to the CLIPBOARD when
+    /// PRIMARY is empty or unavailable (e.g. non-Linux, or nothing selected anywhere).
+    fn get_primary(&mut self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        if let Some(clip) = self.clipboard.as_mut() {
+            use arboard::{GetExtLinux, LinuxClipboardKind};
+            if let Ok(t) = clip.get().clipboard(LinuxClipboardKind::Primary).text() {
+                if !t.is_empty() {
+                    return Some(t);
+                }
+            }
+        }
+        self.clipboard.as_mut().and_then(|c| c.get_text().ok())
+    }
+
+    /// Paste from the CLIPBOARD (Ctrl+Shift+V).
     fn paste_clipboard(&mut self) {
-        let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) else {
-            return;
-        };
+        if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
+            self.paste_text(text);
+        }
+    }
+
+    /// Paste from the PRIMARY selection (middle-click) — the X11 select-to-paste convention.
+    fn paste_primary(&mut self) {
+        if let Some(text) = self.get_primary() {
+            self.paste_text(text);
+        }
+    }
+
+    /// Common paste path: strip the injection marker, then either send or (for a risky
+    /// multi-line paste into a non-bracketed app) raise the confirm modal. Shared by the
+    /// clipboard and primary paste sources so both get the §13 guard.
+    fn paste_text(&mut self, text: String) {
         // Strip any embedded paste-end marker (§13 paste-injection guard).
         let clean = text.replace("\x1b[201~", "");
         let bracketed = self.term_mode().contains(TermMode::BRACKETED_PASTE);
-        // Multi-line paste into a non-bracketed app (a bare shell prompt) would run each line
-        // immediately. Hold it behind a confirm modal so the user sees what will run (§13).
         if paste_needs_confirm(&clean, bracketed) {
             self.paste_confirm = Some(clean);
             self.request_redraw();
