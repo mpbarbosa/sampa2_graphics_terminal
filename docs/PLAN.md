@@ -307,7 +307,11 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
   line (**after Enter**) clears it. **Re-asserted filesystem-verified**: a native
   integration test drives the exact `run_preview` call on `rm`/`mv`/redirect/`find -delete`/
   `&&`-chains and proves the victim file is byte-for-byte untouched while `cat` runs.
-  Exact command capture uses OSC-133 when the shell hooks are active (see below). ⬜ still: scroll.
+  Exact command capture uses OSC-133 when the shell hooks are active (see below). ✅ **scroll** —
+  a long preview output scrolls with the **mouse wheel** (the panel isn't modal, so keys keep
+  typing the command); the header shows `start–end/total · wheel scrolls` and the window clamps
+  to the ends. `scroll_offset` unit-tested; Xephyr-verified (`seq 1 40` → wheel walks `1–12/40`
+  down to `37–40/40`).
 - ✅ **Opt-in shell integration** — `shell-integration/sampa.{zsh,bash}` emit OSC 7 (cwd) +
   OSC 133 prompt marks (`A` prompt / `B` command / `C` output / `D` done), gated to
   `TERM_PROGRAM=sampa-terminal` (set by pty-core) so they no-op elsewhere. Enable via
