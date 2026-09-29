@@ -273,7 +273,13 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
   clipped below the panel and images/decorations/cursor are suppressed under it so nothing
   shows through. `score_token`/`score_command`/`filter_commands`/`palette_window`
   unit-tested (incl. spec acceptance cases); rendered + verified via `--capture`.
-  ⬜ still: run-immediately affordance, recent/frecency ordering.
+  ✅ **frecency ordering** — picking a command records a recency-weighted use count
+  (`frecency_score`: <1h ×4, <1d ×2, <1wk ×1, older ×0.3), persisted to
+  `$XDG_STATE_HOME/sampa2/palette-frecency.tsv`. An **empty** query then lists the
+  most-frecent commands first (the rest stay alphabetical); with a query, fuzzy relevance
+  stays primary and frecency only **breaks ties**. `frecency_score` + the TSV round-trip +
+  the ordering/tiebreak are unit-tested; Xephyr-verified (picking `zsh` floats it from
+  alphabetically-last to the top of the next open). ⬜ still: run-immediately affordance.
 - ✅ **Man panel** (`sampa-man`): `Ctrl+Shift+M` opens a bottom panel with the man page
   for the **first token of the current command line** (tracked from typed keystrokes,
   `sudo`/`command`/`\` stripped; reset on Enter). `man -P cat <cmd>` runs on a
