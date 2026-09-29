@@ -1409,9 +1409,12 @@ impl ImageScanner {
         out
     }
 
-    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+    /// Yields `(offset, payload)` for each completed OSC-1337 image, where `offset` is the
+    /// index just past the terminator — the point the pump advances the VT engine to before
+    /// reading the cursor, so each image anchors where its sequence actually sits.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<(usize, Vec<u8>)> {
         let mut out = Vec::new();
-        for &b in bytes {
+        for (i, &b) in bytes.iter().enumerate() {
             match self.state {
                 OscState::Ground => {
                     if b == 0x1b {
@@ -1424,12 +1427,12 @@ impl ImageScanner {
                     _ => self.state = OscState::Ground,
                 },
                 OscState::Osc => match b {
-                    0x07 => out.extend(self.finish()), // BEL terminator
+                    0x07 => out.extend(self.finish().map(|p| (i + 1, p))), // BEL terminator
                     0x1b => self.state = OscState::EscInOsc,
                     _ => self.push(b),
                 },
                 OscState::EscInOsc => match b {
-                    b'\\' => out.extend(self.finish()), // ST terminator
+                    b'\\' => out.extend(self.finish().map(|p| (i + 1, p))), // ST terminator
                     _ => {
                         self.buf = Vec::new();
                         self.state = if b == 0x1b { OscState::Esc } else { OscState::Ground };
@@ -1603,9 +1606,12 @@ impl SixelScanner {
         out
     }
 
-    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+    /// Yields `(offset, payload)` for each completed sixel DCS, where `offset` is the index
+    /// just past the terminator — where the pump advances the engine to before reading the
+    /// cursor, so multiple sixels in one write anchor independently.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<(usize, Vec<u8>)> {
         let mut out = Vec::new();
-        for &b in bytes {
+        for (i, &b) in bytes.iter().enumerate() {
             match self.state {
                 DcsState::Ground => {
                     if b == 0x1b {
@@ -1622,7 +1628,7 @@ impl SixelScanner {
                     _ => self.state = DcsState::Ground,
                 },
                 DcsState::Dcs => match b {
-                    0x07 => out.extend(self.finish()),
+                    0x07 => out.extend(self.finish().map(|p| (i + 1, p))),
                     0x1b => self.state = DcsState::EscInDcs,
                     _ => {
                         if self.buf.len() < MAX_SIXEL_BYTES {
@@ -1633,7 +1639,7 @@ impl SixelScanner {
                     }
                 },
                 DcsState::EscInDcs => match b {
-                    b'\\' => out.extend(self.finish()),
+                    b'\\' => out.extend(self.finish().map(|p| (i + 1, p))),
                     _ => {
                         self.buf.clear();
                         self.state = if b == 0x1b { DcsState::Esc } else { DcsState::Ground };
@@ -1744,8 +1750,10 @@ impl KittyScanner {
         Self::default()
     }
 
-    /// Process one completed APC body (the bytes between `ESC _` and `ST`).
-    fn complete(&mut self, out: &mut Vec<(String, Vec<u8>)>) {
+    /// Process one completed APC body (the bytes between `ESC _` and `ST`). `pos` is the
+    /// offset just past the terminator; a completed image is emitted at that offset (for a
+    /// chunked image, the offset of its *final* chunk — where the whole image lands).
+    fn complete(&mut self, pos: usize, out: &mut Vec<(usize, (String, Vec<u8>))>) {
         let buf = std::mem::take(&mut self.buf);
         self.state = DcsState::Ground;
         if self.over {
@@ -1766,19 +1774,22 @@ impl KittyScanner {
             self.pending_payload.extend_from_slice(&payload);
             if !more {
                 let ctrl = self.pending_control.take().unwrap();
-                out.push((ctrl, std::mem::take(&mut self.pending_payload)));
+                out.push((pos, (ctrl, std::mem::take(&mut self.pending_payload))));
             }
         } else if more {
             self.pending_control = Some(control);
             self.pending_payload = payload;
         } else {
-            out.push((control, payload));
+            out.push((pos, (control, payload)));
         }
     }
 
-    fn feed(&mut self, bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    /// Yields `(offset, (control, payload))` for each completed kitty APC, `offset` being the
+    /// index just past the terminator — where the pump advances the engine to before placing,
+    /// so multiple placements in one write anchor independently.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<(usize, (String, Vec<u8>))> {
         let mut out = Vec::new();
-        for &b in bytes {
+        for (i, &b) in bytes.iter().enumerate() {
             match self.state {
                 DcsState::Ground => {
                     if b == 0x1b {
@@ -1795,7 +1806,7 @@ impl KittyScanner {
                     _ => self.state = DcsState::Ground,
                 },
                 DcsState::Dcs => match b {
-                    0x07 => self.complete(&mut out),
+                    0x07 => self.complete(i + 1, &mut out),
                     0x1b => self.state = DcsState::EscInDcs,
                     _ => {
                         if self.buf.len() < MAX_KITTY_BYTES {
@@ -1806,7 +1817,7 @@ impl KittyScanner {
                     }
                 },
                 DcsState::EscInDcs => match b {
-                    b'\\' => self.complete(&mut out),
+                    b'\\' => self.complete(i + 1, &mut out),
                     _ => {
                         self.buf.clear();
                         self.state = if b == 0x1b { DcsState::Esc } else { DcsState::Ground };
@@ -2668,6 +2679,250 @@ fn spawn_session(
     Ok(Session { id, state, pty, images, app_rx, title: "shell".to_string() })
 }
 
+/// One out-of-band event the VT engine leaves unhandled, tagged with the byte offset it
+/// occurs at within a PTY chunk. Merged across the control-sequence scanner (DECRQCRA et
+/// al.) and the three image scanners so the engine can be advanced to each in stream order.
+enum StreamEvent {
+    /// A control sequence alacritty ignores (checksum request, soft reset, resize, …).
+    Ctrl(ScanEvent),
+    /// An iTerm2 OSC-1337 inline image (raw payload).
+    ItermImage(Vec<u8>),
+    /// A sixel DCS image (raw payload).
+    Sixel(Vec<u8>),
+    /// A kitty graphics APC (control string, base64 payload).
+    Kitty(String, Vec<u8>),
+}
+
+/// Everything one PTY chunk produces that the pump must apply after releasing the state
+/// lock: replies to write back, images to add, kitty deletes, and a pending PTY resize.
+#[derive(Default)]
+struct ChunkOutput {
+    replies: Vec<Vec<u8>>,
+    image_adds: Vec<PendingImage>,
+    kitty_deletes: Vec<String>,
+    pty_resize: Option<(u16, u16)>,
+}
+
+/// Advance the VT engine through one PTY `bytes` chunk, interleaving the out-of-band
+/// scanners so each is handled at its exact byte offset. Control sequences (DECRQCRA,
+/// resize, …) and the three image protocols (iTerm2/sixel/kitty) all read the *live*
+/// cursor/grid where their sequence actually sits in the stream — so several images in a
+/// single write anchor independently rather than all landing at the chunk's final cursor.
+fn process_chunk(
+    g: &mut TermState,
+    bytes: &[u8],
+    reply_rx: &Receiver<Reply>,
+    store: &Mutex<ImageStore>,
+) -> ChunkOutput {
+    let mut out = ChunkOutput::default();
+    let replies = &mut out.replies;
+    // Kitty acks are collected here and appended after the DECRQSS replies below, preserving
+    // the original reply order (control/DA/DSR/checksum, then DECRQSS, then kitty acks) even
+    // though placement is now interleaved with parsing.
+    let mut kitty_acks: Vec<Vec<u8>> = Vec::new();
+
+    // Merge every scanner's events into one offset-ordered timeline. Each `(offset, event)`
+    // marks a point the engine must be advanced up to before the event is acted on; the
+    // scanners are pure over the bytes, so they can run up-front in any order.
+    let mut timeline: Vec<(usize, StreamEvent)> = Vec::new();
+    timeline.extend(g.decrqcra.feed(bytes).into_iter().map(|(p, e)| (p, StreamEvent::Ctrl(e))));
+    timeline.extend(
+        g.image_scanner.feed(bytes).into_iter().map(|(p, pl)| (p, StreamEvent::ItermImage(pl))),
+    );
+    timeline.extend(g.sixel.feed(bytes).into_iter().map(|(p, pl)| (p, StreamEvent::Sixel(pl))));
+    timeline.extend(
+        g.kitty.feed(bytes).into_iter().map(|(p, (c, pl))| (p, StreamEvent::Kitty(c, pl))),
+    );
+    // Stable sort by offset: the (rare, benign) tie between a control event and an image at
+    // the same offset keeps the control event first, matching the extend order above.
+    timeline.sort_by_key(|(p, _)| *p);
+
+    let mut cursor = 0;
+    for (pos, ev) in timeline {
+        g.parser.advance(&mut g.term, &bytes[cursor..pos]);
+        cursor = pos;
+        match ev {
+            StreamEvent::Ctrl(ScanEvent::Decrqcra(req)) => {
+                // DA/DSR/color replies queued so far, then the checksum.
+                replies.extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
+                replies.push(compute_decrqcra(&g.term, &req));
+            }
+            // alacritty ignores DECSTR — apply the soft reset ourselves.
+            StreamEvent::Ctrl(ScanEvent::Decstr) => g.parser.advance(&mut g.term, DECSTR_RESET),
+            // Selective erase → plain ED/EL at the cursor (no protection).
+            StreamEvent::Ctrl(ScanEvent::SelectiveErase { line, ps }) => {
+                let fin = if line { 'K' } else { 'J' };
+                g.parser.advance(&mut g.term, format!("\x1b[{ps}{fin}").as_bytes());
+            }
+            // Record a modifiable mode's set/reset for DECRQM reporting.
+            StreamEvent::Ctrl(ScanEvent::SetMode { dec, mode, set }) => {
+                g.decrqm_shadow.insert((dec, mode), set);
+            }
+            // OSC 133 shell-integration marker. `B` (command-start) records the cursor as the
+            // command's start; any other marker (prompt start / executed / finished) means
+            // we're no longer editing a command, so clear it. The parser has already consumed
+            // up to here, so the cursor is exactly at the command's first column.
+            StreamEvent::Ctrl(ScanEvent::Osc133 { kind }) => {
+                g.cmd_start = (kind == b'B').then(|| {
+                    let p = g.term.renderable_content().cursor.point;
+                    (p.line.0, p.column.0)
+                });
+            }
+            // alacritty ignores XTWINOPS resize — resize the grid here, and remember to
+            // resize the PTY once we release the lock. `None` dimensions keep the current
+            // extent; values are clamped to a sane range (§13 OOM guard).
+            StreamEvent::Ctrl(ScanEvent::Resize { rows, cols }) => {
+                let (cur_cols, cur_rows) =
+                    (g.term.grid().columns() as u16, g.term.grid().screen_lines() as u16);
+                let cols = cols.unwrap_or(cur_cols).clamp(1, 1000);
+                let rows = rows.unwrap_or(cur_rows).clamp(1, 1000);
+                g.term.resize(TermSize::new(cols as usize, rows as usize));
+                out.pty_resize = Some((cols, rows));
+            }
+            // Pixel resize → cells against the fixed cell metrics.
+            StreamEvent::Ctrl(ScanEvent::ResizePixels { h, w }) => {
+                let (cur_cols, cur_rows) =
+                    (g.term.grid().columns() as u16, g.term.grid().screen_lines() as u16);
+                let cols = w.map(|w| w / CELL_W_PX).unwrap_or(cur_cols).clamp(1, 1000);
+                let rows = h.map(|h| h / CELL_H_PX).unwrap_or(cur_rows).clamp(1, 1000);
+                g.term.resize(TermSize::new(cols as usize, rows as usize));
+                out.pty_resize = Some((cols, rows));
+            }
+            // alacritty ignores ?1048 — apply the equivalent DECSC/DECRC.
+            StreamEvent::Ctrl(ScanEvent::SaveRestoreCursor { save }) => {
+                g.parser.advance(&mut g.term, if save { b"\x1b7" } else { b"\x1b8" });
+            }
+            // DECDSR device-status report — answered from fixed values, DECXCPR from the
+            // live cursor; after earlier queued replies.
+            StreamEvent::Ctrl(ScanEvent::Decdsr { ps, pid }) => {
+                replies.extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
+                let p = g.term.renderable_content().cursor.point;
+                let (row, col) = ((p.line.0 + 1).max(1) as u16, (p.column.0 + 1) as u16);
+                if let Some(reply) = decdsr_reply(ps, pid, row, col) {
+                    replies.push(reply);
+                }
+            }
+            // Size/state report — answered from the live grid + metrics, after any
+            // DA/DSR/color replies queued earlier in the chunk.
+            StreamEvent::Ctrl(ScanEvent::WinopReport(op)) => {
+                replies.extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
+                let (cols, rows) =
+                    (g.term.grid().columns() as u16, g.term.grid().screen_lines() as u16);
+                replies.push(winop_report(op, cols, rows));
+            }
+            // Inline image (iTerm2 OSC 1337): decode, anchor at the live cursor, and reserve
+            // vertical space so following text flows below.
+            StreamEvent::ItermImage(payload) => {
+                if let Some(img) = parse_iterm_image(&payload) {
+                    let cur = g.term.renderable_content().cursor.point;
+                    let (anchor, col) = (cur.line.0, cur.column.0);
+                    let base = g.term.grid().history_size();
+                    let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
+                    g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
+                    out.image_adds.push(PendingImage {
+                        anchor,
+                        base_history: base,
+                        col,
+                        kitty_id: None,
+                        disp_cols: None,
+                        disp_rows: None,
+                        z: 0,
+                        img,
+                    });
+                }
+            }
+            // Sixel graphics (DCS): rasterize + place like an inline image.
+            StreamEvent::Sixel(payload) => {
+                if let Some(img) = parse_sixel(&payload) {
+                    let cur = g.term.renderable_content().cursor.point;
+                    let (anchor, col) = (cur.line.0, cur.column.0);
+                    let base = g.term.grid().history_size();
+                    let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
+                    g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
+                    out.image_adds.push(PendingImage {
+                        anchor,
+                        base_history: base,
+                        col,
+                        kitty_id: None,
+                        disp_cols: None,
+                        disp_rows: None,
+                        z: 0,
+                        img,
+                    });
+                }
+            }
+            // Kitty graphics (APC): decode chunked transmissions, place at the live cursor,
+            // and ack.
+            StreamEvent::Kitty(control, payload) => {
+                kitty_acks.extend(kitty_response(&control));
+                let kid = kitty_num(&control, "i");
+                // `c=`/`r=` request a display size in cells (placement geometry);
+                // `z=` is the stacking order (higher on top, negative under the text).
+                let (dc, dr) = (kitty_num(&control, "c"), kitty_num(&control, "r"));
+                let z = kitty_inum(&control, "z").unwrap_or(0);
+                // Action selects behaviour (kitty default is transmit): `T` display,
+                // `t` transmit-and-store, `p` place a stored image, `d` delete.
+                match kitty_key(&control, "a").unwrap_or("t") {
+                    action @ ("T" | "t") => {
+                        if let Some(img) = decode_kitty_payload(&control, &payload) {
+                            // Retain by id so a later `a=p` can place it again.
+                            if let Some(id) = kid {
+                                if g.kitty_images.len() >= MAX_KITTY_STORED
+                                    && !g.kitty_images.contains_key(&id)
+                                {
+                                    if let Some(&k) = g.kitty_images.keys().next() {
+                                        g.kitty_images.remove(&k);
+                                    }
+                                }
+                                g.kitty_images.insert(id, img.clone());
+                            }
+                            if action == "T" {
+                                place_kitty(
+                                    g, &mut out.image_adds, store, &control, kid, dc, dr, z, img,
+                                );
+                            }
+                        }
+                    }
+                    "p" => {
+                        // Place a previously-transmitted image by id (with `c=`/`r=`).
+                        if let Some(img) = kid.and_then(|id| g.kitty_images.get(&id).cloned()) {
+                            place_kitty(
+                                g, &mut out.image_adds, store, &control, kid, dc, dr, z, img,
+                            );
+                        }
+                    }
+                    // `a=d` delete request — applied to the shared store below.
+                    "d" => out.kitty_deletes.push(control),
+                    _ => {}
+                }
+            }
+        }
+    }
+    g.parser.advance(&mut g.term, &bytes[cursor..]);
+    replies.extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
+
+    // DECRQSS status-string queries (unhandled by the engine). No cursor dependency, so
+    // scanned over the whole chunk after parsing.
+    for pt in g.dcs.feed(bytes) {
+        replies.push(decrqss_reply(&pt, &g.term));
+    }
+    // Kitty acks last, in stream order (their timeline is position-sorted) — matching the
+    // original ordering where the kitty loop ran after DECRQSS.
+    replies.append(&mut kitty_acks);
+
+    // Correct alacritty's DECRQM replies (§17): permanently-reset modes 0→4, and shadowed
+    // modifiable modes to their tracked set/reset state. Done on the outgoing bytes, keyed
+    // by the reply's own mode number.
+    for r in replies.iter_mut() {
+        if let Some(fixed) =
+            decrqm_perm_reset(r).or_else(|| decrqm_modifiable(r, &g.decrqm_shadow))
+        {
+            *r = fixed;
+        }
+    }
+    out
+}
+
 fn pump(
     rx: Receiver<PtyEvent>,
     state: Arc<Mutex<TermState>>,
@@ -2683,198 +2938,12 @@ fn pump(
                 // Collect every reply this chunk produces, in stream order, then write
                 // them back to the PTY synchronously (a query must be answered before
                 // the next output byte is processed — that's what apps block on).
-                let mut replies: Vec<Vec<u8>> = Vec::new();
-                let mut pty_resize: Option<(u16, u16)> = None;
-                let mut image_adds: Vec<PendingImage> = Vec::new();
-                let mut kitty_deletes: Vec<String> = Vec::new();
-                if let Ok(mut g) = state.lock() {
-                    let g = &mut *g;
-                    // Split the feed at each DECRQCRA so the checksum sees the exact
-                    // grid state at the query point (§17 conformance).
-                    let events = g.decrqcra.feed(&bytes);
-                    let mut cursor = 0;
-                    for (pos, ev) in events {
-                        g.parser.advance(&mut g.term, &bytes[cursor..pos]);
-                        cursor = pos;
-                        match ev {
-                            ScanEvent::Decrqcra(req) => {
-                                // DA/DSR/color replies queued so far, then the checksum.
-                                replies
-                                    .extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
-                                replies.push(compute_decrqcra(&g.term, &req));
-                            }
-                            // alacritty ignores DECSTR — apply the soft reset ourselves.
-                            ScanEvent::Decstr => g.parser.advance(&mut g.term, DECSTR_RESET),
-                            // Selective erase → plain ED/EL at the cursor (no protection).
-                            ScanEvent::SelectiveErase { line, ps } => {
-                                let fin = if line { 'K' } else { 'J' };
-                                g.parser.advance(&mut g.term, format!("\x1b[{ps}{fin}").as_bytes());
-                            }
-                            // Record a modifiable mode's set/reset for DECRQM reporting.
-                            ScanEvent::SetMode { dec, mode, set } => {
-                                g.decrqm_shadow.insert((dec, mode), set);
-                            }
-                            // OSC 133 shell-integration marker. `B` (command-start) records
-                            // the cursor as the command's start; any other marker (prompt
-                            // start / executed / finished) means we're no longer editing a
-                            // command, so clear it. The parser has already consumed up to
-                            // here, so the cursor is exactly at the command's first column.
-                            ScanEvent::Osc133 { kind } => {
-                                g.cmd_start = (kind == b'B').then(|| {
-                                    let p = g.term.renderable_content().cursor.point;
-                                    (p.line.0, p.column.0)
-                                });
-                            }
-                            // alacritty ignores XTWINOPS resize — resize the grid here,
-                            // and remember to resize the PTY once we release the lock.
-                            // `None` dimensions keep the current extent; values are
-                            // clamped to a sane range (§13 OOM guard).
-                            ScanEvent::Resize { rows, cols } => {
-                                let (cur_cols, cur_rows) =
-                                    (g.term.grid().columns() as u16, g.term.grid().screen_lines() as u16);
-                                let cols = cols.unwrap_or(cur_cols).clamp(1, 1000);
-                                let rows = rows.unwrap_or(cur_rows).clamp(1, 1000);
-                                g.term.resize(TermSize::new(cols as usize, rows as usize));
-                                pty_resize = Some((cols, rows));
-                            }
-                            // Pixel resize → cells against the fixed cell metrics.
-                            ScanEvent::ResizePixels { h, w } => {
-                                let (cur_cols, cur_rows) =
-                                    (g.term.grid().columns() as u16, g.term.grid().screen_lines() as u16);
-                                let cols = w.map(|w| w / CELL_W_PX).unwrap_or(cur_cols).clamp(1, 1000);
-                                let rows = h.map(|h| h / CELL_H_PX).unwrap_or(cur_rows).clamp(1, 1000);
-                                g.term.resize(TermSize::new(cols as usize, rows as usize));
-                                pty_resize = Some((cols, rows));
-                            }
-                            // alacritty ignores ?1048 — apply the equivalent DECSC/DECRC.
-                            ScanEvent::SaveRestoreCursor { save } => {
-                                g.parser.advance(&mut g.term, if save { b"\x1b7" } else { b"\x1b8" });
-                            }
-                            // DECDSR device-status report — answered from fixed values,
-                            // DECXCPR from the live cursor; after earlier queued replies.
-                            ScanEvent::Decdsr { ps, pid } => {
-                                replies
-                                    .extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
-                                let p = g.term.renderable_content().cursor.point;
-                                let (row, col) =
-                                    ((p.line.0 + 1).max(1) as u16, (p.column.0 + 1) as u16);
-                                if let Some(reply) = decdsr_reply(ps, pid, row, col) {
-                                    replies.push(reply);
-                                }
-                            }
-                            // Size/state report — answered from the live grid + metrics,
-                            // after any DA/DSR/color replies queued earlier in the chunk.
-                            ScanEvent::WinopReport(op) => {
-                                replies
-                                    .extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
-                                let (cols, rows) =
-                                    (g.term.grid().columns() as u16, g.term.grid().screen_lines() as u16);
-                                replies.push(winop_report(op, cols, rows));
-                            }
-                        }
-                    }
-                    g.parser.advance(&mut g.term, &bytes[cursor..]);
-                    replies.extend(reply_rx.try_iter().map(|r| resolve_reply(r, &g.term)));
-
-                    // DECRQSS status-string queries (unhandled by the engine).
-                    for pt in g.dcs.feed(&bytes) {
-                        replies.push(decrqss_reply(&pt, &g.term));
-                    }
-
-                    // Inline images (iTerm2 OSC 1337): decode each, anchor at the
-                    // cursor, and reserve vertical space so following text flows below.
-                    for payload in g.image_scanner.feed(&bytes) {
-                        if let Some(img) = parse_iterm_image(&payload) {
-                            let cur = g.term.renderable_content().cursor.point;
-                            let (anchor, col) = (cur.line.0, cur.column.0);
-                            let base = g.term.grid().history_size();
-                            let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
-                            g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-                            image_adds.push(PendingImage {
-                                anchor,
-                                base_history: base,
-                                col,
-                                kitty_id: None,
-                                disp_cols: None,
-                                disp_rows: None,
-                                z: 0,
-                                img,
-                            });
-                        }
-                    }
-                    // Sixel graphics (DCS): rasterize + place like an inline image.
-                    for payload in g.sixel.feed(&bytes) {
-                        if let Some(img) = parse_sixel(&payload) {
-                            let cur = g.term.renderable_content().cursor.point;
-                            let (anchor, col) = (cur.line.0, cur.column.0);
-                            let base = g.term.grid().history_size();
-                            let rows = ((img.height as f32 / LINE_HEIGHT).ceil() as usize).max(1);
-                            g.parser.advance(&mut g.term, "\r\n".repeat(rows).as_bytes());
-                            image_adds.push(PendingImage {
-                                anchor,
-                                base_history: base,
-                                col,
-                                kitty_id: None,
-                                disp_cols: None,
-                                disp_rows: None,
-                                z: 0,
-                                img,
-                            });
-                        }
-                    }
-                    // Kitty graphics (APC): decode chunked transmissions, place, and ack.
-                    for (control, payload) in g.kitty.feed(&bytes) {
-                        replies.extend(kitty_response(&control));
-                        let kid = kitty_num(&control, "i");
-                        // `c=`/`r=` request a display size in cells (placement geometry);
-                        // `z=` is the stacking order (higher on top, negative under the text).
-                        let (dc, dr) = (kitty_num(&control, "c"), kitty_num(&control, "r"));
-                        let z = kitty_inum(&control, "z").unwrap_or(0);
-                        // Action selects behaviour (kitty default is transmit): `T` display,
-                        // `t` transmit-and-store, `p` place a stored image, `d` delete.
-                        match kitty_key(&control, "a").unwrap_or("t") {
-                            action @ ("T" | "t") => {
-                                if let Some(img) = decode_kitty_payload(&control, &payload) {
-                                    // Retain by id so a later `a=p` can place it again.
-                                    if let Some(id) = kid {
-                                        if g.kitty_images.len() >= MAX_KITTY_STORED
-                                            && !g.kitty_images.contains_key(&id)
-                                        {
-                                            if let Some(&k) = g.kitty_images.keys().next() {
-                                                g.kitty_images.remove(&k);
-                                            }
-                                        }
-                                        g.kitty_images.insert(id, img.clone());
-                                    }
-                                    if action == "T" {
-                                        place_kitty(&mut *g, &mut image_adds, &image_store, &control, kid, dc, dr, z, img);
-                                    }
-                                }
-                            }
-                            "p" => {
-                                // Place a previously-transmitted image by id (with `c=`/`r=`),
-                                // relative to a parent placement when `P=` names one.
-                                if let Some(img) = kid.and_then(|id| g.kitty_images.get(&id).cloned())
-                                {
-                                    place_kitty(&mut *g, &mut image_adds, &image_store, &control, kid, dc, dr, z, img);
-                                }
-                            }
-                            // `a=d` delete request — applied to the shared store below.
-                            "d" => kitty_deletes.push(control),
-                            _ => {}
-                        }
-                    }
-                    // Correct alacritty's DECRQM replies (§17): permanently-reset modes
-                    // 0→4, and shadowed modifiable modes to their tracked set/reset state.
-                    // Done on the outgoing bytes, keyed by the reply's own mode number.
-                    for r in replies.iter_mut() {
-                        if let Some(fixed) =
-                            decrqm_perm_reset(r).or_else(|| decrqm_modifiable(r, &g.decrqm_shadow))
-                        {
-                            *r = fixed;
-                        }
-                    }
-                }
+                let ChunkOutput { replies, image_adds, kitty_deletes, pty_resize } =
+                    if let Ok(mut g) = state.lock() {
+                        process_chunk(&mut g, &bytes, &reply_rx, &image_store)
+                    } else {
+                        ChunkOutput::default()
+                    };
                 if !image_adds.is_empty() || !kitty_deletes.is_empty() {
                     if let Ok(mut store) = image_store.lock() {
                         for p in image_adds {
@@ -10257,7 +10326,7 @@ fn capture(path: &str) -> Result<()> {
     if let Ok(path) = std::env::var("SAMPA_CAPTURE_SIXEL") {
         if let Ok(bytes) = std::fs::read(&path) {
             let mut sc = SixelScanner::new();
-            for payload in sc.feed(&bytes) {
+            for (_, payload) in sc.feed(&bytes) {
                 if let Some(img) = parse_sixel(&payload) {
                     images.lock().unwrap().add(pending_image(4, 0, 30, None, img));
                 }
@@ -10268,7 +10337,7 @@ fn capture(path: &str) -> Result<()> {
     if let Ok(path) = std::env::var("SAMPA_CAPTURE_KITTY") {
         if let Ok(bytes) = std::fs::read(&path) {
             let mut sc = KittyScanner::new();
-            for (control, payload) in sc.feed(&bytes) {
+            for (_, (control, payload)) in sc.feed(&bytes) {
                 if let Some(img) = parse_kitty(&control, &payload) {
                     images.lock().unwrap().add(pending_image(4, 0, 30, None, img));
                 }
@@ -10718,9 +10787,91 @@ mod tests {
         assert!(out.is_empty(), "m=1 chunk is buffered, not emitted");
         out = sc.feed(b"\x1b_Gm=0;BBBB\x1b\\");
         assert_eq!(out.len(), 1);
-        let (control, payload) = &out[0];
+        // Emitted at the final chunk's terminator offset (index past the closing ST).
+        let (pos, (control, payload)) = &out[0];
+        assert_eq!(*pos, "\x1b_Gm=0;BBBB\x1b\\".len());
         assert_eq!(control, "a=T,f=32,s=2,v=1,m=1");
         assert_eq!(payload, b"AAAABBBB"); // concatenated across chunks
+    }
+
+    /// A fresh `TermState` on an 80×24 grid, for driving `process_chunk` in tests.
+    fn test_term_state() -> (TermState, std::sync::mpsc::Receiver<Reply>) {
+        let (reply_tx, reply_rx) = channel::<Reply>();
+        // The app receiver is dropped; `EventProxy` ignores send errors, so that's harmless.
+        let (app_tx, _) = channel::<AppEvent>();
+        let term = Term::new(
+            TermConfig::default(),
+            &TermSize::new(80, 24),
+            EventProxy { reply_tx, app_tx },
+        );
+        let g = TermState {
+            parser: Processor::new(),
+            term,
+            decrqcra: DecrqcraScanner::new(),
+            image_scanner: ImageScanner::new(),
+            sixel: SixelScanner::new(),
+            kitty: KittyScanner::new(),
+            kitty_images: std::collections::HashMap::new(),
+            dcs: DcsScanner::new(),
+            decrqm_shadow: std::collections::HashMap::new(),
+            cmd_start: None,
+        };
+        (g, reply_rx)
+    }
+
+    #[test]
+    fn two_images_in_one_write_anchor_independently() {
+        // Regression for the pre-existing anchoring bug: two image placements in a single
+        // PTY write, with a cursor move between them, must anchor at their own cursor points
+        // — not both at the cursor left after the whole chunk was parsed (see PR #123).
+        let (mut g, reply_rx) = test_term_state();
+        // No image is ever placed relative to another here, so an empty store suffices.
+        let img_store = Mutex::new(ImageStore::default());
+        // Transmit-and-store two 1×1 RGBA images (i=1, i=2) so `a=p` can place them.
+        let px = b64(&[1, 2, 3, 4]);
+        let store = format!(
+            "\x1b_Ga=t,f=32,s=1,v=1,i=1;{px}\x1b\\\x1b_Ga=t,f=32,s=1,v=1,i=2;{px}\x1b\\"
+        );
+        let stored = process_chunk(&mut g, store.as_bytes(), &reply_rx, &img_store);
+        assert!(stored.image_adds.is_empty(), "a=t stores only, no placement");
+
+        // One write: place i=1 at the home row, move the cursor to row 10 (1-indexed 11),
+        // then place i=2. The cursor move between them must reach each placement.
+        let place = "\x1b_Ga=p,i=1\x1b\\\x1b[11;1H\x1b_Ga=p,i=2\x1b\\";
+        let out = process_chunk(&mut g, place.as_bytes(), &reply_rx, &img_store);
+        assert_eq!(out.image_adds.len(), 2, "both images placed");
+        assert_eq!(out.image_adds[0].anchor, 0, "first image anchors at the home row");
+        assert_eq!(out.image_adds[1].anchor, 10, "second image anchors where the cursor moved");
+        assert_ne!(
+            out.image_adds[0].anchor, out.image_adds[1].anchor,
+            "the cursor move between placements is honoured (not lost to whole-chunk parsing)"
+        );
+    }
+
+    #[test]
+    fn kitty_relative_placement_through_the_pump() {
+        // Guards the *wiring*, not the arithmetic. `kitty_relative_placement` calls
+        // `find_placement`/`place_kitty_relative` directly, so it stays green even when the
+        // pump never dispatches on `P=` — which is exactly how the restructured pump lost
+        // the relative path. This drives a relative placement through `process_chunk`.
+        let (mut g, reply_rx) = test_term_state();
+        let img_store = Mutex::new(ImageStore::default());
+        let px = b64(&[1, 2, 3, 4]);
+        let stored = format!(
+            "\x1b_Ga=t,f=32,s=1,v=1,i=1;{px}\x1b\\\x1b_Ga=t,f=32,s=1,v=1,i=2;{px}\x1b\\"
+        );
+        process_chunk(&mut g, stored.as_bytes(), &reply_rx, &img_store);
+
+        // One write: place the parent (i=1) at the cursor, then pin i=2 to it via P=1,H=3,V=2.
+        // The parent is only ever in this write's *pending* adds, so this also covers
+        // `find_placement`'s pending-before-store lookup from the pump's side.
+        let place = "\x1b[6;5H\x1b_Ga=p,i=1\x1b\\\x1b_Ga=p,i=2,P=1,H=3,V=2\x1b\\";
+        let out = process_chunk(&mut g, place.as_bytes(), &reply_rx, &img_store);
+        assert_eq!(out.image_adds.len(), 2, "parent and child both placed");
+        let (parent, child) = (&out.image_adds[0], &out.image_adds[1]);
+        assert_eq!(child.anchor, parent.anchor + 2, "V=2 offsets the child down from the parent");
+        assert_eq!(child.col, parent.col + 3, "H=3 offsets the child right of the parent");
+        assert_eq!(child.base_history, parent.base_history, "child rides with the parent");
     }
 
     #[test]
@@ -10867,9 +11018,10 @@ mod tests {
         // ESC P q <data> ESC \
         let out = sc.feed(b"\x1bPq#1~\x1b\\");
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0], b"q#1~");
+        assert_eq!(out[0].0, "\x1bPq#1~\x1b\\".len()); // offset past the closing ST
+        assert_eq!(out[0].1, b"q#1~");
         // And the extracted payload rasterizes.
-        assert!(parse_sixel(&out[0]).is_some());
+        assert!(parse_sixel(&out[0].1).is_some());
     }
 
     #[test]
@@ -11309,7 +11461,8 @@ mod tests {
         let mut sc = ImageScanner::new();
         let p = sc.feed(b"\x1b]1337;File=inline=1:AAAA\x07"); // BEL-terminated
         assert_eq!(p.len(), 1);
-        assert!(p[0].starts_with(b"1337;File="));
+        assert_eq!(p[0].0, "\x1b]1337;File=inline=1:AAAA\x07".len()); // offset past BEL
+        assert!(p[0].1.starts_with(b"1337;File="));
         // A non-1337 OSC (title) is ignored.
         assert!(ImageScanner::new().feed(b"\x1b]0;title\x07").is_empty());
         // Split across chunks, ST-terminated.
