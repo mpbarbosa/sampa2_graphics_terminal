@@ -133,7 +133,14 @@ engine is now ours to prove.
   **bracketed paste** (2004) wrapping with embedded-`ESC[201~` stripping (§13);
   **double-click = word** (Semantic) / **triple-click = line** (Lines) via click-count
   timing, auto-copied. PNG + membership + click-granularity + word-selection tests.
-  ⬜ still: **block** selection (modifier-drag), X11 PRIMARY split, multi-line paste confirm.
+  ✅ **multi-line paste confirm** — a paste into a **non-bracketed** app (a bare shell
+  prompt) whose text has an *interior* newline would run each line on paste, so it's held
+  behind a centered confirm modal showing the line count + a two-line preview (`paste_needs_confirm`
+  gates it; trailing newlines and single lines paste straight through; a bracketed-paste-aware
+  program is trusted and never prompted). Enter/`y` pastes, Esc/`n` discards.
+  `paste_needs_confirm`/`paste_preview` unit-tested; Xephyr-verified (modal → cancel runs
+  nothing, confirm sends the lines, single-line bypasses it). ⬜ still: **block** selection
+  (modifier-drag), X11 PRIMARY split.
 - ✅ **Scrollback scrolling** (10k-line history): **wheel** (3 lines/notch) and
   **Shift+PageUp/PageDown**; display-offset-aware rendering (negative lines = history);
   typing snaps to the live prompt; disabled on the alt screen. Unit test covers the
