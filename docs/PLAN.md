@@ -293,8 +293,10 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
   `UserEvent::ManReady`; ↑/↓ · PgUp/PgDn · Home scroll, `Esc` closes, "No man page"
   when absent. The panel clips the grid above it and scissors images out. `first_command_token`
   unit-tested; rendered + verified via `--capture` (`sampa-man`'s own sanitize/validate
-  tests carry over). ⬜ still: OSC-133 prompt-boundary reset (opt-in shell hooks),
-  auto-show on debounce, in-panel search.
+  tests carry over). ✅ **OSC-133 command capture** — with the shell hooks active,
+  `command_at_prompt` reads from the exact `133;B` command-start to the cursor (no prompt
+  guessing); the marker is cleared on the other marks and it falls back to the grid heuristic
+  without integration. ⬜ still: auto-show on debounce, in-panel search.
 - ✅ **Preview panel** (`sampa-preview`): `Ctrl+Shift+E` toggles a live bottom panel that
   **safely auto-runs** the current command as you type. Keystrokes debounce **550 ms**;
   only the settled line runs (a `preview_gen` token supersedes stale requests), off the
@@ -305,8 +307,14 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
   line (**after Enter**) clears it. **Re-asserted filesystem-verified**: a native
   integration test drives the exact `run_preview` call on `rm`/`mv`/redirect/`find -delete`/
   `&&`-chains and proves the victim file is byte-for-byte untouched while `cat` runs.
-  ⬜ still: scroll, OSC-133 prompt-boundary reset for exact command capture.
-- OSC 7/133 already handled by `sampa-shellint`; ship the opt-in zsh/bash hooks.
+  Exact command capture uses OSC-133 when the shell hooks are active (see below). ⬜ still: scroll.
+- ✅ **Opt-in shell integration** — `shell-integration/sampa.{zsh,bash}` emit OSC 7 (cwd) +
+  OSC 133 prompt marks (`A` prompt / `B` command / `C` output / `D` done), gated to
+  `TERM_PROGRAM=sampa-terminal` (set by pty-core) so they no-op elsewhere. Enable via
+  `eval "$(sampa2 --shell-integration zsh)"` or by sourcing the file (packaged to
+  `/usr/share/sampa/`). This is what gives the man/preview/palette **exact** command
+  boundaries. `shell_integration` unit-tested (both shells carry all four marks + OSC 7);
+  the emitted marks verified under a pty (zsh + bash each fire A/B/C/D; no-op without the env).
 
 **Exit (§17):** palette inserts (not runs); man opens/closes correctly; preview
 refuses writes (file provably untouched) and clears on Enter.
