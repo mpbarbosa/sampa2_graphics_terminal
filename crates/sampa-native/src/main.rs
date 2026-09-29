@@ -2427,6 +2427,17 @@ fn bench(mb: usize, baseline: Option<f64>, out: Option<&std::path::Path>) -> Res
     Ok(())
 }
 
+/// The opt-in shell-integration snippet for `shell` (`zsh` / `bash`), embedded from
+/// `shell-integration/` so the binary is self-contained. Emits OSC 7 (cwd) + OSC 133 prompt
+/// marks; a no-op outside Sampa. `None` for an unsupported shell.
+fn shell_integration(shell: &str) -> Option<&'static str> {
+    match shell {
+        "zsh" => Some(include_str!("../../../shell-integration/sampa.zsh")),
+        "bash" => Some(include_str!("../../../shell-integration/sampa.bash")),
+        _ => None,
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--smoke") {
@@ -2444,6 +2455,27 @@ fn main() -> Result<()> {
         let baseline = flag_val("--baseline").and_then(|s| s.parse::<f64>().ok());
         let out = flag_val("--out");
         return bench(mb, baseline, out.as_deref().map(std::path::Path::new));
+    }
+    // Print the opt-in shell-integration snippet (OSC 7 cwd + OSC 133 prompt marks) for
+    // `eval "$(sampa2 --shell-integration zsh)"`, so the man/preview/palette get exact
+    // command boundaries. `--shell-integration` alone lists the supported shells.
+    if let Some(i) = args.iter().position(|a| a == "--shell-integration") {
+        return match args.get(i + 1).map(String::as_str) {
+            Some(shell) => match shell_integration(shell) {
+                Some(script) => {
+                    print!("{script}");
+                    Ok(())
+                }
+                None => {
+                    eprintln!("sampa2: unknown shell {shell:?} (supported: zsh, bash)");
+                    std::process::exit(2);
+                }
+            },
+            None => {
+                eprintln!("usage: sampa2 --shell-integration <zsh|bash>");
+                std::process::exit(2);
+            }
+        };
     }
 
     // Full CLI (§12.2) via the shared, tested `sampa-cli` parser: -e/-- CMD…,
@@ -12237,6 +12269,22 @@ mod tests {
         // The Summary line carries the numbers and the right marker.
         assert!(bench_trend_line(80.0, 60.0).contains("⚠ regression"));
         assert!(bench_trend_line(80.0, 88.0).contains("✓ within noise"));
+    }
+
+    #[test]
+    fn shell_integration_ships_osc133_marks() {
+        for shell in ["zsh", "bash"] {
+            let s = shell_integration(shell).expect("known shell");
+            // Gated to Sampa, and carries all four OSC 133 marks (A prompt, B command,
+            // C output, D done) that `command_at_prompt` reads for exact capture.
+            assert!(s.contains("sampa-terminal"), "{shell} must gate on TERM_PROGRAM");
+            for mark in ["133;A", "133;B", "133;C", "133;D"] {
+                assert!(s.contains(mark), "{shell} snippet missing {mark}");
+            }
+            assert!(s.contains("]7;file://"), "{shell} must emit OSC 7 cwd");
+        }
+        // Unknown shells have no snippet (the CLI reports it and exits non-zero).
+        assert!(shell_integration("fish").is_none());
     }
 
     #[test]

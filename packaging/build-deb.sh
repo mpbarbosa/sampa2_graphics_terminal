@@ -38,6 +38,10 @@ for sz in 64 128 256 512; do
     install -Dm644 "$ROOT/assets/sampa2-$sz.png" "$STAGE/usr/share/icons/hicolor/${sz}x${sz}/apps/sampa2.png"
 done
 install -Dm644 "$ROOT/assets/sampa2-icon.svg" "$STAGE/usr/share/icons/hicolor/scalable/apps/sampa2.svg"
+# Opt-in shell integration (OSC 7 cwd + OSC 133 prompt marks). Sourced from ~/.zshrc/.bashrc,
+# or via `eval "$(sampa2 --shell-integration zsh)"`; no-op outside Sampa.
+install -Dm644 "$ROOT/shell-integration/sampa.zsh" "$STAGE/usr/share/sampa/sampa.zsh"
+install -Dm644 "$ROOT/shell-integration/sampa.bash" "$STAGE/usr/share/sampa/sampa.bash"
 install -Dm644 "$DEB/copyright" "$STAGE/usr/share/doc/sampa2/copyright"
 # Native package (version has no Debian revision) → changelog.gz, mode 0644.
 install -d "$STAGE/usr/share/doc/sampa2"

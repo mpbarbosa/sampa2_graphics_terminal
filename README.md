@@ -80,6 +80,24 @@ Or grab a single-file, no-install **AppImage**:
 An `.rpm` (`./packaging/build-rpm.sh`) is available too. See
 [packaging/README.md](packaging/README.md) for details (icons, man page, deps).
 
+## Shell integration (optional)
+
+For **exact** command boundaries and the working directory — so the command palette, man
+panel, and preview know precisely what you've typed — enable the OSC 7 / OSC 133 shell hooks.
+Add one line to your shell rc:
+
+```bash
+# ~/.zshrc
+eval "$(sampa2 --shell-integration zsh)"
+# ~/.bashrc
+eval "$(sampa2 --shell-integration bash)"
+```
+
+Or source the packaged file (`.deb`/`.rpm` install it to `/usr/share/sampa/`), e.g.
+`source /usr/share/sampa/sampa.zsh`. The hooks are gated to Sampa (`TERM_PROGRAM`), so the
+same rc line is a no-op in any other terminal. Everything still works without them — Sampa
+falls back to reading the command off the grid.
+
 ## Docs
 
 - [docs/spec-enhance-views.md](docs/spec-enhance-views.md) — the `Ctrl+Shift+D` command
