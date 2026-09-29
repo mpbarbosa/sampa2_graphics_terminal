@@ -4590,7 +4590,9 @@ impl App {
                 };
                 self.click_count = next_click_count(self.click_count, same, elapsed);
                 self.last_click = Some((now, col, row));
-                let ty = selection_type_for(self.click_count);
+                // Alt-drag starts a block (rectangular / column) selection; Ctrl is taken by
+                // link-open, so Alt is the block modifier (matches iTerm2/Konsole/GNOME).
+                let ty = selection_type_for_click(self.click_count, self.modifiers.alt_key());
                 if let Ok(mut g) = self.state.lock() {
                     let d = g.term.grid().display_offset() as i32;
                     g.term.selection = Some(Selection::new(
@@ -8569,6 +8571,17 @@ fn selection_type_for(count: u8) -> SelectionType {
     }
 }
 
+/// Selection type at drag start: a held modifier makes it a **block** (rectangular / column)
+/// selection — copying the cells inside the rectangle, not the reading-order run — overriding
+/// the click-count granularity. Otherwise the usual char/word/line by click count.
+fn selection_type_for_click(count: u8, block: bool) -> SelectionType {
+    if block {
+        SelectionType::Block
+    } else {
+        selection_type_for(count)
+    }
+}
+
 /// Resolve one grid cell (color + attributes + cursor inversion) for display.
 fn cell_vis(
     cell: &alacritty_terminal::term::cell::Cell,
@@ -11833,6 +11846,27 @@ mod tests {
         assert!(in_selection(&range, 0, 5));
         assert!(!in_selection(&range, 0, 1));
         assert!(!in_selection(&range, 1, 3));
+    }
+
+    #[test]
+    fn block_selection_is_rectangular() {
+        // Alt-drag selects a block; a block range's membership is the rectangle [cols 2..=5]
+        // on every row 0..=2 — unlike a Simple range, which wraps at line ends.
+        assert!(matches!(selection_type_for_click(1, true), SelectionType::Block));
+        assert!(matches!(selection_type_for_click(2, true), SelectionType::Block)); // modifier wins over count
+        assert!(matches!(selection_type_for_click(2, false), SelectionType::Semantic));
+        let block = SelectionRange::new(
+            Point::new(Line(0), Column(2)),
+            Point::new(Line(2), Column(5)),
+            true,
+        );
+        // Inside the column band on an interior row → selected.
+        assert!(in_selection(&block, 1, 3));
+        assert!(in_selection(&block, 2, 5));
+        // Outside the column band, even on a spanned row → NOT selected (rectangular).
+        assert!(!in_selection(&block, 1, 1));
+        assert!(!in_selection(&block, 0, 6));
+        assert!(!in_selection(&block, 3, 3)); // below the block
     }
 
     #[test]

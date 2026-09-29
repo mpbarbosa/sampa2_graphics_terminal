@@ -139,8 +139,13 @@ engine is now ours to prove.
   gates it; trailing newlines and single lines paste straight through; a bracketed-paste-aware
   program is trusted and never prompted). Enter/`y` pastes, Esc/`n` discards.
   `paste_needs_confirm`/`paste_preview` unit-tested; Xephyr-verified (modal → cancel runs
-  nothing, confirm sends the lines, single-line bypasses it). ⬜ still: **block** selection
-  (modifier-drag), X11 PRIMARY split.
+  nothing, confirm sends the lines, single-line bypasses it). ✅ **block (rectangular)
+  selection** — **Alt-drag** starts a `SelectionType::Block` (Ctrl is taken by link-open), so
+  the highlight and the copied text are the column rectangle, not the reading-order run; the
+  render (`in_selection` block membership) and copy (`selection_to_string`) were already
+  block-aware, so it's the drag-start type that changed (`selection_type_for_click`).
+  Unit-tested (rectangular membership + modifier-wins-over-count); Xephyr-verified (Alt-drag
+  over a column copies just that column). ⬜ still: X11 PRIMARY split.
 - ✅ **Scrollback scrolling** (10k-line history): **wheel** (3 lines/notch) and
   **Shift+PageUp/PageDown**; display-offset-aware rendering (negative lines = history);
   typing snaps to the live prompt; disabled on the alt screen. Unit test covers the
