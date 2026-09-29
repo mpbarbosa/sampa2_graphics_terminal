@@ -296,7 +296,11 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
   tests carry over). ✅ **OSC-133 command capture** — with the shell hooks active,
   `command_at_prompt` reads from the exact `133;B` command-start to the cursor (no prompt
   guessing); the marker is cleared on the other marks and it falls back to the grid heuristic
-  without integration. ⬜ still: auto-show on debounce, in-panel search.
+  without integration. ✅ **in-panel search** — `/` opens a live query (case-insensitive)
+  that highlights the matching lines and shows the match count; **Enter** jumps to the first
+  match, **`n`/`N`** cycle (wrapping) relative to the scroll position, **Esc** cancels. Works
+  on cheat-sheets too. `man_matches`/`man_next_match` unit-tested; Xephyr-verified on
+  `man grep` (`/pattern` → 35 matches highlighted, `n` walks them). ⬜ still: auto-show on debounce.
 - ✅ **Preview panel** (`sampa-preview`): `Ctrl+Shift+E` toggles a live bottom panel that
   **safely auto-runs** the current command as you type. Keystrokes debounce **550 ms**;
   only the settled line runs (a `preview_gen` token supersedes stale requests), off the

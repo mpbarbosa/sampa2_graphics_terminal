@@ -2630,6 +2630,8 @@ fn main() -> Result<()> {
         man_lines: Vec::new(),
         man_scroll: 0,
         man_loading: false,
+        man_query: String::new(),
+        man_searching: false,
         preview_on: false,
         preview_text: String::new(),
         preview_ran: false,
@@ -3124,6 +3126,8 @@ struct App {
     man_lines: Vec<String>,
     man_scroll: usize,
     man_loading: bool,
+    man_query: String,     // in-panel search query (empty → no search); matches are highlighted
+    man_searching: bool,   // true while typing the query (`/` mode); Enter confirms, Esc cancels
     // command preview (safe auto-run, gated by sampa-preview)
     preview_on: bool,
     preview_text: String,
@@ -3371,7 +3375,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if action == Some(Action::ToggleMan) {
                         self.man_close();
                     } else {
-                        self.man_key(&event.logical_key);
+                        self.man_key(&event.logical_key, event.text.as_deref());
                     }
                     return;
                 }
@@ -5720,6 +5724,8 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let cmd = first_command_token(&line).to_string();
         self.man_on = true;
         self.man_scroll = 0;
+        self.man_query.clear();
+        self.man_searching = false;
         self.man_cmd = cmd.clone();
         if cmd.is_empty() {
             self.man_loading = false;
@@ -6014,9 +6020,39 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.request_redraw();
     }
 
-    /// Scroll keys while the man panel owns input (Esc handled by the caller).
-    fn man_key(&mut self, key: &Key) {
+    /// Keys while the man panel owns input. Two modes: normal scrolling, and `/` search where
+    /// keystrokes build the query (Enter jumps to the first match, Esc cancels). With a query
+    /// active, `n`/`N` cycle matches and the matching lines are highlighted.
+    fn man_key(&mut self, key: &Key, text: Option<&str>) {
         let page = MAN_VISIBLE.saturating_sub(1).max(1);
+        // Search input mode: build the query live, then confirm/cancel.
+        if self.man_searching {
+            match key {
+                Key::Named(NamedKey::Escape) => {
+                    self.man_searching = false;
+                    self.man_query.clear();
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.man_searching = false;
+                    self.man_jump(true);
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.man_query.pop();
+                    self.request_redraw();
+                }
+                _ => {
+                    if let Some(t) = text {
+                        let add: String = t.chars().filter(|c| !c.is_control()).collect();
+                        if !add.is_empty() {
+                            self.man_query.push_str(&add);
+                            self.request_redraw();
+                        }
+                    }
+                }
+            }
+            return;
+        }
         match key {
             Key::Named(NamedKey::Escape) => self.man_close(),
             Key::Named(NamedKey::ArrowDown) => self.man_scroll_by(1, true),
@@ -6027,8 +6063,26 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                 self.man_scroll = 0;
                 self.request_redraw();
             }
+            Key::Character(c) if c == "/" => {
+                self.man_searching = true;
+                self.man_query.clear();
+                self.request_redraw();
+            }
+            Key::Character(c) if c == "n" => self.man_jump(true),
+            Key::Character(c) if c == "N" => self.man_jump(false),
             _ => {}
         }
+    }
+
+    /// Jump to the next (`forward`) / previous match of `man_query`, wrapping; brings it to the
+    /// top of the visible window. No-op with no query or no matches.
+    fn man_jump(&mut self, forward: bool) {
+        let matches = man_matches(&self.man_lines, &self.man_query);
+        if let Some(target) = man_next_match(&matches, self.man_scroll, forward) {
+            let max = self.man_lines.len().saturating_sub(1);
+            self.man_scroll = target.min(max);
+        }
+        self.request_redraw();
     }
 
     fn man_scroll_by(&mut self, delta: usize, down: bool) {
@@ -8052,6 +8106,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         // Both slice their body to the lines that fit the window.
         let panel_title;
         let panel_body;
+        let man_spans: Vec<BodySpan>;
         let ps_title;
         let ps_body;
         let ps_spans: Vec<BodySpan>;
@@ -8216,7 +8271,27 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let total = self.man_lines.len();
             let start = self.man_scroll.min(total.saturating_sub(1));
             let end = (start + visible).min(total);
-            panel_body = self.man_lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default();
+            let vis = self.man_lines.get(start..end).unwrap_or(&[]);
+            panel_body = vis.join("\n");
+            // In-panel search: colour the matching lines in the visible window (body_spans must
+            // concatenate back to `panel_body`, so a `\n` span sits between each line).
+            let matches = man_matches(&self.man_lines, &self.man_query);
+            let body_spans = if self.man_query.is_empty() {
+                None
+            } else {
+                let hit = self.theme.cursor;
+                let fg = self.theme.fg;
+                let mut spans: Vec<BodySpan> = Vec::with_capacity(vis.len() * 2);
+                for (i, line) in vis.iter().enumerate() {
+                    let is_hit = matches.binary_search(&(start + i)).is_ok();
+                    spans.push((line.clone(), if is_hit { hit } else { fg }, is_hit, false));
+                    if i + 1 < vis.len() {
+                        spans.push(("\n".to_string(), fg, false, false));
+                    }
+                }
+                man_spans = spans;
+                Some(man_spans.as_slice())
+            };
             // gh/cargo/npm/docker/kubectl/helm/aws (and their `<sub>` drill-ins) show a cheat-sheet, not a man page.
             let is_cheatsheet = |c: &str| {
                 let prog = c.split_whitespace().next().unwrap_or("");
@@ -8227,15 +8302,17 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             } else {
                 format!("man {}", self.man_cmd)
             };
+            let pos = if total > 0 { format!("{}–{}/{}", start + 1, end, total) } else { "0/0".into() };
             panel_title = if self.man_loading {
                 format!("{label} — loading…")
+            } else if self.man_searching {
+                format!("{label}   /{}▏   {} matches   ·  Enter jump · Esc", self.man_query, matches.len())
+            } else if !self.man_query.is_empty() {
+                format!("{label}   {pos}   /{} ({} matches)   ·  n/N · / · Esc", self.man_query, matches.len())
             } else {
-                format!(
-                    "{label}   {}   ·  ↑/↓ PgUp/PgDn · Esc",
-                    if total > 0 { format!("{}–{}/{}", start + 1, end, total) } else { "0/0".into() }
-                )
+                format!("{label}   {pos}   ·  ↑/↓ PgUp/PgDn · / search · Esc")
             };
-            Some(PanelView { title: &panel_title, body: &panel_body, body_spans: None })
+            Some(PanelView { title: &panel_title, body: &panel_body, body_spans })
         } else if self.preview_on {
             let visible = fit(PREVIEW_VISIBLE);
             // The body is the command output (only when it actually ran); a rejection's
@@ -8788,6 +8865,31 @@ fn scroll_offset(cur: usize, delta: usize, down: bool, max: usize) -> usize {
         (cur + delta).min(max)
     } else {
         cur.saturating_sub(delta)
+    }
+}
+
+/// Line indices in `lines` that contain `query`, case-insensitively (the man/cheat-sheet
+/// in-panel search). An empty query matches nothing. Pure, so the search is unit-tested.
+fn man_matches(lines: &[String], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let q = query.to_lowercase();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The next match strictly after `from` (`forward`) or before it, wrapping around the ends;
+/// `None` when there are no matches. Drives `n`/`N` off the current scroll position.
+fn man_next_match(matches: &[usize], from: usize, forward: bool) -> Option<usize> {
+    if forward {
+        matches.iter().find(|&&m| m > from).copied().or_else(|| matches.first().copied())
+    } else {
+        matches.iter().rev().find(|&&m| m < from).copied().or_else(|| matches.last().copied())
     }
 }
 
@@ -12171,6 +12273,27 @@ mod tests {
         assert_eq!(scroll_offset(2, 3, false, 10), 0);
         // A body that fits (max 0) never scrolls.
         assert_eq!(scroll_offset(0, 3, true, 0), 0);
+    }
+
+    #[test]
+    fn man_search_matches_and_cycles() {
+        let lines: Vec<String> = ["NAME", "  grep - print lines", "SYNOPSIS", "  grep [OPTIONS]", "DESCRIPTION"]
+            .iter().map(|s| s.to_string()).collect();
+        // Case-insensitive substring; empty query matches nothing.
+        assert_eq!(man_matches(&lines, "grep"), vec![1, 3]);
+        assert_eq!(man_matches(&lines, "SYNOPSIS"), vec![2]);
+        assert_eq!(man_matches(&lines, "sis"), vec![2]); // case-insensitive
+        assert!(man_matches(&lines, "").is_empty());
+        assert!(man_matches(&lines, "zzz").is_empty());
+
+        // n/N cycle relative to the current scroll, wrapping at both ends.
+        let m = man_matches(&lines, "grep"); // [1, 3]
+        assert_eq!(man_next_match(&m, 0, true), Some(1));  // first below top
+        assert_eq!(man_next_match(&m, 1, true), Some(3));  // next after a match
+        assert_eq!(man_next_match(&m, 3, true), Some(1));  // wrap to first
+        assert_eq!(man_next_match(&m, 3, false), Some(1)); // prev before 3
+        assert_eq!(man_next_match(&m, 1, false), Some(3)); // wrap to last
+        assert_eq!(man_next_match(&[], 0, true), None);    // no matches
     }
 
     #[test]
