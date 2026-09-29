@@ -245,8 +245,11 @@ interactive pass + wider program coverage outstanding.)*
   `normalize_key` folding shifted symbols to a base token). So **rebinding a key changes
   both its trigger and its help row** (spec §6) — verified end-to-end (`[keybindings]`
   override → rendered help shows the new chord). `parse_chord`/`normalize_key`/
-  `action_for`/`help_rows`/rebinding all unit-tested (66 tests). ⬜ still: a ✕ button;
-  chord *validation* diagnostics.
+  `action_for`/`help_rows`/rebinding all unit-tested (66 tests). ✅ **chord-validation
+  diagnostics** — a `[keybindings]` entry naming an unknown action, or a chord that doesn't
+  parse (a typo like `Ctrl+Shft+C`), is printed to stderr at startup and on live reload
+  (`keybinding_diagnostics`, unit-tested) instead of being silently ignored / left unbound; a
+  valid override stays quiet. ⬜ still: a ✕ button.
 
 **Exit:** a config edit hot-reloads theme/font/cursor; a Powerline + truecolor prompt
 renders; tabs run independent shells; search highlights scrollback matches.
