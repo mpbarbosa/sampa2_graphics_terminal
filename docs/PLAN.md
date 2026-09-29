@@ -330,8 +330,14 @@ refuses writes (file provably untouched) and clears on Enter.
   higher z draws on top (ties keep insertion order = ascending id, per kitty), and a
   **negative z draws *under* the text** (its quad batch runs before the glyph pass, the rest
   after). `image_draw_order` unit-tested; Xephyr-verified (two exactly-overlapping squares —
-  the higher-z colour wins, and the result flips when the z values swap). ⬜ still: relative
-  placement (`P=`/`Q=` parent-relative offsets).
+  the higher-z colour wins, and the result flips when the z values swap). ✅ **relative
+  placement (`P=`, `H`/`V`)** — a placement naming a parent image (`P=<id>`) is pinned to that
+  parent's placement, offset by the `H`/`V` cell deltas, and shares the parent's
+  `base_history` so it rides and scrolls with it (a floating overlay: no row reservation, no
+  cursor move). The parent is resolved from this write's pending adds first, then the live
+  store (`find_placement`); an unknown parent falls back to a normal cursor placement.
+  `kitty_relative_placement` unit-tested; Xephyr-verified (a child pinned `H=6,V=2` renders
+  offset down-right of its parent). This completes the Kitty-graphics placement family.
 - ✅ **OSC 8 hyperlinks:** OSC-8 tracked (via `alacritty_terminal`), rendered
   **underlined**, with a strict **http/https scheme gate** (§13 — never `file:`/`javascript:`);
   auto-opens nothing. ✅ **plain-URL detection** too (`url_at`: whitespace token under the
