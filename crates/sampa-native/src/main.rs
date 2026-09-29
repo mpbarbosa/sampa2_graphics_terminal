@@ -2641,7 +2641,7 @@ fn main() -> Result<()> {
         cursor_on: true,
         blink,
         help_on: false,
-        keys: Keybindings::load(),
+        keys: Keybindings::load_and_report(),
         preedit: String::new(),
         preedit_cursor: None,
         bell_until: None,
@@ -3887,15 +3887,36 @@ fn normalize_key(key: &Key) -> Option<String> {
 }
 
 /// The live keybinding table: each action's chord string (for display) + its parsed
+/// Diagnostics for `[keybindings]` config overrides: an entry naming an **unknown action**
+/// (silently ignored otherwise), or a **chord that doesn't parse** (which would leave the
+/// action unbound). Returns one human-readable line per problem, action-key-sorted for a
+/// stable order; empty when the config is clean. Pure over its input, so it's unit-tested.
+fn keybinding_diagnostics(overrides: &std::collections::HashMap<String, String>) -> Vec<String> {
+    let known: std::collections::HashSet<&str> = ACTIONS.iter().map(|(_, key, _, _)| *key).collect();
+    let mut keys: Vec<&String> = overrides.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .filter_map(|key| {
+            let val = &overrides[key];
+            if !known.contains(key.as_str()) {
+                Some(format!("[keybindings] unknown action '{key}' (ignored)"))
+            } else if parse_chord(val).is_none() {
+                Some(format!("[keybindings] {key}: invalid chord '{val}' (left unbound)"))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// form (for matching). Built from [`ACTIONS`] defaults with `[keybindings]` overrides.
 struct Keybindings {
     map: Vec<(Action, String, Option<Chord>)>,
 }
 
 impl Keybindings {
-    /// Load defaults, then apply any `[keybindings]` entries from the config file.
-    fn load() -> Self {
-        let overrides = read_keybinding_overrides();
+    /// Build the binding map from a given override set (defaults for anything not overridden).
+    fn from_overrides(overrides: &std::collections::HashMap<String, String>) -> Self {
         let map = ACTIONS
             .iter()
             .map(|(a, key, _label, def)| {
@@ -3905,6 +3926,23 @@ impl Keybindings {
             })
             .collect();
         Self { map }
+    }
+
+    /// Load defaults + `[keybindings]` overrides from the config file (no diagnostics — used
+    /// for throwaway rebuilds like the help overlay).
+    fn load() -> Self {
+        Self::from_overrides(&read_keybinding_overrides())
+    }
+
+    /// Like [`load`], but first prints a diagnostic for each bad `[keybindings]` entry (an
+    /// unknown action or an unparseable chord) to stderr — used at startup and on live reload
+    /// so a config typo isn't silently ignored.
+    fn load_and_report() -> Self {
+        let overrides = read_keybinding_overrides();
+        for d in keybinding_diagnostics(&overrides) {
+            eprintln!("sampa2: {d}");
+        }
+        Self::from_overrides(&overrides)
     }
 
     /// The action bound to a live key event, if any.
@@ -8036,7 +8074,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.theme = theme_from(&cfg.colors);
         self.font_size = cfg.font.size.clamp(6.0, 72.0);
         self.font_size_base = self.font_size; // zoom resets to the configured size
-        self.keys = Keybindings::load(); // pick up any [keybindings] changes
+        self.keys = Keybindings::load_and_report(); // pick up any [keybindings] changes
         self.ligatures = cfg.font.ligatures;
         self.font_family = primary_family(&cfg.font.family);
         self.cursor_style = cfg.cursor.style;
@@ -11656,6 +11694,30 @@ mod tests {
         assert_eq!(normalize_key(&Key::Character("/".into())).as_deref(), Some("Slash"));
         assert_eq!(normalize_key(&Key::Character("t".into())).as_deref(), Some("T"));
         assert_eq!(normalize_key(&Key::Named(NamedKey::Tab)).as_deref(), Some("Tab"));
+    }
+
+    #[test]
+    fn keybinding_diagnostics_flag_bad_entries() {
+        use std::collections::HashMap;
+        let mk = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        // A clean override (known action, parseable chord) → no diagnostics.
+        assert!(keybinding_diagnostics(&mk(&[("paste", "Ctrl+Alt+V")])).is_empty());
+        // An unknown action key is reported (it would otherwise be silently ignored).
+        let d = keybinding_diagnostics(&mk(&[("pastte", "Ctrl+V")]));
+        assert_eq!(d.len(), 1);
+        assert!(d[0].contains("unknown action 'pastte'"));
+        // A known action with an unparseable chord is reported (it would be left unbound).
+        let d = keybinding_diagnostics(&mk(&[("copy", "Ctrl+Shft+C")]));
+        assert_eq!(d.len(), 1);
+        assert!(d[0].contains("copy") && d[0].contains("invalid chord 'Ctrl+Shft+C'"));
+        // A bare token is a valid (modifier-less) chord — not flagged.
+        assert!(keybinding_diagnostics(&mk(&[("copy", "bogus")])).is_empty());
+        // Multiple problems come back sorted by action key for a stable order.
+        let d = keybinding_diagnostics(&mk(&[("zzz", "Ctrl+A"), ("copy", "Ctrl+A+B")]));
+        assert_eq!(d.len(), 2);
+        assert!(d[0].contains("copy") && d[1].contains("zzz"));
     }
 
     #[test]
