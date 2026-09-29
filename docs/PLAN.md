@@ -216,8 +216,15 @@ interactive pass + wider program coverage outstanding.)*
   render + resize + input routing; single-pane pixel-identical). ✅ **“＋” new-tab button** —
   a plus at the right of the tab bar (`tabs_area_w` reserves `NEW_TAB_W`, so the hit-test,
   quads and labels share the reduced strip); clicking it runs `new_tab`. `tab_bar_hit`
-  unit-tested; Xephyr-verified (click the ＋ → a third tab opens). ⬜ still: horizontal splits,
-  nested layouts, drag-resize, tab reordering/drag.
+  unit-tested; Xephyr-verified (click the ＋ → a third tab opens). ✅ **horizontal splits** —
+  Ctrl+Shift+B stacks the panes as rows (`SplitDir`; `split(dir)` shared with Ctrl+Shift+R).
+  Paint lays each pane into its vertical band (`pane_band` maps a `(y_frac, h_frac)` to
+  pixels within the grid region; a full-height pane keeps the exact vertical behaviour), the
+  divider turns horizontal, and resize gives each pane fewer rows / full columns. `pane_band`
+  unit-tested; Xephyr-verified (stacked panes render independent content + focus cycles between
+  them; vertical splits unchanged). Also fixed a latent panic — `link_at` now bounds-checks the
+  hovered cell, so a stale mouse position over a just-shrunk pane can't index past the grid.
+  ⬜ still: nested layouts, drag-resize, tab reordering/drag.
 - ✅ **Search overlay** — **Ctrl+Shift+F** opens a bottom search bar; incremental
   regex match over the whole buffer (scrollback included) via `alacritty_terminal`'s
   `RegexSearch`/`RegexIter`. All matches highlighted, the current one brighter;
