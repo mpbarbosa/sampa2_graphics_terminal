@@ -79,6 +79,8 @@ const LINE_HEIGHT: f32 = 18.0;
 const PAD: f32 = 6.0;
 /// Height of the visual tab bar, shown only when more than one tab is open.
 const TAB_BAR_H: f32 = 26.0;
+/// Width of the "+" new-tab button at the right of the tab bar (a square cell).
+const NEW_TAB_W: f32 = TAB_BAR_H;
 /// Height of the search bar (overlaid at the bottom while search is open).
 const SEARCH_H: f32 = 22.0;
 /// Highlight backgrounds for search matches (all) and the current match.
@@ -3527,11 +3529,27 @@ fn top_offset(ntabs: usize) -> f32 {
     }
 }
 
-/// Tab index under a tab-bar click at pixel `px` (window width `w`, `ntabs` ≥ 1),
-/// with tabs laid out as equal-width segments across the full width.
+/// Tab index under a tab-bar click at pixel `px` (tab-strip width `w`, `ntabs` ≥ 1),
+/// with tabs laid out as equal-width segments across that width.
 fn tab_at_px(px: f64, w: f32, ntabs: usize) -> usize {
     let tabw = (w / ntabs as f32).max(1.0) as f64;
     ((px / tabw).floor() as usize).min(ntabs - 1)
+}
+
+/// Width the tab segments occupy — the rest of the bar (`NEW_TAB_W` on the right) is the
+/// "+" new-tab button. Every tab-strip layout (hit-test, quads, labels) uses this.
+fn tabs_area_w(w: f32) -> f32 {
+    (w - NEW_TAB_W).max(1.0)
+}
+
+/// What a tab-bar click at `px` hits (window width `w`): `Some(i)` a tab segment, or `None`
+/// the "+" new-tab button on the right.
+fn tab_bar_hit(px: f64, w: f32, ntabs: usize) -> Option<usize> {
+    if px >= tabs_area_w(w) as f64 {
+        None // the "+" button
+    } else {
+        Some(tab_at_px(px, tabs_area_w(w), ntabs))
+    }
 }
 
 /// Linear blend of two sRGB byte colors, `t` in [0,1] toward `b`.
@@ -4708,7 +4726,10 @@ impl App {
                 .as_ref()
                 .map(|win| win.inner_size().width as f32)
                 .unwrap_or(1.0);
-            self.switch_to(tab_at_px(self.mouse_px, w, self.sessions.len()));
+            match tab_bar_hit(self.mouse_px, w, self.sessions.len()) {
+                Some(i) => self.switch_to(i),
+                None => self.new_tab(), // the "+" button
+            }
             return;
         }
         // Ctrl+click a hyperlink → confirm modal (explicit action, §13), never auto-opens.
@@ -9546,7 +9567,8 @@ impl Renderer {
         let bar_bg = blend(self.theme.bg, self.theme.fg, 0.10);
         let sep = blend(self.theme.bg, self.theme.fg, 0.28);
         out.push(QuadInstance { rect: [0.0, 0.0, w as f32, TAB_BAR_H], color: self.color4(bar_bg) });
-        let tabw = w as f32 / tabs.len() as f32;
+        let area = tabs_area_w(w as f32);
+        let tabw = area / tabs.len() as f32;
         for i in 0..tabs.len() {
             let x = i as f32 * tabw;
             if i == active {
@@ -9566,6 +9588,13 @@ impl Renderer {
                 });
             }
         }
+        // The "+" new-tab button: a divider, then a plus glyph drawn as two bars.
+        out.push(QuadInstance { rect: [area, 4.0, 1.0, TAB_BAR_H - 8.0], color: self.color4(sep) });
+        let (cx, cy) = (area + NEW_TAB_W / 2.0, TAB_BAR_H / 2.0);
+        let (arm, thick) = (6.0, 2.0);
+        let plus = blend(self.theme.bg, self.theme.fg, 0.75);
+        out.push(QuadInstance { rect: [cx - arm, cy - thick / 2.0, arm * 2.0, thick], color: self.color4(plus) });
+        out.push(QuadInstance { rect: [cx - thick / 2.0, cy - arm, thick, arm * 2.0], color: self.color4(plus) });
     }
 
     /// Shape each tab's label into its own reusable buffer (grown lazily). No-op when
@@ -9578,7 +9607,7 @@ impl Renderer {
             let b = Buffer::new(&mut self.font_system, Metrics::new(13.0, self.line_h));
             self.tab_buffers.push(b);
         }
-        let tabw = w as f32 / tabs.len() as f32;
+        let tabw = tabs_area_w(w as f32) / tabs.len() as f32;
         let inactive = blend(self.theme.fg, self.theme.bg, 0.45);
         for (i, title) in tabs.iter().enumerate() {
             let label = tab_label(title, i);
@@ -10358,7 +10387,7 @@ impl Renderer {
             }
         }
         if tabs.len() > 1 {
-            let tabw = w as f32 / tabs.len() as f32;
+            let tabw = tabs_area_w(w as f32) / tabs.len() as f32;
             let label_top = ((TAB_BAR_H - self.line_h) / 2.0).max(0.0);
             for (i, buf) in self.tab_buffers.iter().enumerate().take(tabs.len()) {
                 let seg = i as f32 * tabw;
@@ -11862,6 +11891,14 @@ mod tests {
         assert_eq!(tab_at_px(150.0, 300.0, 3), 1); // segment 1 = [100,200)
         assert_eq!(tab_at_px(299.0, 300.0, 3), 2); // segment 2 = [200,300)
         assert_eq!(tab_at_px(1000.0, 300.0, 3), 2); // past the end → last tab
+
+        // The "+" button occupies the rightmost NEW_TAB_W; tabs share the rest.
+        let w = 300.0;
+        let area = tabs_area_w(w); // 300 - NEW_TAB_W
+        assert_eq!(tab_bar_hit((area + 1.0) as f64, w, 3), None); // in the "+" zone
+        assert_eq!(tab_bar_hit((w - 1.0) as f64, w, 3), None); // far right → "+"
+        assert_eq!(tab_bar_hit(1.0, w, 3), Some(0)); // first tab
+        assert_eq!(tab_bar_hit((area - 1.0) as f64, w, 3), Some(2)); // last tab, still left of "+"
     }
 
     #[test]
