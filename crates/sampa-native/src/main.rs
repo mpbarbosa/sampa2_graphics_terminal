@@ -2692,6 +2692,7 @@ fn main() -> Result<()> {
         mouse_col: 0,
         mouse_row: 0,
         mouse_px: 0.0,
+        tab_drag: None,
         mouse_py: 0.0,
         left_down: false,
         last_click: None,
@@ -3193,6 +3194,7 @@ struct App {
     mouse_px: f64, // raw pixel X/Y, for tab-bar hit-testing
     mouse_py: f64,
     left_down: bool,
+    tab_drag: Option<usize>, // grabbed tab's current index while dragging to reorder (None = not)
     last_click: Option<(std::time::Instant, usize, usize)>,
     click_count: u8,
     clipboard: Option<arboard::Clipboard>,
@@ -3691,6 +3693,20 @@ fn tab_bar_hit(px: f64, w: f32, ntabs: usize) -> Option<usize> {
         None // the "+" button
     } else {
         Some(tab_at_px(px, tabs_area_w(w), ntabs))
+    }
+}
+
+/// Where the index `idx` lands after moving the element at `from` to `to` in a Vec (the
+/// remap tab-drag reordering applies to `active`/`panes`). Pure, so it's unit-tested.
+fn move_index(idx: usize, from: usize, to: usize) -> usize {
+    if idx == from {
+        to
+    } else if from < to && idx > from && idx <= to {
+        idx - 1 // elements between shift left toward the vacated slot
+    } else if from > to && idx >= to && idx < from {
+        idx + 1 // elements between shift right
+    } else {
+        idx
     }
 }
 
@@ -4749,6 +4765,18 @@ impl App {
     fn on_cursor_moved(&mut self, x: f64, y: f64) {
         self.mouse_px = x;
         self.mouse_py = y;
+        // Tab-reorder drag: while a tab is grabbed, moving the cursor over another tab's
+        // segment slides the grabbed tab there (live). Takes precedence over grid handling.
+        if let Some(from) = self.tab_drag {
+            let w = self.window.as_ref().map(|win| win.inner_size().width as f32).unwrap_or(1.0);
+            if let Some(to) = tab_bar_hit(x, w, self.sessions.len()) {
+                if to != from {
+                    self.reorder_tab(from, to);
+                    self.tab_drag = Some(to);
+                }
+            }
+            return;
+        }
         let (col, row, side) = self.cell_at(x, y);
         let moved = col != self.mouse_col || row != self.mouse_row;
         self.mouse_col = col;
@@ -4912,7 +4940,10 @@ impl App {
                 .map(|win| win.inner_size().width as f32)
                 .unwrap_or(1.0);
             match tab_bar_hit(self.mouse_px, w, self.sessions.len()) {
-                Some(i) => self.switch_to(i),
+                Some(i) => {
+                    self.switch_to(i);
+                    self.tab_drag = Some(i); // begin a drag-to-reorder from this tab
+                }
                 None => self.new_tab(), // the "+" button
             }
             return;
@@ -4926,6 +4957,9 @@ impl App {
         }
         if button == MouseButton::Left {
             self.left_down = pressed;
+            if !pressed {
+                self.tab_drag = None; // release ends any tab-reorder drag
+            }
         }
         // Report to the app unless Shift forces local handling.
         if !self.modifiers.shift_key() && self.report_mouse(cb_base, pressed, false) {
@@ -5194,6 +5228,25 @@ impl App {
             self.panes = vec![self.active];
             self.focus = 0;
         }
+    }
+
+    /// Move tab `from` to position `to` in the tab strip (drag-to-reorder). Only in the classic
+    /// single-pane view — reordering the session list under a split would scramble `panes`.
+    fn reorder_tab(&mut self, from: usize, to: usize) {
+        if from == to
+            || self.panes.len() != 1
+            || from >= self.sessions.len()
+            || to >= self.sessions.len()
+        {
+            return;
+        }
+        let s = self.sessions.remove(from);
+        self.sessions.insert(to, s);
+        self.active = move_index(self.active, from, to);
+        self.panes = vec![self.active];
+        self.focus = 0;
+        self.update_title(); // the `[i/n]` index may have changed
+        self.request_redraw();
     }
 
     /// Run a bound keyboard action. The single place app shortcuts take effect, so the
@@ -12221,6 +12274,23 @@ mod tests {
         assert_eq!(tab_bar_hit((w - 1.0) as f64, w, 3), None); // far right → "+"
         assert_eq!(tab_bar_hit(1.0, w, 3), Some(0)); // first tab
         assert_eq!(tab_bar_hit((area - 1.0) as f64, w, 3), Some(2)); // last tab, still left of "+"
+    }
+
+    #[test]
+    fn move_index_remaps_after_reorder() {
+        // Move tab 0 → 2 in [A,B,C,D] → [B,C,A,D]: the moved index becomes `to`, the ones it
+        // passed shift left, the rest stay.
+        assert_eq!(move_index(0, 0, 2), 2); // the moved element
+        assert_eq!(move_index(1, 0, 2), 0); // B shifted left
+        assert_eq!(move_index(2, 0, 2), 1); // C shifted left
+        assert_eq!(move_index(3, 0, 2), 3); // D untouched (past the range)
+        // Move tab 3 → 1 in [A,B,C,D] → [A,D,B,C]: the ones it passed shift right.
+        assert_eq!(move_index(3, 3, 1), 1);
+        assert_eq!(move_index(1, 3, 1), 2);
+        assert_eq!(move_index(2, 3, 1), 3);
+        assert_eq!(move_index(0, 3, 1), 0); // before the range, untouched
+        // No-op move leaves everything put.
+        assert_eq!(move_index(2, 1, 1), 2);
     }
 
     #[test]

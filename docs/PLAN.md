@@ -234,7 +234,11 @@ interactive pass + wider program coverage outstanding.)*
   unit-tested; Xephyr-verified (stacked panes render independent content + focus cycles between
   them; vertical splits unchanged). Also fixed a latent panic — `link_at` now bounds-checks the
   hovered cell, so a stale mouse position over a just-shrunk pane can't index past the grid.
-  ⬜ still: nested layouts, drag-resize, tab reordering/drag.
+  ✅ **tab drag-reorder** — press a tab and drag it across the strip to move it; crossing
+  into another tab's segment slides it there live (`reorder_tab`, gated to the single-pane
+  view so a split's `panes` can't be scrambled). `move_index` remaps `active`/`panes` after
+  the move (unit-tested); Xephyr-verified (dragging `TAB_AAA` from slot 1 to 3 leaves
+  `BBB · CCC · AAA`, the dragged tab still active). ⬜ still: nested layouts, drag-resize.
 - ✅ **Search overlay** — **Ctrl+Shift+F** opens a bottom search bar; incremental
   regex match over the whole buffer (scrollback included) via `alacritty_terminal`'s
   `RegexSearch`/`RegexIter`. All matches highlighted, the current one brighter;
