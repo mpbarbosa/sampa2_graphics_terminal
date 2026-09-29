@@ -213,8 +213,11 @@ interactive pass + wider program coverage outstanding.)*
   **click-to-switch**; the grid offsets below it (and reflows on the 1↔2 boundary).
   Geometry/label/close-index math unit-tested; bar rendered + verified via `--capture`.
   ✅ **splits** — Ctrl+Shift+R splits a vertical pane, Ctrl+Shift+O cycles focus (per-pane
-  render + resize + input routing; single-pane pixel-identical). ⬜ still: horizontal splits,
-  nested layouts, drag-resize, tab reordering/drag, a “＋” new-tab affordance.
+  render + resize + input routing; single-pane pixel-identical). ✅ **“＋” new-tab button** —
+  a plus at the right of the tab bar (`tabs_area_w` reserves `NEW_TAB_W`, so the hit-test,
+  quads and labels share the reduced strip); clicking it runs `new_tab`. `tab_bar_hit`
+  unit-tested; Xephyr-verified (click the ＋ → a third tab opens). ⬜ still: horizontal splits,
+  nested layouts, drag-resize, tab reordering/drag.
 - ✅ **Search overlay** — **Ctrl+Shift+F** opens a bottom search bar; incremental
   regex match over the whole buffer (scrollback included) via `alacritty_terminal`'s
   `RegexSearch`/`RegexIter`. All matches highlighted, the current one brighter;
