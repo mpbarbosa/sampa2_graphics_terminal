@@ -429,9 +429,13 @@ and show target; a CJK/emoji/compose input test passes; a screen reader sees the
   (`sampa2 --bench [MiB]`) measures the parse+grid hot path (the `cat 50MB` ceiling minus GPU
   present) on a deterministic representative workload, reporting MiB/s, line rate, and the
   100k-line scrollback RSS. Baseline **~82–87 MiB/s · ~1.2 M lines/s · ~193 MiB scrollback**
-  (`bench_workload` unit-tested), documented in [perf.md](perf.md). ⬜ still: typometer
-  added-input-latency **< one frame** (needs the live window), and wiring the bench as a
-  non-gating **trend in CI**.
+  (`bench_workload` unit-tested), documented in [perf.md](perf.md). ✅ **non-gating trend in
+  CI** — the bench job emits its metrics as one JSON line (`--out`) and uploads them as an
+  artifact each run; the next run pulls the most recent **base-branch** run's metrics
+  (same runner class) as a baseline (`--baseline`) and prints the signed %Δ to the run
+  Summary, flagging a >10 % drop as `⚠` **advisory** only (`bench_trend`, unit-tested; the job
+  never gates on it). First run / fork-PR read-only token → no baseline, trend skipped.
+  ⬜ still: typometer added-input-latency **< one frame** (needs the live window).
 
 **v1:** app matrix green · esctest threshold met · latency/throughput targets met ·
 signature-feature tests green · config reference + docs complete.

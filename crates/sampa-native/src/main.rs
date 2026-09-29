@@ -2314,11 +2314,33 @@ fn bench_workload(target: usize) -> Vec<u8> {
     out
 }
 
-/// `--bench [MiB]`: measure **VT ingest throughput** — the parse-and-grid hot path
-/// (`Processor::advance` into `Term`), i.e. the "cat a big file" ceiling *minus* GPU present.
-/// Feeds a representative workload in 64 KiB chunks (like the real reader thread) through an
-/// 80×24 grid with a 100k-line scrollback, then reports MiB/s, lines/s, and the RSS delta.
-fn bench(mb: usize) -> Result<()> {
+/// Percent change of a `--bench` throughput vs an earlier run's baseline, and whether it is a
+/// **regression** past `BENCH_REGRESSION_PCT`. Pure, so the CI trend verdict is unit-tested;
+/// the comparison is only meaningful run-to-run on the *same* hardware class (CI vs CI).
+const BENCH_REGRESSION_PCT: f64 = 10.0;
+fn bench_trend(baseline_mib_s: f64, current_mib_s: f64) -> (f64, bool) {
+    if baseline_mib_s <= 0.0 {
+        return (0.0, false); // no usable baseline → never flag
+    }
+    let pct = (current_mib_s - baseline_mib_s) / baseline_mib_s * 100.0;
+    (pct, pct < -BENCH_REGRESSION_PCT)
+}
+
+/// One-line trend verdict for the CI Summary (and stdout): the signed %Δ vs `baseline` with a
+/// `✓`/`⚠` marker. `⚠` is advisory — the bench job never gates on it.
+fn bench_trend_line(baseline_mib_s: f64, current_mib_s: f64) -> String {
+    let (pct, regressed) = bench_trend(baseline_mib_s, current_mib_s);
+    let mark = if regressed { "⚠ regression (advisory)" } else { "✓ within noise" };
+    format!("  trend:      {baseline_mib_s:.0} MiB/s baseline → {current_mib_s:.0} MiB/s ({pct:+.1}%) {mark}")
+}
+
+/// `--bench [MiB] [--baseline <MiB/s>] [--out <file>]`: measure **VT ingest throughput** — the
+/// parse-and-grid hot path (`Processor::advance` into `Term`), i.e. the "cat a big file"
+/// ceiling *minus* GPU present. Feeds a representative workload in 64 KiB chunks (like the real
+/// reader thread) through an 80×24 grid with a 100k-line scrollback, then reports MiB/s,
+/// lines/s, and the RSS delta. With `--baseline` it also prints a %Δ trend line vs an earlier
+/// run; with `--out` it writes the metrics as one JSON line (the CI trend artifact).
+fn bench(mb: usize, baseline: Option<f64>, out: Option<&std::path::Path>) -> Result<()> {
     let (cols, rows) = (80u16, 24u16);
     let payload = bench_workload(mb * 1024 * 1024);
     let lines = payload.iter().filter(|&&b| b == b'\n').count();
@@ -2339,12 +2361,30 @@ fn bench(mb: usize) -> Result<()> {
 
     let secs = elapsed.as_secs_f64();
     let actual_mib = payload.len() as f64 / (1024.0 * 1024.0);
+    let mib_per_s = actual_mib / secs;
+    let lines_per_s = lines as f64 / secs;
+    let rss_kib = match (rss_before, rss_after) {
+        (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+        _ => None,
+    };
     println!("sampa2 --bench — VT ingest (parse + grid, no GPU present)");
     println!("  workload:   {actual_mib:.1} MiB · {lines} lines · {cols}×{rows} grid · 100k scrollback");
     println!("  elapsed:    {secs:.3} s");
-    println!("  throughput: {:.0} MiB/s · {:.0} lines/s", actual_mib / secs, lines as f64 / secs);
-    if let (Some(a), Some(b)) = (rss_before, rss_after) {
-        println!("  RSS delta:  {} KiB (parser + grid + scrollback)", b.saturating_sub(a));
+    println!("  throughput: {mib_per_s:.0} MiB/s · {lines_per_s:.0} lines/s");
+    if let Some(kib) = rss_kib {
+        println!("  RSS delta:  {kib} KiB (parser + grid + scrollback)");
+    }
+    // Trend vs an earlier run's throughput (CI passes the previous run's baseline).
+    if let Some(base) = baseline {
+        println!("{}", bench_trend_line(base, mib_per_s));
+    }
+    // Machine-readable metrics for the CI trend artifact (one JSON line).
+    if let Some(path) = out {
+        let json = format!(
+            "{{\"mib_per_s\":{mib_per_s:.1},\"lines_per_s\":{lines_per_s:.0},\"rss_kib\":{},\"mib\":{actual_mib:.1},\"secs\":{secs:.3}}}\n",
+            rss_kib.map(|k| k.to_string()).unwrap_or_else(|| "null".into()),
+        );
+        std::fs::write(path, json)?;
     }
     Ok(())
 }
@@ -2360,7 +2400,12 @@ fn main() -> Result<()> {
     }
     if let Some(i) = args.iter().position(|a| a == "--bench") {
         let mb = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
-        return bench(mb);
+        let flag_val = |name: &str| {
+            args.iter().position(|a| a == name).and_then(|j| args.get(j + 1)).cloned()
+        };
+        let baseline = flag_val("--baseline").and_then(|s| s.parse::<f64>().ok());
+        let out = flag_val("--out");
+        return bench(mb, baseline, out.as_deref().map(std::path::Path::new));
     }
 
     // Full CLI (§12.2) via the shared, tested `sampa-cli` parser: -e/-- CMD…,
@@ -11687,6 +11732,22 @@ mod tests {
         assert!(a.len() >= 100_000);
         assert!(a.contains(&b'\n'), "should contain line breaks (grid scrolling)");
         assert!(a.windows(2).any(|w| w == [0x1b, b'[']), "should contain SGR escapes");
+    }
+
+    #[test]
+    fn bench_trend_flags_only_real_regressions() {
+        // Faster or roughly-flat vs the baseline → positive/small %Δ, never flagged.
+        let (pct, reg) = bench_trend(80.0, 88.0);
+        assert!((pct - 10.0).abs() < 1e-9 && !reg, "+10% is an improvement");
+        assert!(!bench_trend(80.0, 76.0).1, "−5% is within noise, not a regression");
+        // A drop past the threshold is flagged (advisory only).
+        let (pct, reg) = bench_trend(80.0, 60.0);
+        assert!(pct < 0.0 && reg, "−25% is a regression");
+        // A missing/zero baseline is never flagged (first run has nothing to compare).
+        assert_eq!(bench_trend(0.0, 60.0), (0.0, false));
+        // The Summary line carries the numbers and the right marker.
+        assert!(bench_trend_line(80.0, 60.0).contains("⚠ regression"));
+        assert!(bench_trend_line(80.0, 88.0).contains("✓ within noise"));
     }
 
     #[test]

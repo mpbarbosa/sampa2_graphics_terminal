@@ -53,6 +53,10 @@ jobs:
     name: VT ingest throughput (trend)
     runs-on: ubuntu-latest
     needs: test
+    # `actions: read` lets us pull the previous run's metrics artifact for the trend baseline.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
@@ -66,10 +70,42 @@ jobs:
       - name: Build release
         run: cargo build --release -p sampa-native --locked
 
-      # Non-gating perf trend: the MiB/s lands in the run's Summary each time (docs/perf.md).
+      # Trend baseline: the throughput from the most recent successful CI run on the base
+      # branch (same runner class, so the comparison is meaningful). Best-effort — the first
+      # run ever, or a fork PR with a read-only token, simply has no baseline and skips it.
+      - name: Baseline from previous run
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.ref_name }}
+        run: |
+          prev=$(gh run list -w CI -b "$BASE_REF" -s success -L 1 \
+                   --json databaseId -q '.[0].databaseId // empty' 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            gh run download "$prev" -n perf-metrics -D prev 2>/dev/null || true
+          fi
+          if [ -f prev/perf-metrics.json ]; then
+            base=$(jq -r '.mib_per_s // empty' prev/perf-metrics.json)
+            echo "PERF_BASELINE=$base" >> "$GITHUB_ENV"
+            echo "baseline: $base MiB/s (run $prev)"
+          else
+            echo "no previous metrics — first run or unavailable; trend skipped"
+          fi
+
+      # Non-gating perf trend: MiB/s + the %Δ vs the baseline land in the run Summary, and the
+      # metrics are uploaded so the next run can diff against this one (docs/perf.md).
       - name: Bench (VT ingest)
         run: |
-          echo '### VT ingest throughput' >> "$GITHUB_STEP_SUMMARY"
+          echo '### VT ingest throughput (trend)' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          ./target/release/sampa2 --bench | tee -a "$GITHUB_STEP_SUMMARY"
+          ./target/release/sampa2 --bench 50 ${PERF_BASELINE:+--baseline "$PERF_BASELINE"} \
+            --out perf-metrics.json | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload metrics (next run's baseline)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-metrics
+          path: perf-metrics.json
+          if-no-files-found: warn
