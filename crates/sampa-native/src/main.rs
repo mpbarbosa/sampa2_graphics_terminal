@@ -618,6 +618,33 @@ fn osc52_preview(text: &str) -> (String, String) {
     (label, preview)
 }
 
+/// Whether a paste should raise the multi-line confirm modal (§13 paste safety). Only when the
+/// app is **not** in bracketed-paste mode — a bracketed-paste-aware program (shell/editor) is
+/// told "this is pasted", so it won't auto-run the lines — **and** the text is genuinely
+/// multi-line: trailing newlines are ignored (a single command with a trailing `\n` just runs
+/// the one line the user meant), but an *interior* newline would submit a command before the
+/// user can review it. Pure, so the gate is unit-tested.
+fn paste_needs_confirm(text: &str, bracketed: bool) -> bool {
+    !bracketed && text.trim_end_matches(['\n', '\r']).contains('\n')
+}
+
+/// Line count and a short, control-safe preview for the multi-line paste modal: the first two
+/// non-empty logical lines, each clipped to 60 chars, with a trailing `…` when more follows.
+fn paste_preview(text: &str) -> (usize, String) {
+    let lines: Vec<&str> = text.trim_end_matches(['\n', '\r']).split('\n').collect();
+    let n = lines.len();
+    let clip = |s: &str| -> String {
+        let clean: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let head: String = clean.chars().take(60).collect();
+        format!("{head}{}", if clean.chars().count() > 60 { "…" } else { "" })
+    };
+    let mut preview = lines.iter().take(2).map(|l| clip(l)).collect::<Vec<_>>().join("\n");
+    if n > 2 {
+        preview.push_str(&format!("\n… (+{} more line{})", n - 2, if n - 2 == 1 { "" } else { "s" }));
+    }
+    (n, preview)
+}
+
 /// Run a **read-only, timeout-bounded** `df -k` off the caller's thread and parse it into
 /// per-filesystem usage rows (spec-df-gauge.md §3). `df` stats every mount and can block on a
 /// stale network mount, so a reader thread drains stdout and the child is killed at 6s.
@@ -2532,6 +2559,7 @@ fn main() -> Result<()> {
         osc52_session_allow: false,
         osc52_prompt: None,
         link_confirm: None,
+        paste_confirm: None,
         link_hover: false,
         hovered_link: None,
         title: win_title,
@@ -3010,6 +3038,7 @@ struct App {
     osc52_session_allow: bool,        // set when the user picks "allow for this session"
     osc52_prompt: Option<String>,     // a pending OSC-52 write awaiting consent (the payload)
     link_confirm: Option<String>,     // a hyperlink awaiting the open/cancel confirm modal
+    paste_confirm: Option<String>,    // multi-line clipboard text awaiting the paste/cancel modal
     link_hover: bool,                 // cursor is over a link with Ctrl held (hand cursor shown)
     hovered_link: Option<(usize, usize, usize)>, // (row, start_col, end_col) to accent-underline
     title: String,
@@ -3286,6 +3315,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // The link-open confirm modal likewise gates opening a URL in the browser.
                 if self.link_confirm.is_some() {
                     self.link_confirm_key(&event.logical_key);
+                    return;
+                }
+                // The multi-line paste confirm modal gates running pasted commands.
+                if self.paste_confirm.is_some() {
+                    self.paste_confirm_key(&event.logical_key);
                     return;
                 }
                 if self.help_on {
@@ -4604,6 +4638,19 @@ impl App {
         // Strip any embedded paste-end marker (§13 paste-injection guard).
         let clean = text.replace("\x1b[201~", "");
         let bracketed = self.term_mode().contains(TermMode::BRACKETED_PASTE);
+        // Multi-line paste into a non-bracketed app (a bare shell prompt) would run each line
+        // immediately. Hold it behind a confirm modal so the user sees what will run (§13).
+        if paste_needs_confirm(&clean, bracketed) {
+            self.paste_confirm = Some(clean);
+            self.request_redraw();
+            return;
+        }
+        self.send_paste(&clean, bracketed);
+    }
+
+    /// Write pasted text to the PTY, wrapped in the bracketed-paste markers when the app
+    /// enabled them. Shared by the direct paste path and the confirmed multi-line path.
+    fn send_paste(&mut self, clean: &str, bracketed: bool) {
         let mut out = Vec::with_capacity(clean.len() + 12);
         if bracketed {
             out.extend_from_slice(b"\x1b[200~");
@@ -4614,6 +4661,24 @@ impl App {
         }
         self.pty_write(&out);
         self.schedule_preview(); // pasted commands preview too (grid-read after debounce)
+    }
+
+    /// Key handling for the multi-line paste confirm modal: Enter/`y` pastes (non-bracketed —
+    /// it only opens in that case), Esc/`n` discards it. Either way the modal closes.
+    fn paste_confirm_key(&mut self, key: &Key) {
+        let paste = match key {
+            Key::Named(NamedKey::Enter) => true,
+            Key::Named(NamedKey::Escape) => false,
+            Key::Character(c) if c.eq_ignore_ascii_case("y") => true,
+            Key::Character(c) if c.eq_ignore_ascii_case("n") => false,
+            _ => return,
+        };
+        if let Some(text) = self.paste_confirm.take() {
+            if paste {
+                self.send_paste(&text, false);
+            }
+        }
+        self.request_redraw();
     }
 
     /// Pixel width of one split-pane column for a window width `w` (dividers subtracted,
@@ -7846,6 +7911,31 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                 (uri.clone(), accent, false, true),
                 (
                     "\n\nEnter / o  open  ·  Esc / n  cancel".to_string(),
+                    muted,
+                    false,
+                    false,
+                ),
+            ];
+            Some(AiCard { title: &ai_title, body_spans: &ai_body_spans })
+        } else if let Some(text) = &self.paste_confirm {
+            // Multi-line paste confirm: the app isn't in bracketed-paste mode, so these lines
+            // would run on paste. Show how many and a preview before committing (§13).
+            let fg = self.theme.fg;
+            let muted = blend(self.theme.bg, self.theme.fg, 0.55);
+            let accent = self.theme.cursor;
+            let (n, preview) = paste_preview(text);
+            ai_title = "Run pasted text?".to_string();
+            ai_body_spans = vec![
+                (
+                    format!("This paste is {n} lines with no bracketed-paste guard — pressing Enter runs them:"),
+                    fg,
+                    false,
+                    false,
+                ),
+                ("\n\n".to_string(), muted, false, false),
+                (preview, accent, false, true),
+                (
+                    "\n\nEnter / y  paste & run  ·  Esc / n  cancel".to_string(),
                     muted,
                     false,
                     false,
@@ -11920,6 +12010,33 @@ mod tests {
         let (_, long) = osc52_preview(&"a".repeat(80));
         assert_eq!(long.chars().filter(|&c| c == 'a').count(), 60);
         assert!(long.ends_with("…\u{201d}"));
+    }
+
+    #[test]
+    fn paste_confirm_gates_only_risky_multiline() {
+        // Bracketed-paste-aware app: never confirm (the app won't auto-run the lines).
+        assert!(!paste_needs_confirm("a\nb\nc", true));
+        // Non-bracketed, genuinely multi-line (interior newline) → confirm.
+        assert!(paste_needs_confirm("git add .\ngit commit", false));
+        assert!(paste_needs_confirm("a\nb\n", false)); // trailing newline ignored, still 2 lines
+        // Non-bracketed but a single line — with or without a trailing newline → no confirm.
+        assert!(!paste_needs_confirm("just one command", false));
+        assert!(!paste_needs_confirm("one\n", false));
+        assert!(!paste_needs_confirm("", false));
+    }
+
+    #[test]
+    fn paste_preview_counts_lines_and_clips() {
+        // Two lines shown verbatim; count excludes the trailing blank line.
+        let (n, p) = paste_preview("ls -la\ncd /tmp\n");
+        assert_eq!(n, 2);
+        assert_eq!(p, "ls -la\ncd /tmp");
+        // Beyond two lines: a "+N more" tail (pluralized), control chars neutralized.
+        let (n, p) = paste_preview("a\tx\nb\nc\nd");
+        assert_eq!(n, 4);
+        assert!(p.starts_with("a x\nb")); // tab → space, first two lines
+        assert!(p.contains("+2 more lines"));
+        assert_eq!(paste_preview("one\ntwo\nthree").1, "one\ntwo\n… (+1 more line)");
     }
 
     #[test]
