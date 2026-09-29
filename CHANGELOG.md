@@ -5,6 +5,58 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.12.0] - 2026-09-29
+
+Two headline features land. **Horizontal splits** — `Ctrl+Shift+B` stacks panes as rows,
+alongside `Ctrl+Shift+R` for columns — and the **kitty keyboard protocol** (disambiguate
+level), so modern TUIs like neovim get unambiguous key reporting (`Ctrl+I` ≠ Tab, `Ctrl+M` ≠
+Enter, `Esc` is explicit). Also new: **opt-in shell integration** (`eval "$(sampa2
+--shell-integration zsh)"`) that gives the man/preview/palette **exact** OSC-133 command
+boundaries; **X11/Wayland PRIMARY selection** (select-to-copy, middle-click paste);
+**block/rectangular selection** (Alt-drag); **command-palette frecency ordering**; **styled
+underlines** (SGR `4:2`–`4:5` double/curly/dotted/dashed + underline colour); **Kitty graphics
+z-index (`z=`) and relative placement (`P=`)**; **in-panel search** in the man/cheat-sheet
+panel; mouse-wheel **preview scrolling**; a tab-bar **"+" new-tab button**; **multi-line paste
+confirmation** for non-bracketed apps; keybinding-config **diagnostics**; and a non-gating
+**VT-ingest perf trend in CI**.
+
+### Features
+
+- Horizontal splits — stack panes as rows (`Ctrl+Shift+B`) — N3
+- Kitty keyboard protocol — disambiguate level — N1
+- Opt-in zsh/bash shell integration (OSC 7 + OSC 133) — N4
+- X11/Wayland PRIMARY selection — select-to-copy, middle-click paste — N1
+- Block (rectangular) selection via Alt-drag — N1
+- Command-palette frecency ordering — N3
+- Styled underlines (SGR 4:2/4:3/4:4/4:5) + underline colour (SGR 58) — N5
+- Kitty graphics z-index (`z=`) — stacking order + under-text placement — N5
+- Kitty graphics relative placement (`P=`, `H`/`V`) — pin an image to another — N5
+- In-panel search for the man / cheat-sheet panel — N4
+- Scroll the command-preview panel with the mouse wheel — N4
+- "+" new-tab button in the tab bar — N2
+- Multi-line paste confirm for non-bracketed apps (§13 paste safety) — N1
+- Diagnostics for bad `[keybindings]` config entries — N4
+- Dynamic cursor shape via DECSCUSR (`CSI Ps SP q`) — N1
+- Focus reporting (XTFOCUS / DECSET 1004) — N1
+- Application keypad mode (DECKPAM) — N1
+- Accent-underline the Ctrl-hovered hyperlink — N5
+- Native URL link-preview overlay (`Ctrl+Shift+U`); git-status preview mirrored to native
+- `aws` / `helm` / `kubectl` / `docker` / `npm` / `cargo` command cheat-sheets in the native build
+- Wire the VT-ingest bench as a non-gating trend in CI — N6
+
+### Bug Fixes
+
+- Default the URL-preview keybinding to `Ctrl+Shift+L` (not `U`)
+
+### Testing
+
+- CJK/emoji width + Unicode snapshot render checks — N6
+- Expand the real-app matrix (nvim/tmux/less + mc/emacs/weechat) — N6
+
+### Miscellaneous Tasks
+
+- Pin the last core path deps to git — reproducible build + CI
+
 ## [0.11.0] - 2026-08-23
 
 A native **`netstat`/`ss` connections table** joins the enhance-view set (`Ctrl+Shift+D`):
