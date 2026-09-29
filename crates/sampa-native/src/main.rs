@@ -1009,6 +1009,7 @@ struct DecrqcraScanner {
     star: bool,     // saw '*' intermediate (DECRQCRA)
     bang: bool,     // saw '!' intermediate (DECSTR)
     private: bool,  // saw a leading '?' private marker (DEC private modes)
+    kbd: u8,        // saw a leading '>'/'<'/'=' kitty-keyboard marker (0 = none)
     bad: bool,      // saw a disqualifying intermediate / private marker
     osc: Vec<u8>,   // OSC string head (capped) — enough to spot an `OSC 133 ; X` marker
 }
@@ -1046,6 +1047,63 @@ enum ScanEvent {
     /// letter: `A` prompt-start, `B` command-start, `C` command-executed, `D` finished.
     /// Used to locate the command on the prompt line exactly (no prompt-glyph guessing).
     Osc133 { kind: u8 },
+    /// A **kitty keyboard protocol** mode change/query. The VT engine exposes the mode flags
+    /// but never parses these `… u` sequences, so we keep a shadow stack and answer the query.
+    KittyKeyboard(KittyKbd),
+}
+
+/// A kitty keyboard protocol operation (its `… u` escape): push a flag set, set the current
+/// flags (mode 1 replace / 2 set-bits / 3 clear-bits), pop N entries, or report the flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KittyKbd {
+    Push(u8),    // CSI > flags u
+    Set(u8, u8), // CSI = flags ; mode u
+    Pop(u16),    // CSI < number u
+    Query,       // CSI ? u
+}
+
+/// The five kitty keyboard flag bits we track (mask); higher bits are ignored.
+const KITTY_KBD_FLAGS: u8 = 0b1_1111;
+/// Bound the mode stack so a runaway app can't grow it without limit (kitty's own cap).
+const KITTY_KBD_MAX_STACK: usize = 16;
+
+/// Apply a kitty keyboard op to the shadow mode `stack` (the current flags are its top). Push
+/// adds a flag set, Set replaces (mode 1) / ORs (2) / clears (3) the top's bits, Pop removes
+/// entries; Query returns the reply bytes `CSI ? <flags> u`. Pure, so it's unit-tested.
+fn apply_kitty_keyboard(stack: &mut Vec<u8>, op: KittyKbd) -> Option<Vec<u8>> {
+    match op {
+        KittyKbd::Push(flags) => {
+            if stack.len() >= KITTY_KBD_MAX_STACK {
+                stack.remove(0);
+            }
+            stack.push(flags & KITTY_KBD_FLAGS);
+            None
+        }
+        KittyKbd::Set(flags, mode) => {
+            let cur = stack.last().copied().unwrap_or(0);
+            let f = flags & KITTY_KBD_FLAGS;
+            let new = match mode {
+                2 => cur | f,  // set the given bits
+                3 => cur & !f, // reset the given bits
+                _ => f,        // 1 (default): replace all flags
+            };
+            match stack.last_mut() {
+                Some(top) => *top = new,
+                None => stack.push(new),
+            }
+            None
+        }
+        KittyKbd::Pop(n) => {
+            for _ in 0..n {
+                stack.pop();
+            }
+            None
+        }
+        KittyKbd::Query => {
+            let flags = stack.last().copied().unwrap_or(0);
+            Some(format!("\x1b[?{flags}u").into_bytes())
+        }
+    }
 }
 
 impl DecrqcraScanner {
@@ -1062,6 +1120,7 @@ impl DecrqcraScanner {
         self.star = false;
         self.bang = false;
         self.private = false;
+        self.kbd = 0;
         self.bad = false;
     }
 
@@ -1183,6 +1242,10 @@ impl DecrqcraScanner {
                     b'?' if self.params.is_empty() && !self.cur_seen && !self.private => {
                         self.private = true
                     }
+                    // A leading '>'/'<'/'=' is the kitty-keyboard marker (for the `… u` forms).
+                    b'>' | b'<' | b'=' if self.params.is_empty() && !self.cur_seen && self.kbd == 0 => {
+                        self.kbd = b
+                    }
                     0x40..=0x7e => {
                         self.push_param(); // finalize the trailing parameter
                         if !self.bad {
@@ -1196,6 +1259,20 @@ impl DecrqcraScanner {
                                 // XTWINOPS (`CSI … t`): resize / DECSLPP / size reports.
                                 if let Some(ev) = self.winop() {
                                     out.push((i + 1, ev));
+                                }
+                            } else if b == b'u' && !self.star && !self.bang {
+                                // Kitty keyboard protocol: `> flags` push, `= flags ; mode`
+                                // set, `< n` pop, `? ` report. (The VT engine ignores these.)
+                                let p0 = self.params.first().copied().unwrap_or(0);
+                                let ev = match self.kbd {
+                                    b'>' => Some(KittyKbd::Push(p0 as u8)),
+                                    b'=' => Some(KittyKbd::Set(p0 as u8, self.params.get(1).copied().unwrap_or(1) as u8)),
+                                    b'<' => Some(KittyKbd::Pop(self.params.first().copied().unwrap_or(1).max(1))),
+                                    _ if self.private => Some(KittyKbd::Query),
+                                    _ => None,
+                                };
+                                if let Some(k) = ev {
+                                    out.push((i + 1, ScanEvent::KittyKeyboard(k)));
                                 }
                             } else if (b == b'h' || b == b'l')
                                 && self.private
@@ -2286,6 +2363,9 @@ struct TermState {
     /// in alacritty grid coordinates. `None` when not at an integrated prompt. Lets the
     /// preview/man read the exact command without a prompt-glyph heuristic.
     cmd_start: Option<(i32, usize)>,
+    /// Kitty keyboard protocol mode stack (the VT engine doesn't parse the `… u` sequences).
+    /// The current flags are the top; empty = disabled. Bit 0b1 = disambiguate escape codes.
+    kitty_kbd_stack: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -2762,6 +2842,7 @@ fn spawn_session(
         dcs: DcsScanner::new(),
         decrqm_shadow: std::collections::HashMap::new(),
         cmd_start: None,
+        kitty_kbd_stack: Vec::new(),
     }));
     let images = Arc::new(Mutex::new(ImageStore::default()));
     let (tx, rx) = channel();
@@ -2865,6 +2946,13 @@ fn process_chunk(
                     let p = g.term.renderable_content().cursor.point;
                     (p.line.0, p.column.0)
                 });
+            }
+            // Kitty keyboard protocol: alacritty exposes the flags but never parses the `… u`
+            // sequences, so we keep the mode stack here and answer the query from it.
+            StreamEvent::Ctrl(ScanEvent::KittyKeyboard(op)) => {
+                if let Some(reply) = apply_kitty_keyboard(&mut g.kitty_kbd_stack, op) {
+                    replies.push(reply);
+                }
             }
             // alacritty ignores XTWINOPS resize — resize the grid here, and remember to
             // resize the PTY once we release the lock. `None` dimensions keep the current
@@ -3504,25 +3592,45 @@ impl ApplicationHandler<UserEvent> for App {
                     self.dispatch(a, event_loop);
                     return;
                 }
-                let (app_cursor, app_keypad) = self
+                let (app_cursor, app_keypad, kitty_kbd) = self
                     .state
                     .lock()
                     .map(|g| {
                         let mode = g.term.mode();
-                        (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD))
+                        // Kitty keyboard is tracked in our shadow stack (the VT engine doesn't
+                        // parse it): the disambiguate bit on the current flags turns it on.
+                        let kitty = g.kitty_kbd_stack.last().copied().unwrap_or(0) & 0b1 != 0;
+                        (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD), kitty)
                     })
-                    .unwrap_or((false, false));
+                    .unwrap_or((false, false, false));
                 let numpad = event.location == KeyLocation::Numpad;
-                let bytes = encode_key(
-                    &event.logical_key,
-                    event.text.as_deref(),
-                    m.shift_key(),
-                    m.alt_key(),
-                    m.control_key(),
-                    app_cursor,
-                    app_keypad,
-                    numpad,
-                );
+                // When the app negotiated the kitty keyboard protocol, encode key presses in its
+                // unambiguous form; otherwise the legacy encoding (unchanged for every app that
+                // hasn't opted in).
+                let bytes = if kitty_kbd {
+                    encode_key_kitty(
+                        &event.logical_key,
+                        event.text.as_deref(),
+                        m.shift_key(),
+                        m.alt_key(),
+                        m.control_key(),
+                        m.super_key(),
+                        app_cursor,
+                        app_keypad,
+                        numpad,
+                    )
+                } else {
+                    encode_key(
+                        &event.logical_key,
+                        event.text.as_deref(),
+                        m.shift_key(),
+                        m.alt_key(),
+                        m.control_key(),
+                        app_cursor,
+                        app_keypad,
+                        numpad,
+                    )
+                };
                 if !bytes.is_empty() {
                     self.schedule_preview(); // debounced safe auto-run (no-op if off)
                     self.pty_write(&bytes);
@@ -8826,6 +8934,61 @@ fn encode_key(
     }
 }
 
+/// Kitty keyboard modifier bitfield value (`1 + Σbits`): shift 1, alt 2, ctrl 4, super 8 — as
+/// sent in the `CSI unicode ; modifiers u` form. `1` means no modifiers.
+fn kitty_mods(shift: bool, alt: bool, ctrl: bool, superk: bool) -> u32 {
+    1 + shift as u32 + 2 * alt as u32 + 4 * ctrl as u32 + 8 * superk as u32
+}
+
+/// Encode a key press under the **kitty keyboard protocol**, *disambiguate* level (`CSI > 1 u`).
+/// Only the cases the legacy encoding renders ambiguously switch to the unambiguous
+/// `CSI <codepoint> [; <mods>] u` form:
+/// - **Esc** always (bare `ESC` collides with escape sequences) → `CSI 27 u`;
+/// - a **text key with Ctrl/Alt/Super** → `CSI <base-codepoint> ; <mods> u` (so Ctrl+I is
+///   distinct from Tab, Ctrl+M from Enter, and Alt+key isn't an ESC-prefixed byte);
+/// - **Enter / Tab / Backspace / Space with a modifier** → their `CSI u` codepoints.
+///
+/// Everything else — plain typing, and the functional keys (arrows / F-keys / Home…PageDown,
+/// whose legacy `CSI …` forms already carry the modifier) — defers to [`encode_key`], which is
+/// already conformant. Higher levels (event types, report-all-as-esc, associated text) are not
+/// implemented; a client that requests them still gets correct press events.
+#[allow(clippy::too_many_arguments)]
+fn encode_key_kitty(
+    key: &Key,
+    text: Option<&str>,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    superk: bool,
+    app_cursor: bool,
+    app_keypad: bool,
+    numpad: bool,
+) -> Vec<u8> {
+    let mods = kitty_mods(shift, alt, ctrl, superk);
+    let csi_u = |cp: u32| -> Vec<u8> {
+        if mods > 1 {
+            format!("\x1b[{cp};{mods}u").into_bytes()
+        } else {
+            format!("\x1b[{cp}u").into_bytes()
+        }
+    };
+    let legacy = || encode_key(key, text, shift, alt, ctrl, app_cursor, app_keypad, numpad);
+    let modified = mods > 1;
+    match key {
+        Key::Named(NamedKey::Escape) => csi_u(27),
+        Key::Named(NamedKey::Enter) if modified => csi_u(13),
+        Key::Named(NamedKey::Tab) if modified => csi_u(9),
+        Key::Named(NamedKey::Backspace) if modified => csi_u(127),
+        Key::Named(NamedKey::Space) if ctrl || alt || superk => csi_u(32),
+        Key::Character(s) if ctrl || alt || superk => match s.chars().next() {
+            // Base-layout codepoint: the logical char, ASCII-lowercased (Shift lives in `mods`).
+            Some(c) => csi_u(u32::from(c.to_ascii_lowercase())),
+            None => legacy(),
+        },
+        _ => legacy(),
+    }
+}
+
 /// Map a character under Ctrl to its C0 control byte; empty if it has no mapping.
 fn ctrl_byte(s: &str) -> Vec<u8> {
     let Some(c) = s.chars().next() else {
@@ -11438,6 +11601,7 @@ mod tests {
             dcs: DcsScanner::new(),
             decrqm_shadow: std::collections::HashMap::new(),
             cmd_start: None,
+            kitty_kbd_stack: Vec::new(),
         };
         (g, reply_rx)
     }
@@ -12230,6 +12394,84 @@ mod tests {
         // XTFOCUS (DECSET 1004): CSI I on focus-in, CSI O on focus-out.
         assert_eq!(focus_report(true), b"\x1b[I");
         assert_eq!(focus_report(false), b"\x1b[O");
+    }
+
+    #[test]
+    fn kitty_keyboard_disambiguate_encoding() {
+        // (shift, alt, ctrl, super) → the kitty CSI u bytes.
+        let kc = |s: &str, sh, al, ct, su| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, su, false, false, false);
+        let kn = |n, sh, al, ct, su| encode_key_kitty(&Key::Named(n), None, sh, al, ct, su, false, false, false);
+
+        // Esc is always disambiguated (bare ESC is ambiguous), unmodified → `CSI 27 u`.
+        assert_eq!(kn(NamedKey::Escape, false, false, false, false), b"\x1b[27u");
+        // Ctrl+I is now distinct from Tab, Ctrl+M from Enter: base codepoint + mods (ctrl = 5).
+        assert_eq!(kc("i", false, false, true, false), b"\x1b[105;5u");
+        assert_eq!(kc("m", false, false, true, false), b"\x1b[109;5u");
+        // Shift is in the modifier field, not the codepoint (Ctrl+Shift+A = 'a' + mods 6).
+        assert_eq!(kc("A", true, false, true, false), b"\x1b[97;6u");
+        // Alt+key is CSI u, not an ESC-prefixed byte (alt = 3); Super sets bit 8 (→ 9).
+        assert_eq!(kc("x", false, true, false, false), b"\x1b[120;3u");
+        assert_eq!(kc("x", false, false, false, true), b"\x1b[120;9u");
+        // Modified Enter/Tab/Backspace/Space use their CSI u codepoints.
+        assert_eq!(kn(NamedKey::Enter, false, false, true, false), b"\x1b[13;5u");
+        assert_eq!(kn(NamedKey::Tab, true, false, false, false), b"\x1b[9;2u"); // Shift+Tab
+        assert_eq!(kn(NamedKey::Backspace, false, true, false, false), b"\x1b[127;3u");
+        assert_eq!(kn(NamedKey::Space, false, false, true, false), b"\x1b[32;5u");
+
+        // Plain typing is untouched (defers to the legacy encoder): 'a' → "a", Shift 'A' → "A".
+        assert_eq!(kc("a", false, false, false, false), b"a");
+        assert_eq!(kc("A", true, false, false, false), b"A");
+        // Unmodified Enter/Tab/Backspace stay legacy (\r, \t, DEL) — only the ambiguous cases change.
+        assert_eq!(kn(NamedKey::Enter, false, false, false, false), b"\r");
+        assert_eq!(kn(NamedKey::Tab, false, false, false, false), b"\t");
+        // Functional keys defer to the legacy CSI forms (which already carry the modifier).
+        assert_eq!(kn(NamedKey::ArrowUp, false, false, false, false), b"\x1b[A");
+        assert_eq!(kn(NamedKey::ArrowUp, false, false, true, false), b"\x1b[1;5A");
+    }
+
+    #[test]
+    fn kitty_keyboard_mode_stack() {
+        let mut s: Vec<u8> = Vec::new();
+        // Push sets the current flags; Query reports them as `CSI ? flags u`.
+        assert_eq!(apply_kitty_keyboard(&mut s, KittyKbd::Push(1)), None);
+        assert_eq!(s.last(), Some(&1));
+        assert_eq!(apply_kitty_keyboard(&mut s, KittyKbd::Query), Some(b"\x1b[?1u".to_vec()));
+        // Set: mode 2 ORs bits, mode 3 clears, mode 1 replaces.
+        apply_kitty_keyboard(&mut s, KittyKbd::Set(0b110, 2));
+        assert_eq!(s.last(), Some(&0b111));
+        apply_kitty_keyboard(&mut s, KittyKbd::Set(0b100, 3));
+        assert_eq!(s.last(), Some(&0b011));
+        apply_kitty_keyboard(&mut s, KittyKbd::Set(0b1, 1));
+        assert_eq!(s.last(), Some(&0b1));
+        // Push nests; Pop unwinds; empty stack → flags 0 (protocol off).
+        apply_kitty_keyboard(&mut s, KittyKbd::Push(0b10));
+        assert_eq!(s.last(), Some(&0b10));
+        apply_kitty_keyboard(&mut s, KittyKbd::Pop(1));
+        assert_eq!(s.last(), Some(&0b1)); // back to the pushed disambiguate flag
+        apply_kitty_keyboard(&mut s, KittyKbd::Pop(9)); // over-pop is clamped
+        assert_eq!(apply_kitty_keyboard(&mut s, KittyKbd::Query), Some(b"\x1b[?0u".to_vec()));
+    }
+
+    #[test]
+    fn kitty_mode_sequences_scan_and_apply() {
+        // The scanner recognises the four `… u` forms alacritty ignores; feeding them and
+        // applying the events drives the shadow stack — end to end, mode off → on → off.
+        let mut sc = DecrqcraScanner::new();
+        let mut stack: Vec<u8> = Vec::new();
+        let run = |sc: &mut DecrqcraScanner, stack: &mut Vec<u8>, bytes: &[u8]| {
+            for (_, ev) in sc.feed(bytes) {
+                if let ScanEvent::KittyKeyboard(op) = ev {
+                    apply_kitty_keyboard(stack, op);
+                }
+            }
+        };
+        run(&mut sc, &mut stack, b"\x1b[>1u"); // push disambiguate
+        assert_eq!(stack.last().copied().unwrap_or(0) & 1, 1, "CSI >1u enables disambiguate");
+        run(&mut sc, &mut stack, b"\x1b[<1u"); // pop
+        assert_eq!(stack.last().copied().unwrap_or(0) & 1, 0, "CSI <1u disables it");
+        // A bare `>u`/malformed prefix that isn't a kitty form doesn't corrupt the stack.
+        run(&mut sc, &mut stack, b"\x1b[=5;1u"); // set flags = 5
+        assert_eq!(stack.last(), Some(&5));
     }
 
     #[test]

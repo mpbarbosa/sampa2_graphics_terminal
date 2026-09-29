@@ -117,8 +117,18 @@ engine is now ours to prove.
   sends its SS3 code (`ESC O p`–`y` for 0–9, `ESC O j/k/l/m/n/o` for the operators, `ESC O M`
   for keypad Enter) when the app has enabled `TermMode::APP_KEYPAD`, else the plain digit.
   `app_keypad_code` unit-tested; Xephyr-verified with `cat -v` (numpad `1 2 + Enter` →
-  `^[Oq ^[Or ^[Ok ^[OM`). ⬜ still: **kitty keyboard protocol**, IME/compose sequences
-  beyond what the IM handles.
+  `^[Oq ^[Or ^[Ok ^[OM`). ✅ **kitty keyboard protocol** (disambiguate level) — `alacritty_terminal`
+  exposes the mode flags but never parses the `… u` mode-set sequences, so a **shadow parser**
+  handles them like the other engine gaps: the CSI scanner recognises `CSI > flags u` (push),
+  `CSI = flags ; mode u` (set), `CSI < n u` (pop) and `CSI ? u` (report), and
+  `apply_kitty_keyboard` maintains a per-session mode stack + answers the query. When the
+  disambiguate bit is on, `encode_key_kitty` sends the unambiguous `CSI <code> ; <mods> u`
+  form for **Esc** (always), a **text key with Ctrl/Alt/Super** (so Ctrl+I ≠ Tab, Ctrl+M ≠
+  Enter, Alt+key isn't ESC-prefixed) and **modified Enter/Tab/Backspace/Space**; plain typing
+  and functional keys defer to the legacy encoder, and non-negotiating apps are untouched.
+  Encoder + mode-stack + scanner unit-tested; Xephyr-verified end to end (`CSI >1u` then
+  Ctrl+A→`^[[97;5u`, Alt+X→`^[[120;3u`, Esc→`^[[27u`, plain `q`→`q`). ⬜ still: higher levels
+  (event types, report-all-as-esc, associated text), IME/compose sequences beyond the IM.
 - ✅ **Mouse (§8.2):** **SGR 1006** (+ X10 fallback) reporting for press/release/drag/
   wheel when the app enables a mouse mode (1000/1002/1003); button + Shift/Alt/Ctrl
   modifier bits; **Shift** forces local selection over app grab. 3 unit tests.
