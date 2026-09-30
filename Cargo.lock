@@ -2852,7 +2852,7 @@ source = "git+https://github.com/mpbarbosa/sampa_graphics_terminal?rev=b3d29e3ac
 
 [[package]]
 name = "sampa-native"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",

@@ -5,6 +5,28 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.13.0] - 2026-09-30
+
+Two themes headline this release. **Nested split layouts** — the panes are now a recursive
+split tree, so splitting the focused pane the *other* way subdivides just that pane (columns
+inside a row, rows inside a column, to any depth), each nested divider draggable to
+re-proportion its own split. And the **kitty keyboard protocol is now complete**: on top of the
+disambiguate level from 0.12.0, this adds **event types** (key release + repeat events),
+**report-all-keys-as-escapes**, and **associated text** — all four enhancement flags, verified
+byte-for-byte against the reference terminal. Rounding out the interaction polish: **drag a
+split divider** to resize panes, **drag tabs** to reorder them, and a **✕ close button** on the
+help overlay.
+
+### Features
+
+- Nested split layouts — a recursive split tree, splits nest to any depth — N3
+- Kitty keyboard event types — report key release and repeat events — N1
+- Kitty keyboard report-all-keys-as-escapes — N1
+- Kitty keyboard associated text — the typed text on report-all escapes — N1
+- Drag a split divider to resize the panes it separates — N3
+- Drag tabs along the tab bar to reorder them — N2
+- ✕ close button in the help overlay — N3
+
 ## [0.12.0] - 2026-09-29
 
 Two headline features land. **Horizontal splits** — `Ctrl+Shift+B` stacks panes as rows,
