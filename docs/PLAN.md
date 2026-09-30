@@ -137,8 +137,13 @@ engine is now ours to prove.
   press that would send text is reported as an escape instead (`CSI <code>[;<mods>] u`) —
   what a game / raw-mode editor wants — while Shift stays in the modifier field and functional
   keys are unchanged (already escapes). `encode_key_kitty` takes a `report_all` flag; unit-tested
-  and Xephyr-verified (`CSI > 9 u` → plain `a`/`b` arrive as `^[[97u]`/`^[[98u]`). ⬜ still: **key
-  repeat** as a distinct event, associated text; IME/compose sequences beyond the IM.
+  and Xephyr-verified (`CSI > 9 u` → plain `a`/`b` arrive as `^[[97u]`/`^[[98u]`). ✅ **associated
+  text** (`CSI > 16 u`): a text-producing press carries the typed text as a third field
+  (`CSI <code>;<mods>;<text> u`) so an app receiving every key as an escape still learns what was
+  typed; Ctrl/Alt/Super (a control action, not text), releases, and functional keys carry no text.
+  `encode_key_kitty` takes an `assoc_text` flag; unit-tested and Xephyr-verified (flags 25 → plain
+  `a` → `^[[97;;97u`, Shift+A → `^[[97;2;65u`, Ctrl+C → `^[[99;5u`). ⬜ still: **key repeat** as a
+  distinct event; IME/compose sequences beyond the IM.
 - ✅ **Mouse (§8.2):** **SGR 1006** (+ X10 fallback) reporting for press/release/drag/
   wheel when the app enables a mouse mode (1000/1002/1003); button + Shift/Alt/Ctrl
   modifier bits; **Shift** forces local selection over app grab. 3 unit tests.

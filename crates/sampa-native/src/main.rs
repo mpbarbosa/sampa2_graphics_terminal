@@ -3538,6 +3538,7 @@ impl ApplicationHandler<UserEvent> for App {
                         numpad,
                         3,     // release
                         false, // report-all is moot: a release is always an escape
+                        false, // no associated text on a release
                     );
                     if !bytes.is_empty() {
                         self.pty_write(&bytes);
@@ -3678,18 +3679,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.dispatch(a, event_loop);
                     return;
                 }
-                let (app_cursor, app_keypad, kitty_kbd, report_all) = self
+                let (app_cursor, app_keypad, kitty_kbd, report_all, assoc_text) = self
                     .state
                     .lock()
                     .map(|g| {
                         let mode = g.term.mode();
                         // Kitty keyboard is tracked in our shadow stack (the VT engine doesn't
                         // parse it): the disambiguate bit turns it on, the report-all bit makes
-                        // even plain presses escapes.
+                        // even plain presses escapes, the associated-text bit attaches the typed
+                        // text to those escapes.
                         let flags = g.kitty_kbd_stack.last().copied().unwrap_or(0);
-                        (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD), flags & 0b1 != 0, flags & 0b1000 != 0)
+                        (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD), flags & 0b1 != 0, flags & 0b1000 != 0, flags & 0b10000 != 0)
                     })
-                    .unwrap_or((false, false, false, false));
+                    .unwrap_or((false, false, false, false, false));
                 let numpad = event.location == KeyLocation::Numpad;
                 // When the app negotiated the kitty keyboard protocol, encode key presses in its
                 // unambiguous form; otherwise the legacy encoding (unchanged for every app that
@@ -3707,6 +3709,7 @@ impl ApplicationHandler<UserEvent> for App {
                         numpad,
                         1, // press
                         report_all,
+                        assoc_text,
                     )
                 } else {
                     encode_key(
@@ -9188,8 +9191,8 @@ fn kitty_mods(shift: bool, alt: bool, ctrl: bool, superk: bool) -> u32 {
 ///
 /// Everything else — plain typing, and the functional keys (arrows / F-keys / Home…PageDown,
 /// whose legacy `CSI …` forms already carry the modifier) — defers to [`encode_key`], which is
-/// already conformant. Higher levels (event types, report-all-as-esc, associated text) are not
-/// implemented; a client that requests them still gets correct press events.
+/// already conformant. Higher levels (event types, report-all-as-esc, associated text) layer on
+/// top via `event`, `report_all` and `assoc_text`; key **repeat** is not yet a distinct event.
 ///
 /// `event` is the kitty event type: `1` press (the default) or `3` release. On **release**
 /// (event-types level, `CSI > 3 u`) there is no text, so *every* key is reported in its escape
@@ -9209,11 +9212,39 @@ fn encode_key_kitty(
     numpad: bool,
     event: u8,
     report_all: bool,
+    assoc_text: bool,
 ) -> Vec<u8> {
     let mods = kitty_mods(shift, alt, ctrl, superk);
+    // Associated text (report-associated-text level, `CSI > 16 u`): when the key produces
+    // insertable text, append it as a third field `CSI <code>;<mods>;<text> u` so an app in
+    // report-all mode still learns what was typed. Only for text-producing presses — a release
+    // carries no text, and ctrl/alt/super produce a control action, not text — so plain keys
+    // and Shift-modified keys qualify but nothing else. Text is the produced codepoints (the
+    // shifted result), joined by `:`; the code stays the base-layout key.
+    let text_field: Option<String> = (assoc_text
+        && event != 3
+        && !(ctrl || alt || superk))
+    .then_some(text)
+    .flatten()
+    .filter(|t| !t.is_empty() && t.chars().all(|c| c >= ' ' && c != '\u{7f}'))
+    .map(|t| {
+        t.chars()
+            .map(|c| (c as u32).to_string())
+            .collect::<Vec<_>>()
+            .join(":")
+    });
     // `CSI <code> [; <mods>[:event]] u`; the event sub-parameter forces the modifier field.
+    // With associated text the modifier field is always present as a placeholder (empty = the
+    // default of 1) so the text field lands in the third position.
     let csi_u = |cp: u32| -> Vec<u8> {
-        if event != 1 {
+        if let Some(tf) = &text_field {
+            let modf = if mods > 1 { mods.to_string() } else { String::new() };
+            if event != 1 {
+                format!("\x1b[{cp};{modf}:{event};{tf}u").into_bytes()
+            } else {
+                format!("\x1b[{cp};{modf};{tf}u").into_bytes()
+            }
+        } else if event != 1 {
             format!("\x1b[{cp};{mods}:{event}u").into_bytes()
         } else if mods > 1 {
             format!("\x1b[{cp};{mods}u").into_bytes()
@@ -12690,8 +12721,8 @@ mod tests {
     #[test]
     fn kitty_keyboard_disambiguate_encoding() {
         // (shift, alt, ctrl, super) → the kitty CSI u bytes.
-        let kc = |s: &str, sh, al, ct, su| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, su, false, false, false, 1, false);
-        let kn = |n, sh, al, ct, su| encode_key_kitty(&Key::Named(n), None, sh, al, ct, su, false, false, false, 1, false);
+        let kc = |s: &str, sh, al, ct, su| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, su, false, false, false, 1, false, false);
+        let kn = |n, sh, al, ct, su| encode_key_kitty(&Key::Named(n), None, sh, al, ct, su, false, false, false, 1, false, false);
 
         // Esc is always disambiguated (bare ESC is ambiguous), unmodified → `CSI 27 u`.
         assert_eq!(kn(NamedKey::Escape, false, false, false, false), b"\x1b[27u");
@@ -12724,8 +12755,8 @@ mod tests {
     fn kitty_keyboard_event_types_releases() {
         // event = 3 is a key release (the "report event types" level). There is no text on a
         // release, so *every* key is an escape carrying the `:3` sub-parameter.
-        let rc = |s: &str, sh, al, ct| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, false, false, false, false, 3, false);
-        let rn = |n, sh, al, ct| encode_key_kitty(&Key::Named(n), None, sh, al, ct, false, false, false, false, 3, false);
+        let rc = |s: &str, sh, al, ct| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, false, false, false, false, 3, false, false);
+        let rn = |n, sh, al, ct| encode_key_kitty(&Key::Named(n), None, sh, al, ct, false, false, false, false, 3, false, false);
 
         // A plain text key that PRESSED sends "a" now reports its release as CSI u (mods 1 :3).
         assert_eq!(rc("a", false, false, false), b"\x1b[97;1:3u");
@@ -12746,14 +12777,14 @@ mod tests {
     fn kitty_keyboard_report_all_keys() {
         // report-all-keys-as-esc (CSI > 8 u): a plain press that would send text is an escape
         // instead. `ac`/`an` are presses with report_all on.
-        let ac = |s: &str| encode_key_kitty(&Key::Character(s.into()), Some(s), false, false, false, false, false, false, false, 1, true);
-        let an = |n| encode_key_kitty(&Key::Named(n), None, false, false, false, false, false, false, false, 1, true);
+        let ac = |s: &str| encode_key_kitty(&Key::Character(s.into()), Some(s), false, false, false, false, false, false, false, 1, true, false);
+        let an = |n| encode_key_kitty(&Key::Named(n), None, false, false, false, false, false, false, false, 1, true, false);
 
         // Plain letters/digits become `CSI <code> u` instead of their text.
         assert_eq!(ac("a"), b"\x1b[97u");
         assert_eq!(ac("1"), b"\x1b[49u");
         // Shift is still in the modifier field (not the codepoint): `A` → 'a' + mods 2.
-        let shift_a = encode_key_kitty(&Key::Character("A".into()), Some("A"), true, false, false, false, false, false, false, 1, true);
+        let shift_a = encode_key_kitty(&Key::Character("A".into()), Some("A"), true, false, false, false, false, false, false, 1, true, false);
         assert_eq!(shift_a, b"\x1b[97;2u");
         // Enter/Tab/Backspace/Space now escape on a plain press too.
         assert_eq!(an(NamedKey::Enter), b"\x1b[13u");
@@ -12762,7 +12793,48 @@ mod tests {
         assert_eq!(an(NamedKey::ArrowUp), b"\x1b[A");
         // Without report-all, a plain press is still text (unchanged disambiguate behaviour).
         assert_eq!(
-            encode_key_kitty(&Key::Character("a".into()), Some("a"), false, false, false, false, false, false, false, 1, false),
+            encode_key_kitty(&Key::Character("a".into()), Some("a"), false, false, false, false, false, false, false, 1, false, false),
+            b"a"
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_associated_text() {
+        // report-associated-text (CSI > 16 u), used with report-all: a key that produces
+        // insertable text carries that text as a third field `CSI <code>;<mods>;<text> u`, so an
+        // app receiving every key as an escape still learns what was typed. `at` is a press with
+        // both report-all and associated-text on.
+        let at = |s: &str, sh: bool, al: bool, ct: bool| {
+            encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, false, false, false, false, 1, true, true)
+        };
+
+        // Plain letters/digits: base code, empty (default) modifier field, then the text codepoint.
+        assert_eq!(at("a", false, false, false), b"\x1b[97;;97u");
+        assert_eq!(at("1", false, false, false), b"\x1b[49;;49u");
+        // Shift is a real modifier (field 2) and the text is the *shifted* result: 'a'+shift → "A".
+        assert_eq!(at("A", true, false, false), b"\x1b[97;2;65u");
+        // A symbol reached via Shift keeps the base-layout code but reports the produced glyph.
+        assert_eq!(at("!", true, false, false), b"\x1b[33;2;33u");
+        // Ctrl/Alt/Super produce a control action, not text — no text field is attached.
+        assert_eq!(at("c", false, false, true), b"\x1b[99;5u"); // Ctrl+C
+        assert_eq!(at("a", false, true, false), b"\x1b[97;3u"); // Alt+a
+        // Space carries its text when winit reports it; functional keys (text None) do not.
+        assert_eq!(
+            encode_key_kitty(&Key::Named(NamedKey::Space), Some(" "), false, false, false, false, false, false, false, 1, true, true),
+            b"\x1b[32;;32u"
+        );
+        assert_eq!(
+            encode_key_kitty(&Key::Named(NamedKey::Enter), None, false, false, false, false, false, false, false, 1, true, true),
+            b"\x1b[13u"
+        );
+        // A release never carries text even with the flag on.
+        assert_eq!(
+            encode_key_kitty(&Key::Character("a".into()), Some("a"), false, false, false, false, false, false, false, 3, false, true),
+            b"\x1b[97;1:3u"
+        );
+        // Associated text alone (no report-all): a plain press is still text — nothing to attach to.
+        assert_eq!(
+            encode_key_kitty(&Key::Character("a".into()), Some("a"), false, false, false, false, false, false, false, 1, false, true),
             b"a"
         );
     }
