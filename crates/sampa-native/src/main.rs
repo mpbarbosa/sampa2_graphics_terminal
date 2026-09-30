@@ -14146,7 +14146,9 @@ mod tests {
             ("less/pager", "less", &["/etc/os-release"], b"", 900, &["NAME", "ID=", "VERSION"]),
             ("mc", "mc", &[], b"", 1500, &["Left", "File", "Right", "Help"]),
             ("emacs -nw", "emacs", &["-nw", "-Q"], b"", 1600, &["GNU Emacs", "scratch", "Buffers"]),
-            ("weechat", "weechat", &["-r", "/quit"], b"", 1500, &["WeeChat"]),
+            // Run interactively into a throwaway home so it draws its buffer/status UI; the
+            // harness kills it after the wait (`-r /quit` would exit + clear the screen first).
+            ("weechat", "weechat", &["-d", "/tmp/sampa-weechat-smoke"], b"", 2200, &["WeeChat", "weechat.org"]),
         ];
 
         let mut failed = Vec::new();

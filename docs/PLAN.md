@@ -201,8 +201,8 @@ engine is now ours to prove.
 - 🔨 **App-matrix + contract smokes (§17, §3)** — headless harnesses (`#[ignore]`,
   `cargo test -- --ignored`) run real programs through real PTYs:
   - `app_matrix_smoke` — rendering: **echo, ls (color), seq (wrap+scrollback), python,
-    vim (alt-screen), neovim (alt-screen), tmux (status), less (pager)** all green; the case
-    list also carries htop/mc/emacs/weechat, each auto-skipped when the program isn't installed.
+    vim (alt-screen), htop, neovim (alt-screen), tmux (status), less (pager), mc, emacs -nw,
+    weechat** — all 12 green through real PTYs; each case auto-skips if its program isn't installed.
   - `ctrl_c_sends_sigint` — ✅ typed **^C terminates `sleep`** (line-discipline SIGINT).
   - `resize_reaches_child` — ✅ **`pty.resize` → child sees `30 100`** (TIOCSWINSZ/SIGWINCH).
   - ✅ **live resize-reflow** — Xephyr-verified in the GUI window: a 150-column ruler rewraps
@@ -210,12 +210,13 @@ engine is now ours to prove.
     reflow drives from the real `App::resize` path.
   - ✅ **Ctrl-Z job control** — Xephyr-verified: typing `^Z` over `sleep 300` suspends it
     (`[1] + suspended sleep 300`, confirmed by `jobs`) via the line-discipline SIGTSTP.
-  ⬜ still: install + smoke **htop / mc / emacs / weechat / ipython** (need the packages).
+  ⬜ still: `ipython` smoke (not installed).
 
 **Exit — M1 app matrix (§17):** vim, neovim, tmux, htop, less, git log, ipython each
 render without corruption, respond to resize, honor Ctrl-C/Ctrl-Z; clean exit. *(Render +
-SIGINT + SIGWINCH contracts verified headlessly, and vim/neovim/tmux/less plus **live GUI
-resize-reflow and Ctrl-Z** verified in Xephyr; htop/mc/emacs/weechat/ipython await install.)*
+SIGINT + SIGWINCH contracts verified headlessly across the full app matrix — vim/neovim/tmux/
+htop/less/mc/emacs/weechat + echo/ls/seq/python — plus **live GUI resize-reflow and Ctrl-Z**
+verified in Xephyr; only `ipython` still awaits install.)*
 
 ### N2 — Comfort: config-driven renderer (§7.3, §11) 🔨
 - 🔨 Consume `sampa-config` (loaded from the XDG path at startup, else defaults):
