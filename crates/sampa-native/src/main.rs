@@ -3536,7 +3536,8 @@ impl ApplicationHandler<UserEvent> for App {
                         app_cursor,
                         app_keypad,
                         numpad,
-                        3, // release
+                        3,     // release
+                        false, // report-all is moot: a release is always an escape
                     );
                     if !bytes.is_empty() {
                         self.pty_write(&bytes);
@@ -3677,17 +3678,18 @@ impl ApplicationHandler<UserEvent> for App {
                     self.dispatch(a, event_loop);
                     return;
                 }
-                let (app_cursor, app_keypad, kitty_kbd) = self
+                let (app_cursor, app_keypad, kitty_kbd, report_all) = self
                     .state
                     .lock()
                     .map(|g| {
                         let mode = g.term.mode();
                         // Kitty keyboard is tracked in our shadow stack (the VT engine doesn't
-                        // parse it): the disambiguate bit on the current flags turns it on.
-                        let kitty = g.kitty_kbd_stack.last().copied().unwrap_or(0) & 0b1 != 0;
-                        (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD), kitty)
+                        // parse it): the disambiguate bit turns it on, the report-all bit makes
+                        // even plain presses escapes.
+                        let flags = g.kitty_kbd_stack.last().copied().unwrap_or(0);
+                        (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD), flags & 0b1 != 0, flags & 0b1000 != 0)
                     })
-                    .unwrap_or((false, false, false));
+                    .unwrap_or((false, false, false, false));
                 let numpad = event.location == KeyLocation::Numpad;
                 // When the app negotiated the kitty keyboard protocol, encode key presses in its
                 // unambiguous form; otherwise the legacy encoding (unchanged for every app that
@@ -3704,6 +3706,7 @@ impl ApplicationHandler<UserEvent> for App {
                         app_keypad,
                         numpad,
                         1, // press
+                        report_all,
                     )
                 } else {
                     encode_key(
@@ -9205,6 +9208,7 @@ fn encode_key_kitty(
     app_keypad: bool,
     numpad: bool,
     event: u8,
+    report_all: bool,
 ) -> Vec<u8> {
     let mods = kitty_mods(shift, alt, ctrl, superk);
     // `CSI <code> [; <mods>[:event]] u`; the event sub-parameter forces the modifier field.
@@ -9218,17 +9222,18 @@ fn encode_key_kitty(
         }
     };
     let legacy = || encode_key(key, text, shift, alt, ctrl, app_cursor, app_keypad, numpad, event);
-    // A release reports every key (there is no text); a press keeps the disambiguate rules
-    // (plain typing stays text, only the ambiguous keys become CSI u).
-    let release = event == 3;
+    // A release reports every key (there is no text); `report_all` (report-all-keys-as-esc)
+    // likewise makes even plain presses escapes. Otherwise the disambiguate rules apply — plain
+    // typing stays text, only the ambiguous keys become CSI u.
+    let esc = event == 3 || report_all;
     let modified = mods > 1;
     match key {
         Key::Named(NamedKey::Escape) => csi_u(27),
-        Key::Named(NamedKey::Enter) if modified || release => csi_u(13),
-        Key::Named(NamedKey::Tab) if modified || release => csi_u(9),
-        Key::Named(NamedKey::Backspace) if modified || release => csi_u(127),
-        Key::Named(NamedKey::Space) if ctrl || alt || superk || release => csi_u(32),
-        Key::Character(s) if ctrl || alt || superk || release => match s.chars().next() {
+        Key::Named(NamedKey::Enter) if modified || esc => csi_u(13),
+        Key::Named(NamedKey::Tab) if modified || esc => csi_u(9),
+        Key::Named(NamedKey::Backspace) if modified || esc => csi_u(127),
+        Key::Named(NamedKey::Space) if ctrl || alt || superk || esc => csi_u(32),
+        Key::Character(s) if ctrl || alt || superk || esc => match s.chars().next() {
             // Base-layout codepoint: the logical char, ASCII-lowercased (Shift lives in `mods`).
             Some(c) => csi_u(u32::from(c.to_ascii_lowercase())),
             None => legacy(),
@@ -12685,8 +12690,8 @@ mod tests {
     #[test]
     fn kitty_keyboard_disambiguate_encoding() {
         // (shift, alt, ctrl, super) → the kitty CSI u bytes.
-        let kc = |s: &str, sh, al, ct, su| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, su, false, false, false, 1);
-        let kn = |n, sh, al, ct, su| encode_key_kitty(&Key::Named(n), None, sh, al, ct, su, false, false, false, 1);
+        let kc = |s: &str, sh, al, ct, su| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, su, false, false, false, 1, false);
+        let kn = |n, sh, al, ct, su| encode_key_kitty(&Key::Named(n), None, sh, al, ct, su, false, false, false, 1, false);
 
         // Esc is always disambiguated (bare ESC is ambiguous), unmodified → `CSI 27 u`.
         assert_eq!(kn(NamedKey::Escape, false, false, false, false), b"\x1b[27u");
@@ -12719,8 +12724,8 @@ mod tests {
     fn kitty_keyboard_event_types_releases() {
         // event = 3 is a key release (the "report event types" level). There is no text on a
         // release, so *every* key is an escape carrying the `:3` sub-parameter.
-        let rc = |s: &str, sh, al, ct| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, false, false, false, false, 3);
-        let rn = |n, sh, al, ct| encode_key_kitty(&Key::Named(n), None, sh, al, ct, false, false, false, false, 3);
+        let rc = |s: &str, sh, al, ct| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, false, false, false, false, 3, false);
+        let rn = |n, sh, al, ct| encode_key_kitty(&Key::Named(n), None, sh, al, ct, false, false, false, false, 3, false);
 
         // A plain text key that PRESSED sends "a" now reports its release as CSI u (mods 1 :3).
         assert_eq!(rc("a", false, false, false), b"\x1b[97;1:3u");
@@ -12735,6 +12740,31 @@ mod tests {
         assert_eq!(rn(NamedKey::ArrowUp, false, false, true), b"\x1b[1;5:3A");
         assert_eq!(rn(NamedKey::Delete, false, false, false), b"\x1b[3;1:3~");
         assert_eq!(rn(NamedKey::F5, false, false, false), b"\x1b[15;1:3~");
+    }
+
+    #[test]
+    fn kitty_keyboard_report_all_keys() {
+        // report-all-keys-as-esc (CSI > 8 u): a plain press that would send text is an escape
+        // instead. `ac`/`an` are presses with report_all on.
+        let ac = |s: &str| encode_key_kitty(&Key::Character(s.into()), Some(s), false, false, false, false, false, false, false, 1, true);
+        let an = |n| encode_key_kitty(&Key::Named(n), None, false, false, false, false, false, false, false, 1, true);
+
+        // Plain letters/digits become `CSI <code> u` instead of their text.
+        assert_eq!(ac("a"), b"\x1b[97u");
+        assert_eq!(ac("1"), b"\x1b[49u");
+        // Shift is still in the modifier field (not the codepoint): `A` → 'a' + mods 2.
+        let shift_a = encode_key_kitty(&Key::Character("A".into()), Some("A"), true, false, false, false, false, false, false, 1, true);
+        assert_eq!(shift_a, b"\x1b[97;2u");
+        // Enter/Tab/Backspace/Space now escape on a plain press too.
+        assert_eq!(an(NamedKey::Enter), b"\x1b[13u");
+        assert_eq!(an(NamedKey::Space), b"\x1b[32u");
+        // Functional keys are already escapes — unchanged by report-all.
+        assert_eq!(an(NamedKey::ArrowUp), b"\x1b[A");
+        // Without report-all, a plain press is still text (unchanged disambiguate behaviour).
+        assert_eq!(
+            encode_key_kitty(&Key::Character("a".into()), Some("a"), false, false, false, false, false, false, false, 1, false),
+            b"a"
+        );
     }
 
     #[test]
