@@ -266,7 +266,18 @@ interactive pass + wider program coverage outstanding.)*
   per-pane `resize`; `adjust_divider` moves one boundary while keeping the rest fixed and each
   pane ≥ `PANE_MIN_FRAC`. Pure geometry unit-tested; Xephyr-verified (equal split unchanged,
   then dragging the divider left narrows one column and widens the other, content reflowing).
-  ⬜ still: nested layouts.
+  ✅ **nested layouts** — the panes are a recursive split tree (`Layout::{Leaf, Split{dir, ratios,
+  kids}}`) instead of a flat list, so splitting the focused pane the *other* way subdivides just
+  that pane (columns inside a row, rows inside a column, to any depth). `split_leaf` extends the
+  parent when it already runs that way, else wraps the leaf in a fresh perpendicular `Split`;
+  `layout_rects`/`layout_dividers` assign each leaf an absolute pixel rect and place dividers
+  within their own node (so a nested divider spans only its column/row). Focus cycles the leaves in
+  traversal order; any tab op collapses back to a single `Leaf`. Drag-resize edits the ratios of
+  the specific node a divider belongs to. Pure geometry unit-tested (`nested_layout_rects_and_dividers`,
+  `split_leaf_nests_and_extends`); Xephyr-verified (columns → nest the right column into rows: the
+  horizontal divider spans only that column; focus cycle, tab-switch collapse, and divider drag all
+  correct). One behaviour change: a top/bottom overlay now covers split panes rather than reflowing
+  them.
 - ✅ **Search overlay** — **Ctrl+Shift+F** opens a bottom search bar; incremental
   regex match over the whole buffer (scrollback included) via `alacritty_terminal`'s
   `RegexSearch`/`RegexIter`. All matches highlighted, the current one brighter;

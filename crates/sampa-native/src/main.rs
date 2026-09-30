@@ -840,42 +840,207 @@ enum Osc52Policy {
     Ask,
 }
 
-/// How the panes are laid out: side-by-side columns (`Ctrl+Shift+R`) or stacked rows
-/// (`Ctrl+Shift+B`). Only one direction at a time (no nested layouts in v1).
+/// The axis a split node tiles along: side-by-side columns (`Ctrl+Shift+R`) or stacked rows
+/// (`Ctrl+Shift+B`). A layout nests these freely (a column of rows, a row of columns…).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SplitDir {
     Vertical,
     Horizontal,
 }
 
-/// One pane's grid to render this frame: its snapshot, the pixel column `[x, x+w]` it occupies,
-/// and (for horizontal splits) the vertical band `[y_frac, y_frac+h_frac]` as a fraction of the
-/// grid region — paint turns that into pixels once it knows the grid's top/bottom. Vertical /
-/// single panes use the full height (`y_frac = 0`, `h_frac = 1`). `focused` gets the bright cursor.
+/// A recursive split layout: a single session (`Leaf`) or a row/column of children that share an
+/// axis (`Split`). Splitting a leaf whose parent runs the other way wraps it in a new `Split`, so
+/// layouts nest to any depth. The tree holds only the current tab's split view; any tab op resets
+/// it to a single `Leaf`, so the leaf session indices it stores stay valid.
+#[derive(Clone, PartialEq, Debug)]
+enum Layout {
+    Leaf(usize),
+    Split { dir: SplitDir, ratios: Vec<f32>, kids: Vec<Layout> },
+}
+
+/// A pixel rectangle used for laying panes and dividers out.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct PaneRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+/// A divider strip between two siblings: its pixel `rect`, whether it separates columns
+/// (`vertical`), and the `path`+`idx` locating the boundary in the tree (for drag-resize).
+/// `node` is the parent split's own rect, so a drag can convert the cursor to a boundary fraction.
+struct DividerInfo {
+    rect: PaneRect,
+    vertical: bool,
+    path: Vec<usize>,
+    idx: usize,
+    node: PaneRect,
+}
+
+impl Layout {
+    /// True for a lone pane (the classic single-pane view).
+    fn is_single(&self) -> bool {
+        matches!(self, Layout::Leaf(_))
+    }
+
+    /// Session indices of every leaf in traversal order (left-to-right, top-to-bottom) — the
+    /// order panes are snapshotted, laid out and rendered in.
+    fn leaves(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves(&self, out: &mut Vec<usize>) {
+        match self {
+            Layout::Leaf(s) => out.push(*s),
+            Layout::Split { kids, .. } => {
+                for k in kids {
+                    k.collect_leaves(out);
+                }
+            }
+        }
+    }
+
+    fn leaf_count(&self) -> usize {
+        match self {
+            Layout::Leaf(_) => 1,
+            Layout::Split { kids, .. } => kids.iter().map(Layout::leaf_count).sum(),
+        }
+    }
+
+    /// The tree path (child indices) to the `target`-th leaf in traversal order, or `None`.
+    fn leaf_path(&self, target: usize) -> Option<Vec<usize>> {
+        let mut path = Vec::new();
+        let mut n = 0usize;
+        self.find_leaf_path(target, &mut n, &mut path).then_some(path)
+    }
+
+    fn find_leaf_path(&self, target: usize, n: &mut usize, path: &mut Vec<usize>) -> bool {
+        match self {
+            Layout::Leaf(_) => {
+                let hit = *n == target;
+                *n += 1;
+                hit
+            }
+            Layout::Split { kids, .. } => {
+                for (i, k) in kids.iter().enumerate() {
+                    path.push(i);
+                    if k.find_leaf_path(target, n, path) {
+                        return true;
+                    }
+                    path.pop();
+                }
+                false
+            }
+        }
+    }
+
+    /// Mutable reference to the node at `path` (child indices from the root).
+    fn node_at_mut(&mut self, path: &[usize]) -> &mut Layout {
+        let mut n = self;
+        for &p in path {
+            if let Layout::Split { kids, .. } = n {
+                n = &mut kids[p];
+            }
+        }
+        n
+    }
+
+    /// Split the leaf at `path` in direction `dir`, adding `new` beside it. If the leaf's parent
+    /// already tiles along `dir`, `new` joins as a sibling (extending that split); otherwise the
+    /// leaf is wrapped in a fresh `Split`. Ratios in the affected node are re-equalised.
+    fn split_leaf(&mut self, path: &[usize], dir: SplitDir, new: usize) {
+        let Some((&pos, parent_path)) = path.split_last() else {
+            // The whole layout is a single leaf: wrap the root.
+            let old = std::mem::replace(self, Layout::Leaf(new));
+            *self = Layout::Split { dir, ratios: equal_ratios(2), kids: vec![old, Layout::Leaf(new)] };
+            return;
+        };
+        let parent = self.node_at_mut(parent_path);
+        if let Layout::Split { dir: pdir, ratios, kids } = parent {
+            if *pdir == dir {
+                kids.insert(pos + 1, Layout::Leaf(new));
+                *ratios = equal_ratios(kids.len());
+                return;
+            }
+            // Parent runs the other way: wrap just this child in a new perpendicular split.
+            let leaf = std::mem::replace(&mut kids[pos], Layout::Leaf(new));
+            kids[pos] = Layout::Split { dir, ratios: equal_ratios(2), kids: vec![leaf, Layout::Leaf(new)] };
+        }
+    }
+}
+
+/// Assign a pixel rect to each leaf in traversal order, dividing each `Split`'s rect along its
+/// axis by the node ratios with `divider`-pixel gaps. Parallel to [`Layout::leaves`]. Pure, so the
+/// nested geometry is unit-tested.
+fn layout_rects(node: &Layout, rect: PaneRect, divider: f32, out: &mut Vec<PaneRect>) {
+    match node {
+        Layout::Leaf(_) => out.push(rect),
+        Layout::Split { dir, ratios, kids } => {
+            let total = if *dir == SplitDir::Vertical { rect.w } else { rect.h };
+            let ext = pane_extents(ratios, total, divider);
+            for (k, (off, size)) in kids.iter().zip(ext) {
+                let sub = if *dir == SplitDir::Vertical {
+                    PaneRect { x: rect.x + off, y: rect.y, w: size, h: rect.h }
+                } else {
+                    PaneRect { x: rect.x, y: rect.y + off, w: rect.w, h: size }
+                };
+                layout_rects(k, sub, divider, out);
+            }
+        }
+    }
+}
+
+/// Collect every divider strip (with the tree path to its split node) for drawing and drag-resize.
+fn layout_dividers(node: &Layout, rect: PaneRect, divider: f32, path: &mut Vec<usize>, out: &mut Vec<DividerInfo>) {
+    let Layout::Split { dir, ratios, kids } = node else { return };
+    let vertical = *dir == SplitDir::Vertical;
+    let total = if vertical { rect.w } else { rect.h };
+    let ext = pane_extents(ratios, total, divider);
+    // A strip sits in the `divider`-wide gap after each pane but the last.
+    for (i, &(off, size)) in ext.iter().take(kids.len().saturating_sub(1)).enumerate() {
+        let strip = if vertical {
+            PaneRect { x: rect.x + off + size, y: rect.y, w: divider, h: rect.h }
+        } else {
+            PaneRect { x: rect.x, y: rect.y + off + size, w: rect.w, h: divider }
+        };
+        out.push(DividerInfo { rect: strip, vertical, path: path.clone(), idx: i, node: rect });
+    }
+    for (ci, k) in kids.iter().enumerate() {
+        let (off, size) = ext[ci];
+        let sub = if vertical {
+            PaneRect { x: rect.x + off, y: rect.y, w: size, h: rect.h }
+        } else {
+            PaneRect { x: rect.x, y: rect.y + off, w: rect.w, h: size }
+        };
+        path.push(ci);
+        layout_dividers(k, sub, divider, path, out);
+        path.pop();
+    }
+}
+
+/// One pane's grid to render this frame: its snapshot and the absolute pixel rect `[x, x+w] ×
+/// [y, y+h]` it occupies (its row 0 anchors at `y`). A single pane fills the whole grid region;
+/// split panes get sub-rects from the layout tree. `focused` gets the bright cursor. The renderer
+/// clips each pane's glyphs to the current grid band, so a top/bottom overlay covers it cleanly.
 struct PaneRender<'a> {
     snap: &'a Snapshot,
     x: f32,
+    y: f32,
     w: f32,
-    y_frac: f32,
-    h_frac: f32,
+    h: f32,
     focused: bool,
     /// `(row, start_col, end_col)` of a Ctrl-hovered link to accent-underline (focused pane).
     hovered_link: Option<(usize, usize, usize)>,
 }
 
-/// A pane's vertical placement in pixels: `(vp_y, clip_top, clip_bottom)` — the y-origin for
-/// its row 0 and the band it's clipped to. A full-height (vertical / single) pane anchors at
-/// `top` and clips to the whole grid `[grid_top, grid_bottom]` (unchanged behaviour); a
-/// horizontal pane anchors at its band top within the grid region. Pure, so it's unit-tested.
-fn pane_band(y_frac: f32, h_frac: f32, top: f32, grid_top: f32, grid_bottom: f32) -> (f32, f32, f32) {
-    if h_frac >= 0.999 {
-        (top, grid_top, grid_bottom)
-    } else {
-        let gh = (grid_bottom - grid_top).max(0.0);
-        let vp_y = grid_top + y_frac * gh;
-        let clip_bottom = (grid_top + (y_frac + h_frac) * gh).min(grid_bottom);
-        (vp_y, vp_y.max(grid_top), clip_bottom)
-    }
+/// Clip a pane's vertical extent `[y, y+h]` to the grid band `[grid_top, grid_bottom]`, returning
+/// `(vp_y, clip_top, clip_bottom)` — the row-0 origin and the band rows are drawn within. A top or
+/// bottom overlay narrows the band, so the pane is covered rather than reflowed.
+fn pane_band(y: f32, h: f32, grid_top: f32, grid_bottom: f32) -> (f32, f32, f32) {
+    (y, y.max(grid_top), (y + h).min(grid_bottom))
 }
 
 /// Smallest fraction a split pane may shrink to when dragging a divider (keeps each pane usable).
@@ -2717,10 +2882,8 @@ fn main() -> Result<()> {
     let mut app = App {
         sessions,
         active: 0,
-        panes: vec![0],
+        layout: Layout::Leaf(0),
         focus: 0,
-        split_dir: SplitDir::Vertical,
-        pane_ratios: Vec::new(),
         div_drag: None,
         next_id: 1,
         proxy,
@@ -3212,16 +3375,13 @@ fn pump(
 struct App {
     sessions: Vec<Session>,
     active: usize,
-    // Split panes: session indices in layout order; `focus` indexes it and
-    // `panes[focus] == active`. len()==1 is the classic single-pane view. `split_dir` is
-    // whether they tile as columns (Vertical) or rows (Horizontal).
-    panes: Vec<usize>,
+    // Split panes as a recursive tree; `focus` indexes its leaves in traversal order and
+    // `layout.leaves()[focus] == active`. A lone `Leaf` is the classic single-pane view. Any tab
+    // op resets it to `Leaf(active)`, so the session indices it stores stay valid.
+    layout: Layout,
     focus: usize,
-    split_dir: SplitDir,
-    // Per-pane size ratios (sum ~1), set by dragging a divider. Ignored when its length no
-    // longer matches `panes` (a split/collapse changed the count) — the layout falls back to
-    // equal. `div_drag` is the divider index currently being dragged.
-    pane_ratios: Vec<f32>,
+    // The divider currently being dragged, as an index into the per-frame divider list (stable
+    // while the layout structure is unchanged; a drag only edits ratios).
     div_drag: Option<usize>,
     next_id: u64,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
@@ -5238,58 +5398,57 @@ impl App {
         self.request_redraw();
     }
 
-    /// The current per-pane size ratios: the dragged `pane_ratios` when they still match the
-    /// pane count, else an equal split (a split/collapse invalidates a stale set by length).
-    fn current_ratios(&self) -> Vec<f32> {
-        let n = self.panes.len().max(1);
-        if self.pane_ratios.len() == n && n > 0 {
-            self.pane_ratios.clone()
-        } else {
-            equal_ratios(n)
-        }
+    /// The pixel rectangle the split layout fills for a `w`×`h` window: the whole grid area below
+    /// the tab bar. Panes get sub-rects of this from the layout tree.
+    fn grid_region(&self, w: f32, h: f32) -> PaneRect {
+        let top = top_offset(self.sessions.len());
+        PaneRect { x: 0.0, y: top, w, h: (h - top - PAD).max(1.0) }
     }
 
-    /// The split divider (index `i`, between pane `i` and `i+1`) under a cursor at `(px, py)`,
-    /// if within a few pixels of one — for starting a drag-to-resize. `None` when not split,
-    /// over the tab bar, or not near a divider.
+    /// Leaf pixel rects for the current layout at `w`×`h`, parallel to `self.layout.leaves()`.
+    fn pane_rects(&self, w: f32, h: f32) -> Vec<PaneRect> {
+        let mut out = Vec::new();
+        layout_rects(&self.layout, self.grid_region(w, h), DIVIDER, &mut out);
+        out
+    }
+
+    /// Every divider strip for the current layout at `w`×`h`, for drawing and grab hit-testing.
+    fn dividers(&self, w: f32, h: f32) -> Vec<DividerInfo> {
+        let mut out = Vec::new();
+        let mut path = Vec::new();
+        layout_dividers(&self.layout, self.grid_region(w, h), DIVIDER, &mut path, &mut out);
+        out
+    }
+
+    /// The divider (index into [`Self::dividers`]) under a cursor at `(px, py)` when within a few
+    /// pixels of its centre-line and inside its span — for starting a drag-to-resize.
     fn divider_at(&self, px: f64, py: f64, w: f32, h: f32) -> Option<usize> {
-        let n = self.panes.len();
-        let top = top_offset(self.sessions.len());
-        if n < 2 || (py as f32) < top {
-            return None;
-        }
-        const GRAB: f64 = 5.0;
-        let ratios = self.current_ratios();
-        if self.split_dir == SplitDir::Vertical {
-            let ext = pane_extents(&ratios, w, DIVIDER);
-            (0..n - 1).find(|&i| {
-                let (off, size) = ext[i];
-                (px - (off + size + DIVIDER / 2.0) as f64).abs() <= GRAB
-            })
-        } else {
-            let ext = pane_extents(&ratios, (h - top - PAD).max(1.0), DIVIDER);
-            (0..n - 1).find(|&i| {
-                let (off, size) = ext[i];
-                (py - (top + off + size + DIVIDER / 2.0) as f64).abs() <= GRAB
-            })
-        }
+        const GRAB: f32 = 5.0;
+        let (px, py) = (px as f32, py as f32);
+        self.dividers(w, h).iter().position(|d| {
+            let r = d.rect;
+            if d.vertical {
+                (px - (r.x + r.w / 2.0)).abs() <= GRAB && py >= r.y && py <= r.y + r.h
+            } else {
+                (py - (r.y + r.h / 2.0)).abs() <= GRAB && px >= r.x && px <= r.x + r.w
+            }
+        })
     }
 
-    /// Drag divider `i` to the cursor, updating the pane ratios and re-sizing the panes.
+    /// Drag divider `i` to the cursor, editing the ratios of the split node it belongs to and
+    /// re-sizing the panes. The boundary is measured within that node's own rect, so a nested
+    /// split resizes independently of its ancestors.
     fn drag_divider_to(&mut self, i: usize, px: f64, py: f64, w: f32, h: f32) {
-        let n = self.panes.len();
-        if i + 1 >= n {
-            return;
+        let divs = self.dividers(w, h);
+        let Some(d) = divs.get(i) else { return };
+        let (vertical, node, path, idx) = (d.vertical, d.node, d.path.clone(), d.idx);
+        if let Layout::Split { ratios, .. } = self.layout.node_at_mut(&path) {
+            let n = ratios.len();
+            let (start, span, coord) = if vertical { (node.x, node.w, px as f32) } else { (node.y, node.h, py as f32) };
+            let usable = (span - (n as f32 - 1.0) * DIVIDER).max(1.0);
+            let boundary = ((coord - start - idx as f32 * DIVIDER) / usable).clamp(0.0, 1.0);
+            *ratios = adjust_divider(ratios, idx, boundary);
         }
-        let top = top_offset(self.sessions.len());
-        let boundary = if self.split_dir == SplitDir::Vertical {
-            let usable = (w - (n as f32 - 1.0) * DIVIDER).max(1.0);
-            ((px as f32 - i as f32 * DIVIDER) / usable).clamp(0.0, 1.0)
-        } else {
-            let usable = (h - top - PAD - (n as f32 - 1.0) * DIVIDER).max(1.0);
-            ((py as f32 - top - i as f32 * DIVIDER) / usable).clamp(0.0, 1.0)
-        };
-        self.pane_ratios = adjust_divider(&self.current_ratios(), i, boundary);
         self.reflow();
     }
 
@@ -5301,33 +5460,25 @@ impl App {
         if let Some(gfx) = &mut self.gfx {
             gfx.resize(w, h);
         }
-        // Each split pane gets its own cell box, sized by its ratio; background (non-pane) tabs
-        // stay full so switching to them needs no reflow. Vertical splits vary the columns (full
-        // rows); horizontal splits vary the rows (full columns). `sizes[pi]` is `(cols, rows,
-        // col_w_px, row_h_px)` for the pane at position `pi`; a non-pane tab gets the full grid.
-        let n = self.panes.len().max(1);
-        let ratios = self.current_ratios();
-        let sizes: Vec<(u16, u16, f32, f32)> = if n <= 1 {
-            vec![(cols, rows, w as f32, h as f32)]
-        } else if self.split_dir == SplitDir::Vertical {
-            pane_extents(&ratios, w as f32, DIVIDER)
-                .into_iter()
-                .map(|(_, cw)| ((((cw - 2.0 * PAD) / cell_w).floor() as u16).max(1), rows, cw, h as f32))
-                .collect()
-        } else {
-            let grid_h = (h as f32 - top - PAD).max(line_h);
-            pane_extents(&ratios, grid_h, DIVIDER)
-                .into_iter()
-                .map(|(_, rh)| (cols, ((rh / line_h).floor() as u16).max(1), w as f32, rh))
-                .collect()
+        // Each split pane gets its own cell box, sized by its layout rect; a background (non-pane)
+        // tab stays full so switching to it needs no reflow. `dims(rect)` converts a pane's pixel
+        // rect to `(cols, rows, w_px, h_px)`; a single-pane layout's one rect is the whole grid.
+        let leaves = self.layout.leaves();
+        let rects = self.pane_rects(w as f32, h as f32);
+        let dims = |rc: &PaneRect| -> (u16, u16, f32, f32) {
+            (
+                (((rc.w - 2.0 * PAD) / cell_w).floor() as u16).max(1),
+                ((rc.h / line_h).floor() as u16).max(1),
+                rc.w,
+                rc.h,
+            )
         };
         for (i, s) in self.sessions.iter().enumerate() {
-            // A pane uses its position's size; everything else fills the grid.
-            let (c, r, cwpx, rhpx) = self
-                .panes
+            let (c, r, cwpx, rhpx) = leaves
                 .iter()
                 .position(|&p| p == i)
-                .and_then(|pi| sizes.get(pi).copied())
+                .and_then(|pi| rects.get(pi))
+                .map(dims)
                 .unwrap_or((cols, rows, w as f32, h as f32));
             if let Ok(mut g) = s.state.lock() {
                 g.term.resize(TermSize::new(c as usize, r as usize));
@@ -5337,7 +5488,7 @@ impl App {
             }
         }
         // `self.cols`/`rows` track the *focused* pane (mouse mapping, split spawn size).
-        let (fc, fr, _, _) = sizes.get(self.focus).copied().unwrap_or((cols, rows, 0.0, 0.0));
+        let (fc, fr, _, _) = rects.get(self.focus).map(dims).unwrap_or((cols, rows, 0.0, 0.0));
         self.cols = fc;
         self.rows = fr;
     }
@@ -5402,16 +5553,23 @@ impl App {
         if n > 1 {
             let next = if forward { (self.active + 1) % n } else { (self.active + n - 1) % n };
             self.switch_to(next);
-            self.panes = vec![self.active];
-            self.focus = 0;
+            self.collapse_layout();
         }
     }
 
+    /// Collapse any split back to the single active pane. Called by every session op (tab
+    /// switch / new / close / reorder), which would otherwise leave stale session indices in the
+    /// layout tree.
+    fn collapse_layout(&mut self) {
+        self.layout = Layout::Leaf(self.active);
+        self.focus = 0;
+    }
+
     /// Move tab `from` to position `to` in the tab strip (drag-to-reorder). Only in the classic
-    /// single-pane view — reordering the session list under a split would scramble `panes`.
+    /// single-pane view — reordering the session list under a split would scramble the layout.
     fn reorder_tab(&mut self, from: usize, to: usize) {
         if from == to
-            || self.panes.len() != 1
+            || !self.layout.is_single()
             || from >= self.sessions.len()
             || to >= self.sessions.len()
         {
@@ -5420,8 +5578,7 @@ impl App {
         let s = self.sessions.remove(from);
         self.sessions.insert(to, s);
         self.active = move_index(self.active, from, to);
-        self.panes = vec![self.active];
-        self.focus = 0;
+        self.collapse_layout();
         self.update_title(); // the `[i/n]` index may have changed
         self.request_redraw();
     }
@@ -5501,8 +5658,7 @@ impl App {
                 self.sessions.push(session);
                 let showed_bar = self.sessions.len() == 2;
                 self.switch_to(self.sessions.len() - 1);
-                self.panes = vec![self.active];
-                self.focus = 0;
+                self.collapse_layout();
                 if showed_bar {
                     self.reflow(); // bar just appeared → grid lost a row
                 }
@@ -5511,11 +5667,10 @@ impl App {
         }
     }
 
-    /// Split the focused pane vertically: spawn a new shell as a pane to its right and focus
-    /// it. Any other session op (new tab, tab switch, close) collapses the split (v1).
-    /// Split the focused pane, tiling the panes as columns (`Vertical`) or rows (`Horizontal`).
-    /// The direction applies to the whole set (no nested layouts in v1), so splitting the other
-    /// way re-tiles the existing panes in the new direction.
+    /// Split the focused pane, tiling as columns (`Vertical`) or rows (`Horizontal`) and focusing
+    /// the new shell. Splitting nests: if the focused pane's parent already runs the requested way
+    /// the new pane joins it, otherwise the pane is subdivided the other way. A tab op collapses
+    /// the whole layout back to one pane.
     fn split(&mut self, dir: SplitDir) {
         let cfg = load_config();
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -5525,24 +5680,28 @@ impl App {
                 self.next_id += 1;
                 self.sessions.push(session);
                 let new_idx = self.sessions.len() - 1;
-                self.split_dir = dir;
-                self.panes.insert(self.focus + 1, new_idx);
-                self.focus += 1;
-                self.switch_to(new_idx); // mirrors state/pty/images; leaves `panes` intact
-                self.reflow();           // re-size every pane to its column/row
+                // Subdivide the focused leaf; then focus follows the new pane by its traversal order.
+                if let Some(path) = self.layout.leaf_path(self.focus) {
+                    self.layout.split_leaf(&path, dir, new_idx);
+                }
+                self.focus = self.layout.leaves().iter().position(|&s| s == new_idx).unwrap_or(self.focus);
+                self.switch_to(new_idx); // mirrors state/pty/images; leaves the layout intact
+                self.reflow();           // re-size every pane to its rect
             }
             Err(e) => eprintln!("split: {e}"),
         }
     }
 
-    /// Cycle focus to the next split pane (left-to-right, wrapping).
+    /// Cycle focus to the next split pane in traversal order (wrapping).
     fn focus_pane(&mut self) {
-        if self.panes.len() < 2 {
+        let n = self.layout.leaf_count();
+        if n < 2 {
             return;
         }
-        self.focus = (self.focus + 1) % self.panes.len();
-        let si = self.panes[self.focus];
-        self.switch_to(si); // updates `active`; keeps `panes`/`focus`
+        self.focus = (self.focus + 1) % n;
+        if let Some(&si) = self.layout.leaves().get(self.focus) {
+            self.switch_to(si); // updates `active`; keeps the layout/focus
+        }
     }
 
     /// Close tab `idx` (reaps its shell). Returns true when no tabs remain.
@@ -5559,8 +5718,7 @@ impl App {
         }
         let hid_bar = self.sessions.len() == 1;
         self.switch_to(active_after_close(self.active, idx, self.sessions.len()));
-        self.panes = vec![self.active]; // collapse any split (keeps pane indices valid, v1)
-        self.focus = 0;
+        self.collapse_layout(); // any split collapses (keeps session indices valid)
         if hid_bar {
             self.reflow(); // bar just disappeared → grid regained a row
         }
@@ -8478,7 +8636,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         // One snapshot per split pane (usually just one). The focused pane also gets the
         // in-place ps colouring and search highlight overlays. `panes` is cloned so the
         // per-pane `&mut self` (apply_*) calls don't collide with iterating it.
-        let panes = self.panes.clone();
+        let panes = self.layout.leaves();
         let focus = self.focus.min(panes.len().saturating_sub(1));
         let mut pane_snaps: Vec<Snapshot> = Vec::with_capacity(panes.len());
         for (pi, &si) in panes.iter().enumerate() {
@@ -8922,36 +9080,28 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         // Visual bell: flash a border while `bell_until` is in the future, re-drawing
         // until it lapses (then one final frame clears it).
         let bell = self.bell_until.is_some_and(|t| std::time::Instant::now() < t);
-        // Lay the panes into columns (single pane → full width).
-        let win_w = self.window.as_ref().map(|win| win.inner_size().width as f32).unwrap_or(0.0);
-        // Columns (Vertical / single pane) tile across the width; rows (Horizontal) tile the
-        // grid's vertical band, expressed as fractions that paint resolves to pixels.
-        let n = pane_snaps.len().max(1);
-        let vertical = self.split_dir == SplitDir::Vertical || n <= 1;
-        let ratios = self.current_ratios();
-        // Columns are laid out in pixels across the width; rows as fractions of the grid region
-        // (paint resolves those to pixels). Both honour the per-pane ratios via `pane_extents`.
-        let extents = if vertical {
-            pane_extents(&ratios, win_w, DIVIDER)
-        } else {
-            pane_extents(&ratios, 1.0, 0.0)
-        };
+        // Lay the panes out from the split tree: each leaf gets an absolute pixel rect (single
+        // pane → the whole grid region). The rects are parallel to `pane_snaps` (both in leaf
+        // traversal order). Dividers are the strips between siblings, drawn as thin rules.
+        let (win_w, win_h) = self
+            .window
+            .as_ref()
+            .map(|win| (win.inner_size().width as f32, win.inner_size().height as f32))
+            .unwrap_or((0.0, 0.0));
+        let rects = self.pane_rects(win_w, win_h);
+        let divider_rects: Vec<[f32; 4]> =
+            self.dividers(win_w, win_h).iter().map(|d| [d.rect.x, d.rect.y, d.rect.w, d.rect.h]).collect();
         let pane_views: Vec<PaneRender> = pane_snaps
             .iter()
             .enumerate()
             .map(|(pi, s)| {
-                let (off, size) = extents.get(pi).copied().unwrap_or((0.0, win_w));
-                let (x, w, y_frac, h_frac) = if vertical {
-                    (off, size, 0.0, 1.0)
-                } else {
-                    (0.0, win_w, off, size)
-                };
+                let rc = rects.get(pi).copied().unwrap_or(PaneRect { x: 0.0, y: 0.0, w: win_w, h: win_h });
                 PaneRender {
                     snap: s,
-                    x,
-                    w,
-                    y_frac,
-                    h_frac,
+                    x: rc.x,
+                    y: rc.y,
+                    w: rc.w,
+                    h: rc.h,
                     focused: pi == fidx,
                     // The hover highlight belongs to the focused pane the mouse reads from.
                     hovered_link: if pi == fidx { self.hovered_link } else { None },
@@ -8965,9 +9115,9 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let pending = self.pending_analyze.take();
         let mut captured_png: Option<Vec<u8>> = None;
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&pane_views, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), ai.as_ref(), du.as_ref(), preedit, bell);
+            gfx.render(&pane_views, &divider_rects, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), ai.as_ref(), du.as_ref(), preedit, bell);
             if pending.is_some() {
-                captured_png = gfx.paint_to_png(&pane_views, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), du.as_ref(), preedit, bell);
+                captured_png = gfx.paint_to_png(&pane_views, &divider_rects, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), du.as_ref(), preedit, bell);
             }
         }
         if let Some(pa) = pending {
@@ -10343,7 +10493,7 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, panes: &[PaneRender], view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
+    fn paint(&mut self, panes: &[PaneRender], dividers: &[[f32; 4]], view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
         // search bar and the bottom panel (man page / command preview) each overlay a
         // strip/panel at the bottom.
@@ -10441,7 +10591,7 @@ impl Renderer {
         // inside its column [vp_x, vp_x + vp_w] (full width when there's a single pane).
         for pane in panes {
             let (vp_x, snap) = (pane.x, pane.snap);
-            let (vp_y, clip_top, clip_bot) = pane_band(pane.y_frac, pane.h_frac, top, grid_top, grid_bottom);
+            let (vp_y, clip_top, clip_bot) = pane_band(pane.y, pane.h, grid_top, grid_bottom);
             for r in 0..snap.rows {
                 let y = vp_y + r as f32 * self.line_h;
                 let row_visible = y >= clip_top - 0.5 && y + self.line_h <= clip_bot + 0.5;
@@ -10495,15 +10645,15 @@ impl Renderer {
                 }
             }
         }
-        // Divider quads between adjacent panes: a vertical rule between columns, a horizontal
-        // rule between stacked rows.
-        for pane in panes.iter().skip(1) {
-            let div = self.color4(blend(self.theme.bg, self.theme.fg, 0.28));
-            if pane.h_frac >= 0.999 {
-                bg_quads.push(QuadInstance { rect: [pane.x - DIVIDER, top, DIVIDER, h as f32 - top], color: div });
-            } else {
-                let (vp_y, _, _) = pane_band(pane.y_frac, pane.h_frac, top, grid_top, grid_bottom);
-                bg_quads.push(QuadInstance { rect: [0.0, vp_y - DIVIDER, w as f32, DIVIDER], color: div });
+        // Divider rules between sibling panes (a vertical rule between columns, a horizontal one
+        // between rows), each supplied as an absolute pixel rect by the layout tree. Clip to the
+        // grid band so an open top/bottom overlay doesn't paint a stray rule over it.
+        let div = self.color4(blend(self.theme.bg, self.theme.fg, 0.28));
+        for &[dx, dy, dw, dh] in dividers {
+            let y0 = dy.max(grid_top);
+            let y1 = (dy + dh).min(grid_bottom);
+            if y1 > y0 {
+                bg_quads.push(QuadInstance { rect: [dx, y0, dw, y1 - y0], color: div });
             }
         }
         // Search bar: an opaque strip at the bottom (drawn over the grid) + a top rule.
@@ -10655,7 +10805,7 @@ impl Renderer {
                 spans.push(("\n".to_string(), DEFAULT_FG, false, false));
             }
             let buf = &mut self.pane_buffers[pi];
-            buf.set_size(Some(pane.w - 2.0 * PAD), Some(h as f32 - top - PAD));
+            buf.set_size(Some(pane.w - 2.0 * PAD), Some(pane.h));
             buf.set_rich_text(
                 spans.iter().map(|(s, fg, bold, italic)| {
                     let mut a = Attrs::new().family(fam).color(Color::rgb(fg[0], fg[1], fg[2]));
@@ -10817,7 +10967,7 @@ impl Renderer {
             }
         } else {
             for (pi, pane) in panes.iter().enumerate() {
-                let (vp_y, ct, cb) = pane_band(pane.y_frac, pane.h_frac, top, grid_top, grid_bottom);
+                let (vp_y, ct, cb) = pane_band(pane.y, pane.h, grid_top, grid_bottom);
                 text_areas.push(TextArea {
                     buffer: &self.pane_buffers[pi],
                     left: pane.x + PAD,
@@ -11189,7 +11339,7 @@ impl Gfx {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, panes: &[PaneRender], tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
+    fn render(&mut self, panes: &[PaneRender], dividers: &[[f32; 4]], tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -11199,6 +11349,7 @@ impl Gfx {
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.r.paint(
             panes,
+            dividers,
             &view,
             self.config.width,
             self.config.height,
@@ -11225,6 +11376,7 @@ impl Gfx {
     fn paint_to_png(
         &mut self,
         panes: &[PaneRender],
+        dividers: &[[f32; 4]],
         tabs: &[String],
         active: usize,
         search: Option<&str>,
@@ -11250,7 +11402,7 @@ impl Gfx {
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         // Paint the terminal as-is (no AI card — it's showing "Analyzing…").
         self.r.paint(
-            panes, &view, w, h, tabs, active, search, palette, panel, help, None, du, preedit,
+            panes, dividers, &view, w, h, tabs, active, search, palette, panel, help, None, du, preedit,
             bell,
         );
 
@@ -11490,7 +11642,8 @@ fn capture(path: &str) -> Result<()> {
         Some(PanelView { title: &man_title, body: &man_body, body_spans: None })
     };
     r.paint(
-        &[PaneRender { snap: &snap, x: 0.0, w: w as f32, y_frac: 0.0, h_frac: 1.0, focused: true, hovered_link: None }],
+        &[PaneRender { snap: &snap, x: 0.0, y: top_offset(1), w: w as f32, h: h as f32, focused: true, hovered_link: None }],
+        &[],
         &view,
         w,
         h,
@@ -13138,18 +13291,80 @@ mod tests {
     }
 
     #[test]
-    fn pane_band_places_horizontal_rows() {
-        // Grid region is [top=30, grid_bottom=630] here (grid_top may differ under overlays).
-        let (top, gt, gb) = (30.0, 30.0, 630.0); // gh = 600
-        // A full-height pane (h_frac 1) anchors at `top` and clips to the whole grid — the
-        // unchanged vertical/single behaviour, independent of y_frac.
-        assert_eq!(pane_band(0.0, 1.0, top, gt, gb), (30.0, 30.0, 630.0));
-        // Two horizontal panes (h_frac 0.5): top band [30,330], bottom band [330,630].
-        assert_eq!(pane_band(0.0, 0.5, top, gt, gb), (30.0, 30.0, 330.0));
-        assert_eq!(pane_band(0.5, 0.5, top, gt, gb), (330.0, 330.0, 630.0));
-        // The bottom clip never exceeds grid_bottom (rounding-safe).
-        let (_, _, cb) = pane_band(0.66, 0.34, top, gt, gb);
-        assert!(cb <= gb + 0.01);
+    fn pane_band_clips_to_grid() {
+        // Grid band is [grid_top=30, grid_bottom=630].
+        let (gt, gb) = (30.0, 630.0);
+        // A pane fully inside the band keeps its own extent.
+        assert_eq!(pane_band(30.0, 300.0, gt, gb), (30.0, 30.0, 330.0));
+        assert_eq!(pane_band(330.0, 300.0, gt, gb), (330.0, 330.0, 630.0));
+        // A pane extending past the band clips to it (a top/bottom overlay covers the rest), but
+        // its row-0 origin (vp_y) is unchanged so rows stay aligned.
+        let (vp_y, ct, cb) = pane_band(0.0, 700.0, gt, gb);
+        assert_eq!(vp_y, 0.0);
+        assert_eq!((ct, cb), (30.0, 630.0));
+    }
+
+    #[test]
+    fn nested_layout_rects_and_dividers() {
+        let approx = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let region = PaneRect { x: 0.0, y: 0.0, w: 402.0, h: 200.0 };
+        // A column split (2 leaves) over width 402, divider 2 → usable 400, each 200 wide, full
+        // height; the second starts past the 2px gap.
+        let cols = Layout::Split { dir: SplitDir::Vertical, ratios: equal_ratios(2), kids: vec![Layout::Leaf(0), Layout::Leaf(1)] };
+        let mut r = Vec::new();
+        layout_rects(&cols, region, 2.0, &mut r);
+        assert!(approx(r[0].x, 0.0) && approx(r[0].w, 200.0) && approx(r[0].h, 200.0));
+        assert!(approx(r[1].x, 202.0) && approx(r[1].w, 200.0));
+
+        // Nest: split the right column into two rows. Leaves are [left, top-right, bottom-right].
+        let nested = Layout::Split {
+            dir: SplitDir::Vertical,
+            ratios: equal_ratios(2),
+            kids: vec![
+                Layout::Leaf(0),
+                Layout::Split { dir: SplitDir::Horizontal, ratios: equal_ratios(2), kids: vec![Layout::Leaf(1), Layout::Leaf(2)] },
+            ],
+        };
+        assert_eq!(nested.leaves(), vec![0, 1, 2]);
+        assert_eq!(nested.leaf_count(), 3);
+        let mut r = Vec::new();
+        layout_rects(&nested, region, 2.0, &mut r);
+        // Left leaf spans the full height; the two right leaves share the right column's height.
+        assert!(approx(r[0].h, 200.0));
+        assert!(approx(r[1].x, 202.0) && approx(r[1].y, 0.0) && approx(r[1].h, 99.0));
+        assert!(approx(r[2].x, 202.0) && approx(r[2].y, 101.0) && approx(r[2].h, 99.0));
+        // Dividers: the outer vertical rule (full height) and the inner horizontal rule (only
+        // across the right column).
+        let mut divs = Vec::new();
+        let mut path = Vec::new();
+        layout_dividers(&nested, region, 2.0, &mut path, &mut divs);
+        assert_eq!(divs.len(), 2);
+        let vert = divs.iter().find(|d| d.vertical).unwrap();
+        assert!(approx(vert.rect.x, 200.0) && approx(vert.rect.h, 200.0) && vert.path.is_empty());
+        let horiz = divs.iter().find(|d| !d.vertical).unwrap();
+        assert!(approx(horiz.rect.x, 202.0) && approx(horiz.rect.w, 200.0) && approx(horiz.rect.y, 99.0));
+        assert_eq!(horiz.path, vec![1]); // inside the right child
+    }
+
+    #[test]
+    fn split_leaf_nests_and_extends() {
+        // Splitting the lone root wraps it in a column of two.
+        let mut l = Layout::Leaf(0);
+        l.split_leaf(&l.leaf_path(0).unwrap(), SplitDir::Vertical, 1);
+        assert_eq!(l.leaves(), vec![0, 1]);
+        assert!(matches!(&l, Layout::Split { dir: SplitDir::Vertical, kids, .. } if kids.len() == 2));
+        // Splitting the right leaf the SAME way extends that column to three siblings.
+        l.split_leaf(&l.leaf_path(1).unwrap(), SplitDir::Vertical, 2);
+        assert_eq!(l.leaves(), vec![0, 1, 2]);
+        assert!(matches!(&l, Layout::Split { kids, .. } if kids.len() == 3));
+        // Splitting a leaf the OTHER way nests: leaf 2 becomes a row of [2, 3].
+        l.split_leaf(&l.leaf_path(2).unwrap(), SplitDir::Horizontal, 3);
+        assert_eq!(l.leaves(), vec![0, 1, 2, 3]);
+        if let Layout::Split { kids, .. } = &l {
+            assert!(matches!(&kids[2], Layout::Split { dir: SplitDir::Horizontal, kids, .. } if kids.len() == 2));
+        } else {
+            panic!("expected a split at the root");
+        }
     }
 
     #[test]
