@@ -878,6 +878,48 @@ fn pane_band(y_frac: f32, h_frac: f32, top: f32, grid_top: f32, grid_bottom: f32
     }
 }
 
+/// Smallest fraction a split pane may shrink to when dragging a divider (keeps each pane usable).
+const PANE_MIN_FRAC: f32 = 0.08;
+
+/// Equal split ratios for `n` panes (each `1/n`) — the default before any divider drag.
+fn equal_ratios(n: usize) -> Vec<f32> {
+    let n = n.max(1);
+    vec![1.0 / n as f32; n]
+}
+
+/// Lay `ratios` (summing to ~1) into `(offset, size)` per pane across `total`, with `divider`
+/// pixels of gap between them. Pane `i` occupies `[offset_i, offset_i + size_i]`. Reduces
+/// exactly to equal division when the ratios are equal. Pure, so the geometry is unit-tested.
+fn pane_extents(ratios: &[f32], total: f32, divider: f32) -> Vec<(f32, f32)> {
+    let n = ratios.len();
+    let usable = (total - (n.saturating_sub(1)) as f32 * divider).max(0.0);
+    let mut out = Vec::with_capacity(n);
+    let mut off = 0.0;
+    for &r in ratios {
+        let size = (r * usable).max(0.0);
+        out.push((off, size));
+        off += size + divider;
+    }
+    out
+}
+
+/// Move the boundary between pane `idx` and `idx+1` to fraction `boundary` (0..1 of the total),
+/// keeping every other pane fixed and both neighbours ≥ `PANE_MIN_FRAC`. Returns the new ratios.
+/// Pure, so the drag math is unit-tested.
+fn adjust_divider(ratios: &[f32], idx: usize, boundary: f32) -> Vec<f32> {
+    let mut out = ratios.to_vec();
+    if idx + 1 >= out.len() {
+        return out;
+    }
+    let before: f32 = out[..idx].iter().sum();
+    let pair = out[idx] + out[idx + 1]; // the two panes share this span; the rest stay put
+    // Desired left ratio = boundary minus everything to its left, clamped so both keep the min.
+    let left = (boundary - before).clamp(PANE_MIN_FRAC, pair - PANE_MIN_FRAC);
+    out[idx] = left;
+    out[idx + 1] = pair - left;
+    out
+}
+
 /// The `du` disk-usage treemap overlay for one frame (spec-du-treemap.md): the laid-out
 /// boxes to draw, a breadcrumb/status title, and an optional centered message shown
 /// instead of the boxes (scanning / timeout / empty).
@@ -2678,6 +2720,8 @@ fn main() -> Result<()> {
         panes: vec![0],
         focus: 0,
         split_dir: SplitDir::Vertical,
+        pane_ratios: Vec::new(),
+        div_drag: None,
         next_id: 1,
         proxy,
         state,
@@ -3174,6 +3218,11 @@ struct App {
     panes: Vec<usize>,
     focus: usize,
     split_dir: SplitDir,
+    // Per-pane size ratios (sum ~1), set by dragging a divider. Ignored when its length no
+    // longer matches `panes` (a split/collapse changed the count) — the layout falls back to
+    // equal. `div_drag` is the divider index currently being dragged.
+    pane_ratios: Vec<f32>,
+    div_drag: Option<usize>,
     next_id: u64,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     // Active-session pointers (Arc-clones re-pointed on switch) so existing call sites
@@ -4765,6 +4814,17 @@ impl App {
     fn on_cursor_moved(&mut self, x: f64, y: f64) {
         self.mouse_px = x;
         self.mouse_py = y;
+        // Divider-resize drag: while a divider is grabbed, follow the cursor, re-sizing the two
+        // panes it separates. Takes precedence over grid/selection handling.
+        if let Some(i) = self.div_drag {
+            let (w, h) = self
+                .window
+                .as_ref()
+                .map(|win| (win.inner_size().width as f32, win.inner_size().height as f32))
+                .unwrap_or((1.0, 1.0));
+            self.drag_divider_to(i, x, y, w, h);
+            return;
+        }
         // Tab-reorder drag: while a tab is grabbed, moving the cursor over another tab's
         // segment slides the grabbed tab there (live). Takes precedence over grid handling.
         if let Some(from) = self.tab_drag {
@@ -4948,6 +5008,18 @@ impl App {
             }
             return;
         }
+        // Grab a split divider to drag-resize the panes on either side.
+        if button == MouseButton::Left && pressed {
+            let (w, h) = self
+                .window
+                .as_ref()
+                .map(|win| (win.inner_size().width as f32, win.inner_size().height as f32))
+                .unwrap_or((1.0, 1.0));
+            if let Some(i) = self.divider_at(self.mouse_px, self.mouse_py, w, h) {
+                self.div_drag = Some(i);
+                return;
+            }
+        }
         // Ctrl+click a hyperlink → confirm modal (explicit action, §13), never auto-opens.
         if button == MouseButton::Left && pressed && self.modifiers.control_key() {
             let (col, row) = (self.mouse_col, self.mouse_row);
@@ -4959,6 +5031,7 @@ impl App {
             self.left_down = pressed;
             if !pressed {
                 self.tab_drag = None; // release ends any tab-reorder drag
+                self.div_drag = None; // and any divider-resize drag
             }
         }
         // Report to the app unless Shift forces local handling.
@@ -5121,11 +5194,59 @@ impl App {
         self.request_redraw();
     }
 
-    /// Pixel width of one split-pane column for a window width `w` (dividers subtracted,
-    /// divided evenly). Equals the full width for a single pane.
-    fn pane_col_w(&self, w: f32) -> f32 {
-        let n = self.panes.len().max(1) as f32;
-        ((w - (n - 1.0) * DIVIDER) / n).max(1.0)
+    /// The current per-pane size ratios: the dragged `pane_ratios` when they still match the
+    /// pane count, else an equal split (a split/collapse invalidates a stale set by length).
+    fn current_ratios(&self) -> Vec<f32> {
+        let n = self.panes.len().max(1);
+        if self.pane_ratios.len() == n && n > 0 {
+            self.pane_ratios.clone()
+        } else {
+            equal_ratios(n)
+        }
+    }
+
+    /// The split divider (index `i`, between pane `i` and `i+1`) under a cursor at `(px, py)`,
+    /// if within a few pixels of one — for starting a drag-to-resize. `None` when not split,
+    /// over the tab bar, or not near a divider.
+    fn divider_at(&self, px: f64, py: f64, w: f32, h: f32) -> Option<usize> {
+        let n = self.panes.len();
+        let top = top_offset(self.sessions.len());
+        if n < 2 || (py as f32) < top {
+            return None;
+        }
+        const GRAB: f64 = 5.0;
+        let ratios = self.current_ratios();
+        if self.split_dir == SplitDir::Vertical {
+            let ext = pane_extents(&ratios, w, DIVIDER);
+            (0..n - 1).find(|&i| {
+                let (off, size) = ext[i];
+                (px - (off + size + DIVIDER / 2.0) as f64).abs() <= GRAB
+            })
+        } else {
+            let ext = pane_extents(&ratios, (h - top - PAD).max(1.0), DIVIDER);
+            (0..n - 1).find(|&i| {
+                let (off, size) = ext[i];
+                (py - (top + off + size + DIVIDER / 2.0) as f64).abs() <= GRAB
+            })
+        }
+    }
+
+    /// Drag divider `i` to the cursor, updating the pane ratios and re-sizing the panes.
+    fn drag_divider_to(&mut self, i: usize, px: f64, py: f64, w: f32, h: f32) {
+        let n = self.panes.len();
+        if i + 1 >= n {
+            return;
+        }
+        let top = top_offset(self.sessions.len());
+        let boundary = if self.split_dir == SplitDir::Vertical {
+            let usable = (w - (n as f32 - 1.0) * DIVIDER).max(1.0);
+            ((px as f32 - i as f32 * DIVIDER) / usable).clamp(0.0, 1.0)
+        } else {
+            let usable = (h - top - PAD - (n as f32 - 1.0) * DIVIDER).max(1.0);
+            ((py as f32 - top - i as f32 * DIVIDER) / usable).clamp(0.0, 1.0)
+        };
+        self.pane_ratios = adjust_divider(&self.current_ratios(), i, boundary);
+        self.reflow();
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -5136,33 +5257,45 @@ impl App {
         if let Some(gfx) = &mut self.gfx {
             gfx.resize(w, h);
         }
-        // Each split pane gets its own cell box; background (non-pane) tabs stay full so
-        // switching to them needs no reflow. `cols`/`rows` above are the full-grid size.
-        // Vertical splits narrow the columns (full rows); horizontal splits shorten the rows
-        // (full columns). `(pane_cols, pane_rows, col_w_px, row_h_px)` describe one pane.
+        // Each split pane gets its own cell box, sized by its ratio; background (non-pane) tabs
+        // stay full so switching to them needs no reflow. Vertical splits vary the columns (full
+        // rows); horizontal splits vary the rows (full columns). `sizes[pi]` is `(cols, rows,
+        // col_w_px, row_h_px)` for the pane at position `pi`; a non-pane tab gets the full grid.
         let n = self.panes.len().max(1);
-        let (pane_cols, pane_rows, col_w, row_h) = if n <= 1 {
-            (cols, rows, w as f32, h as f32)
+        let ratios = self.current_ratios();
+        let sizes: Vec<(u16, u16, f32, f32)> = if n <= 1 {
+            vec![(cols, rows, w as f32, h as f32)]
         } else if self.split_dir == SplitDir::Vertical {
-            let col_w = self.pane_col_w(w as f32);
-            ((((col_w - 2.0 * PAD) / cell_w).floor() as u16).max(1), rows, col_w, h as f32)
+            pane_extents(&ratios, w as f32, DIVIDER)
+                .into_iter()
+                .map(|(_, cw)| ((((cw - 2.0 * PAD) / cell_w).floor() as u16).max(1), rows, cw, h as f32))
+                .collect()
         } else {
             let grid_h = (h as f32 - top - PAD).max(line_h);
-            let row_h = ((grid_h - (n as f32 - 1.0) * DIVIDER) / n as f32).max(line_h);
-            (cols, ((row_h / line_h).floor() as u16).max(1), w as f32, row_h)
+            pane_extents(&ratios, grid_h, DIVIDER)
+                .into_iter()
+                .map(|(_, rh)| (cols, ((rh / line_h).floor() as u16).max(1), w as f32, rh))
+                .collect()
         };
         for (i, s) in self.sessions.iter().enumerate() {
-            let (c, r) = if self.panes.contains(&i) { (pane_cols, pane_rows) } else { (cols, rows) };
+            // A pane uses its position's size; everything else fills the grid.
+            let (c, r, cwpx, rhpx) = self
+                .panes
+                .iter()
+                .position(|&p| p == i)
+                .and_then(|pi| sizes.get(pi).copied())
+                .unwrap_or((cols, rows, w as f32, h as f32));
             if let Ok(mut g) = s.state.lock() {
                 g.term.resize(TermSize::new(c as usize, r as usize));
             }
             if let Ok(p) = s.pty.lock() {
-                let _ = p.resize(c, r, col_w as u16, row_h as u16);
+                let _ = p.resize(c, r, cwpx as u16, rhpx as u16);
             }
         }
         // `self.cols`/`rows` track the *focused* pane (mouse mapping, split spawn size).
-        self.cols = if n > 1 { pane_cols } else { cols };
-        self.rows = if n > 1 { pane_rows } else { rows };
+        let (fc, fr, _, _) = sizes.get(self.focus).copied().unwrap_or((cols, rows, 0.0, 0.0));
+        self.cols = fc;
+        self.rows = fr;
     }
 
     fn request_redraw(&self) {
@@ -8751,16 +8884,23 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         // grid's vertical band, expressed as fractions that paint resolves to pixels.
         let n = pane_snaps.len().max(1);
         let vertical = self.split_dir == SplitDir::Vertical || n <= 1;
-        let col_w = self.pane_col_w(win_w);
+        let ratios = self.current_ratios();
+        // Columns are laid out in pixels across the width; rows as fractions of the grid region
+        // (paint resolves those to pixels). Both honour the per-pane ratios via `pane_extents`.
+        let extents = if vertical {
+            pane_extents(&ratios, win_w, DIVIDER)
+        } else {
+            pane_extents(&ratios, 1.0, 0.0)
+        };
         let pane_views: Vec<PaneRender> = pane_snaps
             .iter()
             .enumerate()
             .map(|(pi, s)| {
+                let (off, size) = extents.get(pi).copied().unwrap_or((0.0, win_w));
                 let (x, w, y_frac, h_frac) = if vertical {
-                    (pi as f32 * (col_w + DIVIDER), col_w, 0.0, 1.0)
+                    (off, size, 0.0, 1.0)
                 } else {
-                    let frac = 1.0 / n as f32;
-                    (0.0, win_w, pi as f32 * frac, frac)
+                    (0.0, win_w, off, size)
                 };
                 PaneRender {
                     snap: s,
@@ -12795,6 +12935,31 @@ mod tests {
         // The bottom clip never exceeds grid_bottom (rounding-safe).
         let (_, _, cb) = pane_band(0.66, 0.34, top, gt, gb);
         assert!(cb <= gb + 0.01);
+    }
+
+    #[test]
+    fn pane_extents_and_divider_drag() {
+        let approx = |a: f32, b: f32| (a - b).abs() < 0.01;
+        // Equal ratios reduce exactly to the old even split: 2 panes, width 202, divider 2 →
+        // usable 200, each 100, offsets 0 and 102 (the second past the divider gap).
+        let ext = pane_extents(&equal_ratios(2), 202.0, 2.0);
+        assert!(approx(ext[0].0, 0.0) && approx(ext[0].1, 100.0));
+        assert!(approx(ext[1].0, 102.0) && approx(ext[1].1, 100.0));
+        // Uneven ratios split the usable space proportionally (0.25 / 0.75 of 200 = 50 / 150).
+        let ext = pane_extents(&[0.25, 0.75], 202.0, 2.0);
+        assert!(approx(ext[0].1, 50.0) && approx(ext[1].0, 52.0) && approx(ext[1].1, 150.0));
+
+        // Dragging the divider to 0.3 makes pane 0 = 0.3, pane 1 = 0.7 (their sum is preserved).
+        let r = adjust_divider(&equal_ratios(2), 0, 0.3);
+        assert!(approx(r[0], 0.3) && approx(r[1], 0.7));
+        // Each pane keeps at least PANE_MIN_FRAC — dragging past the edge clamps.
+        let r = adjust_divider(&equal_ratios(2), 0, 0.0);
+        assert!(approx(r[0], PANE_MIN_FRAC) && approx(r[1], 1.0 - PANE_MIN_FRAC));
+        // With three panes, only the dragged pair (1,2) moves; pane 0 stays put.
+        let r = adjust_divider(&equal_ratios(3), 1, 0.8);
+        assert!(approx(r[0], 1.0 / 3.0));
+        assert!(approx(r[0] + r[1], 0.8)); // the boundary sits at 0.8
+        assert!(approx(r[0] + r[1] + r[2], 1.0)); // ratios still sum to 1
     }
 
     #[test]

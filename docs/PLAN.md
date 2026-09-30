@@ -238,7 +238,14 @@ interactive pass + wider program coverage outstanding.)*
   into another tab's segment slides it there live (`reorder_tab`, gated to the single-pane
   view so a split's `panes` can't be scrambled). `move_index` remaps `active`/`panes` after
   the move (unit-tested); Xephyr-verified (dragging `TAB_AAA` from slot 1 to 3 leaves
-  `BBB · CCC · AAA`, the dragged tab still active). ⬜ still: nested layouts, drag-resize.
+  `BBB · CCC · AAA`, the dragged tab still active). ✅ **drag-resize** — grab a divider and
+  drag it to re-proportion the two panes it separates (`pane_ratios` per pane, defaulting to
+  equal and reset by length when a split/collapse changes the count). `pane_extents` lays the
+  panes out from the ratios (reducing exactly to the even split) for both the render and the
+  per-pane `resize`; `adjust_divider` moves one boundary while keeping the rest fixed and each
+  pane ≥ `PANE_MIN_FRAC`. Pure geometry unit-tested; Xephyr-verified (equal split unchanged,
+  then dragging the divider left narrows one column and widens the other, content reflowing).
+  ⬜ still: nested layouts.
 - ✅ **Search overlay** — **Ctrl+Shift+F** opens a bottom search bar; incremental
   regex match over the whole buffer (scrollback included) via `alacritty_terminal`'s
   `RegexSearch`/`RegexIter`. All matches highlighted, the current one brighter;
