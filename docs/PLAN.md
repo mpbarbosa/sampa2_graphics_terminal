@@ -200,17 +200,22 @@ engine is now ours to prove.
   read correctly. Unit tests (`sgr_styled_underlines`) + Xephyr PNG.
 - 🔨 **App-matrix + contract smokes (§17, §3)** — headless harnesses (`#[ignore]`,
   `cargo test -- --ignored`) run real programs through real PTYs:
-  - `app_matrix_smoke` — rendering: **echo, ls (color), seq (wrap+scrollback),
-    python, vim (alt-screen)** all green; htop/tmux/neovim skipped (not installed).
+  - `app_matrix_smoke` — rendering: **echo, ls (color), seq (wrap+scrollback), python,
+    vim (alt-screen), neovim (alt-screen), tmux (status), less (pager)** all green; the case
+    list also carries htop/mc/emacs/weechat, each auto-skipped when the program isn't installed.
   - `ctrl_c_sends_sigint` — ✅ typed **^C terminates `sleep`** (line-discipline SIGINT).
   - `resize_reaches_child` — ✅ **`pty.resize` → child sees `30 100`** (TIOCSWINSZ/SIGWINCH).
-  ⬜ still: install + smoke htop/tmux/neovim/less/weechat/emacs; **live** resize-reflow
-  and Ctrl-Z job control driven at the keyboard in the GUI window.
+  - ✅ **live resize-reflow** — Xephyr-verified in the GUI window: a 150-column ruler rewraps
+    from ~112-col to ~60-col lines (and back) as the window is resized, so `alacritty_terminal`'s
+    reflow drives from the real `App::resize` path.
+  - ✅ **Ctrl-Z job control** — Xephyr-verified: typing `^Z` over `sleep 300` suspends it
+    (`[1] + suspended sleep 300`, confirmed by `jobs`) via the line-discipline SIGTSTP.
+  ⬜ still: install + smoke **htop / mc / emacs / weechat / ipython** (need the packages).
 
 **Exit — M1 app matrix (§17):** vim, neovim, tmux, htop, less, git log, ipython each
-render without corruption, respond to resize, honor Ctrl-C/Ctrl-Z; clean exit. *(Render
-+ SIGINT + SIGWINCH contracts verified headlessly for the installed subset; live GUI
-interactive pass + wider program coverage outstanding.)*
+render without corruption, respond to resize, honor Ctrl-C/Ctrl-Z; clean exit. *(Render +
+SIGINT + SIGWINCH contracts verified headlessly, and vim/neovim/tmux/less plus **live GUI
+resize-reflow and Ctrl-Z** verified in Xephyr; htop/mc/emacs/weechat/ipython await install.)*
 
 ### N2 — Comfort: config-driven renderer (§7.3, §11) 🔨
 - 🔨 Consume `sampa-config` (loaded from the XDG path at startup, else defaults):
