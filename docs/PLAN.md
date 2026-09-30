@@ -384,7 +384,10 @@ Services already exist; only the UI is new. Draw panels/overlays in the wgpu sce
   most-frecent commands first (the rest stay alphabetical); with a query, fuzzy relevance
   stays primary and frecency only **breaks ties**. `frecency_score` + the TSV round-trip +
   the ordering/tiebreak are unit-tested; Xephyr-verified (picking `zsh` floats it from
-  alphabetically-last to the top of the next open). ⬜ still: run-immediately affordance.
+  alphabetically-last to the top of the next open). ✅ **run-immediately affordance** —
+  **Shift+Enter** appends a newline instead of a trailing space, so the picked command executes
+  straight away (plain **Enter** still inserts `"<cmd> "` for editing); both record frecency.
+  Xephyr-verified (Shift+Enter on `date` runs it; Enter on `whoami` only inserts it).
 - ✅ **Man panel** (`sampa-man`): `Ctrl+Shift+M` opens a bottom panel with the man page
   for the **first token of the current command line** (tracked from typed keystrokes,
   `sudo`/`command`/`\` stripped; reset on Enter). `man -P cat <cmd>` runs on a
