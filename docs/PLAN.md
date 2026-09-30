@@ -127,8 +127,14 @@ engine is now ours to prove.
   Enter, Alt+key isn't ESC-prefixed) and **modified Enter/Tab/Backspace/Space**; plain typing
   and functional keys defer to the legacy encoder, and non-negotiating apps are untouched.
   Encoder + mode-stack + scanner unit-tested; Xephyr-verified end to end (`CSI >1u` then
-  Ctrl+A→`^[[97;5u`, Alt+X→`^[[120;3u`, Esc→`^[[27u`, plain `q`→`q`). ⬜ still: higher levels
-  (event types, report-all-as-esc, associated text), IME/compose sequences beyond the IM.
+  Ctrl+A→`^[[97;5u`, Alt+X→`^[[120;3u`, Esc→`^[[27u`, plain `q`→`q`). ✅ **event types — key
+  release** (`CSI > 3 u`, `REPORT_EVENT_TYPES`): a release is dropped unless the app enabled the
+  flag, then it's reported as an escape carrying the `:3` sub-parameter — every key, since a
+  release has no text (`CSI <code>;<mods>:3 u`, or a functional key's legacy form with `:3`).
+  `encode_key` threads the event type through its forms (press = unchanged); the release
+  encoding is unit-tested and Xephyr-verified (a key's release follows its press with matching
+  modifiers + `:3`). ⬜ still: **key repeat** as a distinct event, report-all-as-esc, associated
+  text; IME/compose sequences beyond the IM.
 - ✅ **Mouse (§8.2):** **SGR 1006** (+ X10 fallback) reporting for press/release/drag/
   wheel when the app enables a mouse mode (1000/1002/1003); button + Shift/Alt/Ctrl
   modifier bits; **Shift** forces local selection over app grab. 3 unit tests.
