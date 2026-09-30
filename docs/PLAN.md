@@ -133,8 +133,12 @@ engine is now ours to prove.
   release has no text (`CSI <code>;<mods>:3 u`, or a functional key's legacy form with `:3`).
   `encode_key` threads the event type through its forms (press = unchanged); the release
   encoding is unit-tested and Xephyr-verified (a key's release follows its press with matching
-  modifiers + `:3`). ⬜ still: **key repeat** as a distinct event, report-all-as-esc, associated
-  text; IME/compose sequences beyond the IM.
+  modifiers + `:3`). ✅ **report-all-keys-as-esc** (`CSI > 8 u`): with the flag set, a plain
+  press that would send text is reported as an escape instead (`CSI <code>[;<mods>] u`) —
+  what a game / raw-mode editor wants — while Shift stays in the modifier field and functional
+  keys are unchanged (already escapes). `encode_key_kitty` takes a `report_all` flag; unit-tested
+  and Xephyr-verified (`CSI > 9 u` → plain `a`/`b` arrive as `^[[97u]`/`^[[98u]`). ⬜ still: **key
+  repeat** as a distinct event, associated text; IME/compose sequences beyond the IM.
 - ✅ **Mouse (§8.2):** **SGR 1006** (+ X10 fallback) reporting for press/release/drag/
   wheel when the app enables a mouse mode (1000/1002/1003); button + Shift/Alt/Ctrl
   modifier bits; **Shift** forces local selection over app grab. 3 unit tests.
