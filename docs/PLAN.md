@@ -142,8 +142,14 @@ engine is now ours to prove.
   (`CSI <code>;<mods>;<text> u`) so an app receiving every key as an escape still learns what was
   typed; Ctrl/Alt/Super (a control action, not text), releases, and functional keys carry no text.
   `encode_key_kitty` takes an `assoc_text` flag; unit-tested and Xephyr-verified (flags 25 → plain
-  `a` → `^[[97;;97u`, Shift+A → `^[[97;2;65u`, Ctrl+C → `^[[99;5u`). ⬜ still: **key repeat** as a
-  distinct event; IME/compose sequences beyond the IM.
+  `a` → `^[[97;;97u`, Shift+A → `^[[97;2;65u`, Ctrl+C → `^[[99;5u`). ✅ **key repeat**: when the app
+  enabled event types, an auto-repeat (winit `KeyEvent.repeat`) is event type 2 — encoded exactly
+  like its press but with `:2`, so a plain key still repeats its text while an escape-form key
+  carries `^[[<code>;<mods>:2 u` (with text as `^[[<code>;<mods>:2;<text> u`); without event types a
+  repeat is indistinguishable from a press. Unit-tested and verified **byte-for-byte against the
+  reference terminal (kitty 0.49.1)** across flags 9/11/27. This completes all four kitty keyboard
+  enhancement flags (disambiguate · event types · report-all · associated text) plus repeat. ⬜
+  still: IME/compose sequences beyond the IM.
 - ✅ **Mouse (§8.2):** **SGR 1006** (+ X10 fallback) reporting for press/release/drag/
   wheel when the app enables a mouse mode (1000/1002/1003); button + Shift/Alt/Ctrl
   modifier bits; **Shift** forces local selection over app grab. 3 unit tests.

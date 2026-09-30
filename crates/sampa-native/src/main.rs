@@ -3679,7 +3679,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.dispatch(a, event_loop);
                     return;
                 }
-                let (app_cursor, app_keypad, kitty_kbd, report_all, assoc_text) = self
+                let (app_cursor, app_keypad, kitty_kbd, report_all, assoc_text, event_types) = self
                     .state
                     .lock()
                     .map(|g| {
@@ -3687,12 +3687,16 @@ impl ApplicationHandler<UserEvent> for App {
                         // Kitty keyboard is tracked in our shadow stack (the VT engine doesn't
                         // parse it): the disambiguate bit turns it on, the report-all bit makes
                         // even plain presses escapes, the associated-text bit attaches the typed
-                        // text to those escapes.
+                        // text to those escapes, and the event-types bit distinguishes a key
+                        // repeat from a first press.
                         let flags = g.kitty_kbd_stack.last().copied().unwrap_or(0);
-                        (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD), flags & 0b1 != 0, flags & 0b1000 != 0, flags & 0b10000 != 0)
+                        (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD), flags & 0b1 != 0, flags & 0b1000 != 0, flags & 0b10000 != 0, flags & 0b10 != 0)
                     })
-                    .unwrap_or((false, false, false, false, false));
+                    .unwrap_or((false, false, false, false, false, false));
                 let numpad = event.location == KeyLocation::Numpad;
+                // An auto-repeat is event type 2 — but only when the app enabled event types;
+                // otherwise a repeat is indistinguishable from a fresh press (event type 1).
+                let kitty_event = if event_types && event.repeat { 2 } else { 1 };
                 // When the app negotiated the kitty keyboard protocol, encode key presses in its
                 // unambiguous form; otherwise the legacy encoding (unchanged for every app that
                 // hasn't opted in).
@@ -3707,7 +3711,7 @@ impl ApplicationHandler<UserEvent> for App {
                         app_cursor,
                         app_keypad,
                         numpad,
-                        1, // press
+                        kitty_event, // 1 press, 2 repeat
                         report_all,
                         assoc_text,
                     )
@@ -9192,13 +9196,14 @@ fn kitty_mods(shift: bool, alt: bool, ctrl: bool, superk: bool) -> u32 {
 /// Everything else — plain typing, and the functional keys (arrows / F-keys / Home…PageDown,
 /// whose legacy `CSI …` forms already carry the modifier) — defers to [`encode_key`], which is
 /// already conformant. Higher levels (event types, report-all-as-esc, associated text) layer on
-/// top via `event`, `report_all` and `assoc_text`; key **repeat** is not yet a distinct event.
+/// top via `event`, `report_all` and `assoc_text`.
 ///
-/// `event` is the kitty event type: `1` press (the default) or `3` release. On **release**
-/// (event-types level, `CSI > 3 u`) there is no text, so *every* key is reported in its escape
-/// form with the `:3` sub-parameter — a plain text key becomes `CSI <code>;<mods>:3 u`, a
-/// functional key its legacy form with `:3` (via `encode_key`). Key **repeat** is not yet a
-/// distinct event; it is reported as a press.
+/// `event` is the kitty event type: `1` press (the default), `2` repeat, or `3` release. A
+/// **repeat** (event-types level, only when the app enabled event types) is encoded exactly like
+/// its press but with the `:2` sub-parameter — so a plain text key still sends its text, while an
+/// escape-form key (report-all, modified, functional) carries `:2` (e.g. `CSI <code>;<mods>:2 u`,
+/// with associated text as `CSI <code>;<mods>:2;<text> u`). On **release** there is no text, so
+/// *every* key is reported in its escape form with `:3`.
 #[allow(clippy::too_many_arguments)]
 fn encode_key_kitty(
     key: &Key,
@@ -9238,10 +9243,13 @@ fn encode_key_kitty(
     // default of 1) so the text field lands in the third position.
     let csi_u = |cp: u32| -> Vec<u8> {
         if let Some(tf) = &text_field {
-            let modf = if mods > 1 { mods.to_string() } else { String::new() };
             if event != 1 {
-                format!("\x1b[{cp};{modf}:{event};{tf}u").into_bytes()
+                // The `:event` sub-parameter needs a modifier value before it, so it is written
+                // explicitly (`1:2`) rather than left empty (matching kitty's repeat encoding).
+                format!("\x1b[{cp};{mods}:{event};{tf}u").into_bytes()
             } else {
+                // A plain press omits the default modifier value: `CSI <code>;;<text> u`.
+                let modf = if mods > 1 { mods.to_string() } else { String::new() };
                 format!("\x1b[{cp};{modf};{tf}u").into_bytes()
             }
         } else if event != 1 {
@@ -12836,6 +12844,36 @@ mod tests {
         assert_eq!(
             encode_key_kitty(&Key::Character("a".into()), Some("a"), false, false, false, false, false, false, false, 1, false, true),
             b"a"
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_key_repeat() {
+        // Auto-repeat is event type 2, encoded exactly like a press but with `:2`. All forms below
+        // were captured from the reference terminal (kitty 0.49.1) under the matching flag sets.
+        // `event = 2` is only ever passed when the app enabled event types (gated in dispatch).
+        let rep = |s: &str, sh, al, ct, report_all, assoc| {
+            encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, false, false, false, false, 2, report_all, assoc)
+        };
+
+        // Without report-all a plain key repeats as its text — same as the press (flag 3).
+        assert_eq!(rep("a", false, false, false, false, false), b"a");
+        assert_eq!(rep("a", false, false, false, false, true), b"a"); // assoc alone doesn't escape it
+        // With report-all the repeat is the escape form plus `:2`; the modifier value is explicit
+        // (`1:2`) because the event sub-parameter needs a value before it (flag 11).
+        assert_eq!(rep("a", false, false, false, true, false), b"\x1b[97;1:2u");
+        // With associated text too, the produced text is the third field (flag 27).
+        assert_eq!(rep("a", false, false, false, true, true), b"\x1b[97;1:2;97u");
+        // Shift is a real modifier; base code stays 'a', text is the shifted "A".
+        assert_eq!(rep("A", true, false, false, true, true), b"\x1b[97;2:2;65u");
+        // Ctrl/Alt produce a control action, not text — the repeat carries no text field.
+        assert_eq!(rep("c", false, false, true, true, true), b"\x1b[99;5:2u"); // Ctrl+C repeat
+        // A modified key repeats in escape form even without report-all (it is already an escape).
+        assert_eq!(rep("c", false, false, true, false, false), b"\x1b[99;5:2u");
+        // Functional keys repeat via their legacy form carrying `:2`.
+        assert_eq!(
+            encode_key_kitty(&Key::Named(NamedKey::ArrowUp), None, false, false, false, false, false, false, false, 2, false, false),
+            b"\x1b[1;1:2A"
         );
     }
 
