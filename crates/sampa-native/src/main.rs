@@ -41,7 +41,7 @@ use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
 };
 use pty_core::pty::{spawn, PtyEvent, PtyHandle, SpawnConfig};
 use sampa_config::CursorStyle;
@@ -453,6 +453,7 @@ struct CellVis {
     underline_color: Option<[u8; 3]>, // SGR 58; None → draw in `fg`
     strike: bool,
     hyperlink: bool,
+    spacer: bool, // WIDE_CHAR_SPACER: the reserved right half of a wide char (no glyph of its own)
 }
 
 /// One frame's worth of grid content, extracted under the term lock.
@@ -9710,6 +9711,7 @@ fn cell_vis(
         underline_color,
         strike: flags.contains(Flags::STRIKEOUT),
         hyperlink: cell.hyperlink().is_some(),
+        spacer: flags.contains(Flags::WIDE_CHAR_SPACER),
     }
 }
 
@@ -9875,22 +9877,21 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> { return textureSample(tex, samp, in.
 /// surface frame, or an offscreen texture for `--capture`).
 /// Measure a monospace cell's advance for the given font (shape 20 'M's, average).
 fn measure_cell_w(fs: &mut FontSystem, size: f32, line_h: f32, family: &str) -> f32 {
-    let mut probe = Buffer::new(fs, Metrics::new(size, line_h));
-    probe.set_size(Some(4096.0), Some(line_h));
-    probe.set_text(
-        "MMMMMMMMMMMMMMMMMMMM",
-        &Attrs::new().family(family_of(family)),
-        Shaping::Advanced,
-        None,
-    );
-    probe.shape_until_scroll(fs, false);
-    probe
-        .layout_runs()
-        .next()
-        .map(|r| r.line_w / 20.0)
-        .filter(|w| *w > 0.1)
-        .unwrap_or(size * 0.6)
+    measure_advance(fs, size, line_h, family, "MMMMMMMMMMMMMMMMMMMM").unwrap_or(size * 0.6)
 }
+
+/// Average shaped advance of the `probe` string's glyphs (its rendered width ÷ char count), or
+/// `None` when nothing shaped. Advanced shaping so a probe glyph the primary font lacks (a CJK
+/// ideograph) resolves through fallback — used to size the wide-cell letter-spacing pad.
+fn measure_advance(fs: &mut FontSystem, size: f32, line_h: f32, family: &str, probe: &str) -> Option<f32> {
+    let n = probe.chars().count().max(1) as f32;
+    let mut buf = Buffer::new(fs, Metrics::new(size, line_h));
+    buf.set_size(Some(8192.0), Some(line_h));
+    buf.set_text(probe, &Attrs::new().family(family_of(family)), Shaping::Advanced, None);
+    buf.shape_until_scroll(fs, false);
+    buf.layout_runs().next().map(|r| r.line_w / n).filter(|w| *w > 0.1)
+}
+
 
 struct Renderer {
     device: wgpu::Device,
@@ -10808,7 +10809,10 @@ impl Renderer {
         let base = Attrs::new().family(fam);
         // One reusable grid buffer per pane (grown lazily), each shaped from its snapshot.
         while self.pane_buffers.len() < panes.len() {
-            let b = Buffer::new(&mut self.font_system, Metrics::new(self.grid_font_size, self.line_h));
+            let mut b = Buffer::new(&mut self.font_system, Metrics::new(self.grid_font_size, self.line_h));
+            // A grid row is exactly one visual line — never let a long row (or a run of wide
+            // glyphs) wrap onto a second line, which would shove text over the row below.
+            b.set_wrap(Wrap::None);
             self.pane_buffers.push(b);
         }
         for (pi, pane) in panes.iter().enumerate() {
@@ -10823,6 +10827,12 @@ impl Renderer {
             for r in 0..snap.rows {
                 for c in 0..snap.cols {
                     let cell = snap.cell(r, c);
+                    // The spacer is the reserved right half of the wide char to its left; it carries
+                    // no glyph, so drop it — emitting it (as a blank) would drift the row rightward
+                    // and eventually push cells off the (non-wrapping) line.
+                    if cell.spacer {
+                        continue;
+                    }
                     wants_fallback |= needs_fallback_shaping(cell.c);
                     let key = (cell.fg, cell.bold, cell.italic);
                     match spans.last_mut() {
@@ -11800,6 +11810,13 @@ mod tests {
                 "{label}: col 1 is the wide-char spacer",
             );
             assert_eq!(g[Line(0)][Column(2)].c, 'X', "{label}: following text lands at col 2");
+            // The snapshot carries the spacer flag so the renderer can drop that cell from the
+            // shaped text (the wide glyph already spans both cells; emitting the spacer as a blank
+            // would drift the row).
+            let snap = build_snapshot(&term, &Theme::default(), CursorStyle::Block, false);
+            assert!(snap.cell(0, 1).spacer, "{label}: snapshot marks col 1 as a spacer");
+            assert!(!snap.cell(0, 0).spacer, "{label}: the wide char itself is not a spacer");
+            assert!(!snap.cell(0, 2).spacer, "{label}: following text is not a spacer");
         }
     }
 
