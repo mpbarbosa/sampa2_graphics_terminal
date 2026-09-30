@@ -34,7 +34,8 @@ run, never on its own.
   line into a title/description card — guarded fetch (http(s)-only, SSRF-vetted, size/timeout
   bounded); off by default (`[url_preview] enabled`).
 - **Split panes:** `Ctrl+Shift+R` split into columns · `Ctrl+Shift+B` split into rows ·
-  `Ctrl+Shift+O` cycle focus.
+  `Ctrl+Shift+O` cycle focus. Splits nest — subdivide a pane the other way for columns inside a
+  row (or vice versa), to any depth — and dividers drag to re-proportion.
 - **Also:** command palette (`Ctrl+Shift+P`), live man-page panel (`Ctrl+Shift+M`, which
   shows a **`gh`, `cargo`, `npm`, `docker`, `kubectl`, `helm`, or `aws` command cheat-sheet** when
   the typed command is `gh`/`cargo`/`npm`/`docker`/`kubectl`/`helm`/`aws`),
