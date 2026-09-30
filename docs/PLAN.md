@@ -251,9 +251,14 @@ interactive pass + wider program coverage outstanding.)*
   `cjk_and_emoji_are_double_width`); Xephyr-verified (mixed ASCII/CJK/emoji lines render with no
   dropped glyphs). ⬜ still: scrollback change needs a restart (fresh `Term`); **pixel-exact**
   wide-char grid snapping — a fallback CJK glyph advances a little under two cells, so a long
-  wide-char run still drifts sub-cell and its background/cursor quads don't line up glyph-for-glyph
-  (needs per-cell glyph positioning; a `letter_spacing` pad was tried but the advance measurement
-  proved too fragile).
+  wide-char run still drifts sub-cell and its background/cursor quads don't line up glyph-for-glyph.
+  The clean fix — a per-glyph `letter_spacing` pad of `2·cell_w − advance` — is **blocked by a
+  cosmic-text 0.19 bug**: the fallback shaping path (`shape.rs:545`) adds `letter_spacing` to the
+  glyph's *unscaled* advance, where the main path (`shape.rs:217`) adds it to the *scaled* one, so
+  the pad is mis-scaled by ~the font size for exactly the fallback glyphs (CJK/emoji) that need it
+  (measured 2.857px pad rendered ~6× too wide). The remaining path is per-cell glyph positioning
+  (reserve each wide cell as blanks in the flow, overlay the glyph at its exact column) — a larger
+  render-path change deferred for now; revisit if the upstream `letter_spacing` bug is fixed.
 - ✅ **Tabs** — multi-session: each tab owns its VT state/PTY/image-layer/pump; `App`
   keeps active-session pointers (re-pointed on switch). **Ctrl+Shift+T** new,
   **Ctrl+Shift+W** close (reaps the shell; quits on the last), **Ctrl+Tab** /
