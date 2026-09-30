@@ -3823,7 +3823,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if action == Some(Action::Palette) {
                         self.palette_close();
                     } else {
-                        self.palette_key(&event.logical_key, event.text.as_deref());
+                        self.palette_key(&event.logical_key, event.text.as_deref(), self.modifiers.shift_key());
                     }
                     return;
                 }
@@ -5938,12 +5938,13 @@ impl App {
         self.request_redraw();
     }
 
-    /// Keys while the palette owns input: Esc closes, Enter inserts the selected command
-    /// at the prompt, ↑/↓ move the selection, Backspace/text edit the query.
-    fn palette_key(&mut self, key: &Key, text: Option<&str>) {
+    /// Keys while the palette owns input: Esc closes, Enter inserts the selected command at the
+    /// prompt (Shift+Enter runs it immediately), ↑/↓ move the selection, Backspace/text edit the
+    /// query.
+    fn palette_key(&mut self, key: &Key, text: Option<&str>, shift: bool) {
         match key {
             Key::Named(NamedKey::Escape) => self.palette_close(),
-            Key::Named(NamedKey::Enter) => self.palette_run(),
+            Key::Named(NamedKey::Enter) => self.palette_run(shift),
             Key::Named(NamedKey::ArrowDown) => self.palette_move(true),
             Key::Named(NamedKey::ArrowUp) => self.palette_move(false),
             Key::Named(NamedKey::Backspace) if !self.palette_query.is_empty() => {
@@ -5987,12 +5988,14 @@ impl App {
         self.request_redraw();
     }
 
-    /// Insert the selected command (plus a trailing space) at the prompt, then close.
-    /// Deliberately does not append a newline — the user reviews/adds args and runs it.
-    fn palette_run(&mut self) {
+    /// Put the selected command at the prompt, then close. **Enter** inserts `"<cmd> "` and
+    /// stops so the user can add args; **`run`** (Shift+Enter) appends a newline to execute it
+    /// straight away. Either way the pick is recorded for frecency.
+    fn palette_run(&mut self, run: bool) {
         if let Some(m) = self.palette_filtered.get(self.palette_idx) {
             let name = m.name.clone();
-            self.pty_write(format!("{name} ").as_bytes());
+            let tail = if run { "\n" } else { " " };
+            self.pty_write(format!("{name}{tail}").as_bytes());
             self.scroll(Scroll::Bottom);
             // Record the pick so it ranks higher next time, and persist it.
             self.palette_frecency.bump(&name, now_unix());
