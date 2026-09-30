@@ -233,8 +233,18 @@ interactive pass + wider program coverage outstanding.)*
   premultiplied/postmultiplied alpha mode when the compositor supports one and the frame
   clears at that alpha (default-bg cells transparent, colored cells stay opaque). Needs a
   compositing WM; a change takes effect on restart. `parse_opacity`/`strip_native_keys`
-  unit-tested; verified via `--capture` alpha channel. ⬜ still: fontconfig fallback;
-  scrollback change still needs a restart (fresh `Term`).
+  unit-tested; verified via `--capture` alpha channel. ✅ **font fallback** — glyphs the primary
+  monospace font lacks (CJK, kana, Hangul, emoji, math symbols) now resolve to a system font
+  (Noto CJK / Noto Color Emoji / …) via cosmic-text instead of rendering as tofu. Only
+  `Shaping::Advanced` does per-glyph fallback (and it also applies a coding font's ligatures), so a
+  pane shapes with Advanced when the user enabled ligatures **or** it contains a fallback-prone
+  character (`needs_fallback_shaping` — the wide-script/emoji/math ranges), and stays on `Basic`
+  otherwise, preserving the ligature-off default for ordinary ASCII/Powerline text. (cosmic-text
+  0.19's per-`Attrs` `font_features` — the tidier way to disable ligatures under Advanced — drops
+  glyphs, so the per-pane script check is used instead.) `needs_fallback_shaping` unit-tested;
+  Xephyr-verified (CJK/emoji/`∑` render under the default config, matching a ligatures-on
+  reference). ⬜ still: scrollback change needs a restart (fresh `Term`); double-width layout when
+  many wide chars share a line.
 - ✅ **Tabs** — multi-session: each tab owns its VT state/PTY/image-layer/pump; `App`
   keeps active-session pointers (re-pointed on switch). **Ctrl+Shift+T** new,
   **Ctrl+Shift+W** close (reaps the shell; quits on the last), **Ctrl+Tab** /
