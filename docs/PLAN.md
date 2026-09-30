@@ -243,8 +243,17 @@ interactive pass + wider program coverage outstanding.)*
   0.19's per-`Attrs` `font_features` — the tidier way to disable ligatures under Advanced — drops
   glyphs, so the per-pane script check is used instead.) `needs_fallback_shaping` unit-tested;
   Xephyr-verified (CJK/emoji/`∑` render under the default config, matching a ligatures-on
-  reference). ⬜ still: scrollback change needs a restart (fresh `Term`); double-width layout when
-  many wide chars share a line.
+  reference). ✅ **wide-char rendering** — the snapshot tags each cell's `WIDE_CHAR` /
+  `WIDE_CHAR_SPACER` flag, and the grid text drops the spacer cell (a double-width glyph already
+  covers both columns) instead of emitting it as a blank, which used to drift a wide-char row
+  rightward until later cells fell off the (now `Wrap::None`, one-visual-line) row and vanished.
+  Wide runs now render contiguously and completely. Spacer tagging unit-tested (extends
+  `cjk_and_emoji_are_double_width`); Xephyr-verified (mixed ASCII/CJK/emoji lines render with no
+  dropped glyphs). ⬜ still: scrollback change needs a restart (fresh `Term`); **pixel-exact**
+  wide-char grid snapping — a fallback CJK glyph advances a little under two cells, so a long
+  wide-char run still drifts sub-cell and its background/cursor quads don't line up glyph-for-glyph
+  (needs per-cell glyph positioning; a `letter_spacing` pad was tried but the advance measurement
+  proved too fragile).
 - ✅ **Tabs** — multi-session: each tab owns its VT state/PTY/image-layer/pump; `App`
   keeps active-session pointers (re-pointed on switch). **Ctrl+Shift+T** new,
   **Ctrl+Shift+W** close (reaps the shell; quits on the last), **Ctrl+Tab** /
