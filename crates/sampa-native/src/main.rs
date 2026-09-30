@@ -314,6 +314,28 @@ fn family_of(name: &str) -> Family<'_> {
     }
 }
 
+/// Whether a character is likely to need font fallback — a script the primary monospace font
+/// usually lacks (CJK ideographs, kana, Hangul, fullwidth/CJK punctuation, emoji & pictographs,
+/// and mathematical operators like `∑`). Box-drawing, block elements and the Private Use Area
+/// (Powerline / Nerd-Font glyphs) are deliberately excluded: a coding font normally covers them,
+/// so a plain prompt doesn't get pushed onto the fallback path. Drives the per-pane shaping choice
+/// — only a pane containing such a character needs Advanced shaping (which enables cosmic-text's
+/// per-glyph fallback), so ordinary ASCII/Powerline panes keep the ligature setting intact.
+fn needs_fallback_shaping(c: char) -> bool {
+    matches!(c as u32,
+        0x2200..=0x23FF        // Mathematical Operators, Miscellaneous Technical (∑ ∫ √ …)
+        | 0x2600..=0x27BF      // Miscellaneous Symbols + Dingbats
+        | 0x2B00..=0x2BFF      // Miscellaneous Symbols and Arrows
+        | 0x3000..=0x303F      // CJK Symbols and Punctuation
+        | 0x3040..=0x30FF      // Hiragana + Katakana
+        | 0x3400..=0x9FFF      // CJK Unified Ideographs (+ Extension A)
+        | 0xAC00..=0xD7AF      // Hangul Syllables
+        | 0xF900..=0xFAFF      // CJK Compatibility Ideographs
+        | 0xFF00..=0xFFEF      // Halfwidth and Fullwidth Forms
+        | 0x1F000..=0x1FAFF    // emoji, pictographs, symbols supplements
+    )
+}
+
 /// `--config FILE` override, set once at startup. When present it wins over the XDG path
 /// for every reader (initial load, live-reload watcher, new tabs).
 static CONFIG_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
@@ -10784,7 +10806,6 @@ impl Renderer {
         // Foreground text as per-cell colored rich-text spans.
         let fam = family_of(&self.font_family);
         let base = Attrs::new().family(fam);
-        let shaping = if self.ligatures { Shaping::Advanced } else { Shaping::Basic };
         // One reusable grid buffer per pane (grown lazily), each shaped from its snapshot.
         while self.pane_buffers.len() < panes.len() {
             let b = Buffer::new(&mut self.font_system, Metrics::new(self.grid_font_size, self.line_h));
@@ -10793,9 +10814,16 @@ impl Renderer {
         for (pi, pane) in panes.iter().enumerate() {
             let snap = pane.snap;
             let mut spans: Vec<(String, [u8; 3], bool, bool)> = Vec::new();
+            // Only `Shaping::Advanced` does cosmic-text's per-glyph font fallback (Basic renders a
+            // missing glyph as tofu), but Advanced also applies a coding font's ligatures. So a
+            // pane uses Advanced when the user enabled ligatures, or when it actually contains a
+            // fallback-prone character (CJK / emoji / math) that the primary font likely lacks;
+            // otherwise it stays Basic, keeping the ligature-off default for ordinary text.
+            let mut wants_fallback = false;
             for r in 0..snap.rows {
                 for c in 0..snap.cols {
                     let cell = snap.cell(r, c);
+                    wants_fallback |= needs_fallback_shaping(cell.c);
                     let key = (cell.fg, cell.bold, cell.italic);
                     match spans.last_mut() {
                         Some((s, fg, b, i)) if (*fg, *b, *i) == key => s.push(cell.c),
@@ -10804,11 +10832,14 @@ impl Renderer {
                 }
                 spans.push(("\n".to_string(), DEFAULT_FG, false, false));
             }
+            let shaping = if self.ligatures || wants_fallback { Shaping::Advanced } else { Shaping::Basic };
             let buf = &mut self.pane_buffers[pi];
             buf.set_size(Some(pane.w - 2.0 * PAD), Some(pane.h));
             buf.set_rich_text(
                 spans.iter().map(|(s, fg, bold, italic)| {
-                    let mut a = Attrs::new().family(fam).color(Color::rgb(fg[0], fg[1], fg[2]));
+                    let mut a = Attrs::new()
+                        .family(fam)
+                        .color(Color::rgb(fg[0], fg[1], fg[2]));
                     if *bold {
                         a = a.weight(Weight::BOLD);
                     }
@@ -13288,6 +13319,20 @@ mod tests {
         assert_eq!(scroll_offset(2, 3, false, 10), 0);
         // A body that fits (max 0) never scrolls.
         assert_eq!(scroll_offset(0, 3, true, 0), 0);
+    }
+
+    #[test]
+    fn fallback_shaping_targets_wide_scripts() {
+        // Fallback-prone scripts a monospace font usually lacks → force Advanced shaping.
+        for c in ['你', '好', '世', '界', '日', '本', '語', '한', '국', '어', '∑', '√', '≠', '😀', '🚀', '✅'] {
+            assert!(needs_fallback_shaping(c), "{c:?} should need fallback");
+        }
+        // Ordinary text and glyphs a coding / Nerd font covers stay on the fast path (so the
+        // ligature-off default is preserved for normal prompts): ASCII, box-drawing, block
+        // elements, and Private-Use-Area Powerline glyphs.
+        for c in ['a', 'Z', '0', '=', '>', '!', '-', ' ', '│', '─', '█', '▓', '\u{E0B0}', '\u{F001}'] {
+            assert!(!needs_fallback_shaping(c), "{c:?} should not need fallback");
+        }
     }
 
     #[test]
