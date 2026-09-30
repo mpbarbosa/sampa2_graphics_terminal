@@ -3511,6 +3511,38 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                 }
             },
+            // Key releases are dropped unless the app enabled the kitty "report event types"
+            // level (`CSI > 3 u`) — then each release is reported as an escape (`…:3 u`).
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                let (app_cursor, app_keypad, event_types) = self
+                    .state
+                    .lock()
+                    .map(|g| {
+                        let mode = g.term.mode();
+                        let et = g.kitty_kbd_stack.last().copied().unwrap_or(0) & 0b10 != 0;
+                        (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD), et)
+                    })
+                    .unwrap_or((false, false, false));
+                if event_types {
+                    let m = self.modifiers;
+                    let numpad = event.location == KeyLocation::Numpad;
+                    let bytes = encode_key_kitty(
+                        &event.logical_key,
+                        event.text.as_deref(),
+                        m.shift_key(),
+                        m.alt_key(),
+                        m.control_key(),
+                        m.super_key(),
+                        app_cursor,
+                        app_keypad,
+                        numpad,
+                        3, // release
+                    );
+                    if !bytes.is_empty() {
+                        self.pty_write(&bytes);
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // --hold: the process has exited and the window is frozen; any key closes.
                 if self.held {
@@ -3671,6 +3703,7 @@ impl ApplicationHandler<UserEvent> for App {
                         app_cursor,
                         app_keypad,
                         numpad,
+                        1, // press
                     )
                 } else {
                     encode_key(
@@ -3682,6 +3715,7 @@ impl ApplicationHandler<UserEvent> for App {
                         app_cursor,
                         app_keypad,
                         numpad,
+                        1, // press (legacy path: unchanged)
                     )
                 };
                 if !bytes.is_empty() {
@@ -9033,8 +9067,14 @@ fn encode_key(
     app_cursor: bool,
     app_keypad: bool,
     numpad: bool,
+    event: u8,
 ) -> Vec<u8> {
     let modn: u8 = 1 + shift as u8 + 2 * alt as u8 + 4 * ctrl as u8;
+    // Kitty event-type suffix for the functional-key forms: `:event` on a repeat/release
+    // (event != 1) also forces the full `CSI 1 ; modn …` form. Press (`1`) leaves the legacy
+    // encoding byte-for-byte unchanged.
+    let ev = if event != 1 { format!(":{event}") } else { String::new() };
+    let force = event != 1;
 
     // Application keypad (DECKPAM): a numpad key sends its SS3 code, before any other mapping.
     if app_keypad && numpad {
@@ -9045,8 +9085,8 @@ fn encode_key(
 
     // Cursor keys: CSI form with a modifier, else SS3 under DECCKM, else CSI.
     let cursor = |fin: char| -> Vec<u8> {
-        if modn > 1 {
-            format!("\x1b[1;{modn}{fin}").into_bytes()
+        if modn > 1 || force {
+            format!("\x1b[1;{modn}{ev}{fin}").into_bytes()
         } else if app_cursor {
             format!("\x1bO{fin}").into_bytes()
         } else {
@@ -9055,16 +9095,16 @@ fn encode_key(
     };
     // Editing/function keys using the numeric "~" scheme.
     let tilde = |code: u8| -> Vec<u8> {
-        if modn > 1 {
-            format!("\x1b[{code};{modn}~").into_bytes()
+        if modn > 1 || force {
+            format!("\x1b[{code};{modn}{ev}~").into_bytes()
         } else {
             format!("\x1b[{code}~").into_bytes()
         }
     };
     // F1–F4: SS3 form, or CSI with a modifier.
     let ss3 = |fin: char| -> Vec<u8> {
-        if modn > 1 {
-            format!("\x1b[1;{modn}{fin}").into_bytes()
+        if modn > 1 || force {
+            format!("\x1b[1;{modn}{ev}{fin}").into_bytes()
         } else {
             format!("\x1bO{fin}").into_bytes()
         }
@@ -9147,6 +9187,12 @@ fn kitty_mods(shift: bool, alt: bool, ctrl: bool, superk: bool) -> u32 {
 /// whose legacy `CSI …` forms already carry the modifier) — defers to [`encode_key`], which is
 /// already conformant. Higher levels (event types, report-all-as-esc, associated text) are not
 /// implemented; a client that requests them still gets correct press events.
+///
+/// `event` is the kitty event type: `1` press (the default) or `3` release. On **release**
+/// (event-types level, `CSI > 3 u`) there is no text, so *every* key is reported in its escape
+/// form with the `:3` sub-parameter — a plain text key becomes `CSI <code>;<mods>:3 u`, a
+/// functional key its legacy form with `:3` (via `encode_key`). Key **repeat** is not yet a
+/// distinct event; it is reported as a press.
 #[allow(clippy::too_many_arguments)]
 fn encode_key_kitty(
     key: &Key,
@@ -9158,24 +9204,31 @@ fn encode_key_kitty(
     app_cursor: bool,
     app_keypad: bool,
     numpad: bool,
+    event: u8,
 ) -> Vec<u8> {
     let mods = kitty_mods(shift, alt, ctrl, superk);
+    // `CSI <code> [; <mods>[:event]] u`; the event sub-parameter forces the modifier field.
     let csi_u = |cp: u32| -> Vec<u8> {
-        if mods > 1 {
+        if event != 1 {
+            format!("\x1b[{cp};{mods}:{event}u").into_bytes()
+        } else if mods > 1 {
             format!("\x1b[{cp};{mods}u").into_bytes()
         } else {
             format!("\x1b[{cp}u").into_bytes()
         }
     };
-    let legacy = || encode_key(key, text, shift, alt, ctrl, app_cursor, app_keypad, numpad);
+    let legacy = || encode_key(key, text, shift, alt, ctrl, app_cursor, app_keypad, numpad, event);
+    // A release reports every key (there is no text); a press keeps the disambiguate rules
+    // (plain typing stays text, only the ambiguous keys become CSI u).
+    let release = event == 3;
     let modified = mods > 1;
     match key {
         Key::Named(NamedKey::Escape) => csi_u(27),
-        Key::Named(NamedKey::Enter) if modified => csi_u(13),
-        Key::Named(NamedKey::Tab) if modified => csi_u(9),
-        Key::Named(NamedKey::Backspace) if modified => csi_u(127),
-        Key::Named(NamedKey::Space) if ctrl || alt || superk => csi_u(32),
-        Key::Character(s) if ctrl || alt || superk => match s.chars().next() {
+        Key::Named(NamedKey::Enter) if modified || release => csi_u(13),
+        Key::Named(NamedKey::Tab) if modified || release => csi_u(9),
+        Key::Named(NamedKey::Backspace) if modified || release => csi_u(127),
+        Key::Named(NamedKey::Space) if ctrl || alt || superk || release => csi_u(32),
+        Key::Character(s) if ctrl || alt || superk || release => match s.chars().next() {
             // Base-layout codepoint: the logical char, ASCII-lowercased (Shift lives in `mods`).
             Some(c) => csi_u(u32::from(c.to_ascii_lowercase())),
             None => legacy(),
@@ -12616,10 +12669,10 @@ mod tests {
 
     // --- keyboard encoding (§8.1) ---
     fn named(n: NamedKey, shift: bool, alt: bool, ctrl: bool, app: bool) -> Vec<u8> {
-        encode_key(&Key::Named(n), None, shift, alt, ctrl, app, false, false)
+        encode_key(&Key::Named(n), None, shift, alt, ctrl, app, false, false, 1)
     }
     fn chr(s: &str, shift: bool, alt: bool, ctrl: bool) -> Vec<u8> {
-        encode_key(&Key::Character(s.into()), None, shift, alt, ctrl, false, false, false)
+        encode_key(&Key::Character(s.into()), None, shift, alt, ctrl, false, false, false, 1)
     }
 
     #[test]
@@ -12632,8 +12685,8 @@ mod tests {
     #[test]
     fn kitty_keyboard_disambiguate_encoding() {
         // (shift, alt, ctrl, super) → the kitty CSI u bytes.
-        let kc = |s: &str, sh, al, ct, su| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, su, false, false, false);
-        let kn = |n, sh, al, ct, su| encode_key_kitty(&Key::Named(n), None, sh, al, ct, su, false, false, false);
+        let kc = |s: &str, sh, al, ct, su| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, su, false, false, false, 1);
+        let kn = |n, sh, al, ct, su| encode_key_kitty(&Key::Named(n), None, sh, al, ct, su, false, false, false, 1);
 
         // Esc is always disambiguated (bare ESC is ambiguous), unmodified → `CSI 27 u`.
         assert_eq!(kn(NamedKey::Escape, false, false, false, false), b"\x1b[27u");
@@ -12660,6 +12713,28 @@ mod tests {
         // Functional keys defer to the legacy CSI forms (which already carry the modifier).
         assert_eq!(kn(NamedKey::ArrowUp, false, false, false, false), b"\x1b[A");
         assert_eq!(kn(NamedKey::ArrowUp, false, false, true, false), b"\x1b[1;5A");
+    }
+
+    #[test]
+    fn kitty_keyboard_event_types_releases() {
+        // event = 3 is a key release (the "report event types" level). There is no text on a
+        // release, so *every* key is an escape carrying the `:3` sub-parameter.
+        let rc = |s: &str, sh, al, ct| encode_key_kitty(&Key::Character(s.into()), Some(s), sh, al, ct, false, false, false, false, 3);
+        let rn = |n, sh, al, ct| encode_key_kitty(&Key::Named(n), None, sh, al, ct, false, false, false, false, 3);
+
+        // A plain text key that PRESSED sends "a" now reports its release as CSI u (mods 1 :3).
+        assert_eq!(rc("a", false, false, false), b"\x1b[97;1:3u");
+        assert_eq!(rc("A", true, false, false), b"\x1b[97;2:3u"); // Shift release (mods 2)
+        assert_eq!(rc("c", false, false, true), b"\x1b[99;5:3u"); // Ctrl+C release
+        // The special keys carry the event too, even unmodified.
+        assert_eq!(rn(NamedKey::Escape, false, false, false), b"\x1b[27;1:3u");
+        assert_eq!(rn(NamedKey::Enter, false, false, false), b"\x1b[13;1:3u");
+        assert_eq!(rn(NamedKey::Space, false, false, false), b"\x1b[32;1:3u");
+        // Functional keys report the release in their legacy form with the event sub-parameter.
+        assert_eq!(rn(NamedKey::ArrowUp, false, false, false), b"\x1b[1;1:3A");
+        assert_eq!(rn(NamedKey::ArrowUp, false, false, true), b"\x1b[1;5:3A");
+        assert_eq!(rn(NamedKey::Delete, false, false, false), b"\x1b[3;1:3~");
+        assert_eq!(rn(NamedKey::F5, false, false, false), b"\x1b[15;1:3~");
     }
 
     #[test]
@@ -12733,7 +12808,7 @@ mod tests {
     #[test]
     fn app_keypad_encodes_numpad_ss3() {
         // In DECKPAM mode a numpad key sends its SS3 code (digits, operators, keypad Enter).
-        let kp = |k: Key| encode_key(&k, None, false, false, false, false, true, true);
+        let kp = |k: Key| encode_key(&k, None, false, false, false, false, true, true, 1);
         assert_eq!(kp(Key::Character("0".into())), b"\x1bOp");
         assert_eq!(kp(Key::Character("1".into())), b"\x1bOq");
         assert_eq!(kp(Key::Character("9".into())), b"\x1bOy");
@@ -12743,12 +12818,12 @@ mod tests {
         assert_eq!(kp(Key::Named(NamedKey::Enter)), b"\x1bOM");
         // Not in keypad mode → a numpad digit is just the digit (falls through to the char path).
         assert_eq!(
-            encode_key(&Key::Character("1".into()), Some("1"), false, false, false, false, false, true),
+            encode_key(&Key::Character("1".into()), Some("1"), false, false, false, false, false, true, 1),
             b"1",
         );
         // Keypad mode on but the key is NOT from the numpad → unaffected (main-row `1`).
         assert_eq!(
-            encode_key(&Key::Character("1".into()), Some("1"), false, false, false, false, true, false),
+            encode_key(&Key::Character("1".into()), Some("1"), false, false, false, false, true, false, 1),
             b"1",
         );
     }
