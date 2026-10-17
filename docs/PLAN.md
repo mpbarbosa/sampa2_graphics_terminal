@@ -170,7 +170,18 @@ engine is now ours to prove.
   gates it; trailing newlines and single lines paste straight through; a bracketed-paste-aware
   program is trusted and never prompted). Enter/`y` pastes, Esc/`n` discards.
   `paste_needs_confirm`/`paste_preview` unit-tested; Xephyr-verified (modal → cancel runs
-  nothing, confirm sends the lines, single-line bypasses it). ✅ **block (rectangular)
+  nothing, confirm sends the lines, single-line bypasses it).
+  ✅ **paste failures are visible** — a clipboard read that fails used to be dropped with
+  `.ok()`, so a broken backend and an empty clipboard were both an invisible no-op (the
+  shape of the Wayland `arboard` bug fixed in #158). The read now reports which of the
+  three it was (`ClipRead::{Text,Empty,Unavailable,Failed}`) and a **transient toast** —
+  a one-line box in the bottom-right of the grid band that expires on its own, no key to
+  dismiss it — says so: a quiet note for an empty clipboard, the warn color and a longer
+  dwell for a real failure. It is a general facility (`App::show_toast`), not paste-only,
+  for any action that fails without a visible trace. `clip_read_toast`/`first_line`/
+  `toast_rect`/`Toast::visible_at` unit-tested; rendering checked with
+  `--capture` + `SAMPA_CAPTURE_TOAST` (live keystrokes aren't testable on the dev host —
+  its Wayland compositor accepts no synthetic input). ✅ **block (rectangular)
   selection** — **Alt-drag** starts a `SelectionType::Block` (Ctrl is taken by link-open), so
   the highlight and the copied text are the column rectangle, not the reading-order run; the
   render (`in_selection` block membership) and copy (`selection_to_string`) were already

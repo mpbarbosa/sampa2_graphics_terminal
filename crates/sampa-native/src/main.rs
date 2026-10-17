@@ -97,6 +97,12 @@ const PALETTE_MAX: usize = 60;
 const MAN_VISIBLE: usize = 18;
 /// How long the visual bell border flashes.
 const BELL_FLASH: std::time::Duration = std::time::Duration::from_millis(120);
+/// How long a transient toast stays up, by severity: a quiet note goes away quickly, an
+/// error lingers long enough to read without covering the grid for long.
+const TOAST_NOTE: std::time::Duration = std::time::Duration::from_millis(1800);
+const TOAST_ERROR: std::time::Duration = std::time::Duration::from_secs(4);
+/// The accent an error toast wears (the same warn red the AI overlay uses).
+const TOAST_WARN: [u8; 3] = [0xe0, 0x6c, 0x75];
 /// Preview panel: max body lines shown, and the debounce before a settled line runs.
 const PREVIEW_VISIBLE: usize = 12;
 const PREVIEW_DEBOUNCE_MS: u64 = 550;
@@ -851,6 +857,101 @@ fn group_name(g: Group) -> &'static str {
 struct AiCard<'a> {
     title: &'a str,
     body_spans: &'a [BodySpan],
+}
+
+/// How loud a transient toast is. `Note` is a quiet "nothing happened, and that's fine"
+/// (empty clipboard); `Error` is "the action failed" and gets the warning color and a
+/// longer dwell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToastLevel {
+    Note,
+    Error,
+}
+
+impl ToastLevel {
+    /// How long a toast of this level stays on screen.
+    fn dwell(self) -> std::time::Duration {
+        match self {
+            ToastLevel::Note => TOAST_NOTE,
+            ToastLevel::Error => TOAST_ERROR,
+        }
+    }
+}
+
+/// A transient, non-blocking message in the bottom-right corner: one line, no key to
+/// dismiss it, gone on its own after [`ToastLevel::dwell`]. The lightweight counterpart
+/// to the modal overlays (OSC-52 consent, link confirm, paste confirm) — use it for
+/// anything the user should notice but need not answer. Only one is live at a time; a
+/// newer toast replaces an older one.
+struct Toast {
+    text: String,
+    level: ToastLevel,
+    until: std::time::Instant,
+}
+
+impl Toast {
+    /// Whether this toast should still be drawn at `now`.
+    fn visible_at(&self, now: std::time::Instant) -> bool {
+        now < self.until
+    }
+}
+
+/// A live toast handed to the renderer for one frame.
+struct ToastView<'a> {
+    text: &'a str,
+    level: ToastLevel,
+}
+
+/// What a clipboard read gave us. Separating "no clipboard at all" from "the backend
+/// errored" from "there was nothing there" is the whole point: before this, all three
+/// were the same silent no-op (see the Wayland `arboard` backend bug, PR #158).
+enum ClipRead {
+    Text(String),
+    /// The read succeeded but there was nothing to paste.
+    Empty,
+    /// No clipboard handle at all — `Clipboard::new()` failed at startup.
+    Unavailable,
+    /// The backend returned an error; the string is its message.
+    Failed(String),
+}
+
+/// The toast a clipboard read deserves, or `None` when there is text to paste. An empty
+/// clipboard is the user's own doing, so it gets a quiet note; the other two are real
+/// failures the user cannot otherwise see.
+fn clip_read_toast(read: &ClipRead) -> Option<(ToastLevel, String)> {
+    match read {
+        ClipRead::Text(_) => None,
+        ClipRead::Empty => Some((ToastLevel::Note, "Clipboard is empty".to_string())),
+        ClipRead::Unavailable => {
+            Some((ToastLevel::Error, "Clipboard unavailable — no backend for this session".to_string()))
+        }
+        ClipRead::Failed(e) => Some((ToastLevel::Error, format!("Clipboard read failed: {}", first_line(e)))),
+    }
+}
+
+/// The pixel rect `[x, y, w, h]` of the toast box: bottom-right of the grid band, floating
+/// over it (it reserves no rows, so nothing reflows when it appears or goes). Clamped to
+/// the window, and to the band's top when the window is too short to hold it below.
+fn toast_rect(cells: usize, cell_w: f32, line_h: f32, win_w: f32, grid_top: f32, grid_bottom: f32) -> [f32; 4] {
+    const MARGIN: f32 = 12.0;
+    const INNER: f32 = 10.0;
+    let bh = line_h + 8.0;
+    let bw = (cells as f32 * cell_w + 2.0 * INNER).min((win_w - 2.0 * MARGIN).max(1.0));
+    let x = (win_w - bw - MARGIN).max(MARGIN);
+    let y = (grid_bottom - bh - MARGIN).max(grid_top + 2.0);
+    [x, y, bw, bh]
+}
+
+/// The first line of `s`, trimmed and capped — backend errors can be long and multi-line,
+/// and the toast is one line in the corner.
+fn first_line(s: &str) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    if line.chars().count() > 80 {
+        let cut: String = line.chars().take(79).collect();
+        format!("{cut}…")
+    } else {
+        line.to_string()
+    }
 }
 
 /// How OSC-52 clipboard **writes** are handled (spec §13 / N5 escape hardening). Default is
@@ -2958,6 +3059,7 @@ fn main() -> Result<()> {
         preedit: String::new(),
         preedit_cursor: None,
         bell_until: None,
+        toast: None,
         search_on: false,
         search_query: String::new(),
         search_matches: Vec::new(),
@@ -3466,6 +3568,8 @@ struct App {
     preedit_cursor: Option<(usize, usize)>,
     /// When set and still in the future, the visual bell border is flashing.
     bell_until: Option<std::time::Instant>,
+    /// The live transient message in the bottom-right corner, if any (see [`Toast`]).
+    toast: Option<Toast>,
     // search overlay
     search_on: bool,
     search_query: String,
@@ -5344,33 +5448,72 @@ impl App {
         let _ = text;
     }
 
+    /// Read the CLIPBOARD, keeping the three failure modes apart (see [`ClipRead`]) instead
+    /// of flattening them into one `Option`.
+    fn read_clipboard(&mut self) -> ClipRead {
+        let Some(clip) = self.clipboard.as_mut() else {
+            return ClipRead::Unavailable;
+        };
+        match clip.get_text() {
+            Ok(t) if t.is_empty() => ClipRead::Empty,
+            Ok(t) => ClipRead::Text(t),
+            Err(e) => ClipRead::Failed(e.to_string()),
+        }
+    }
+
     /// Read the PRIMARY selection (middle-click paste), falling back to the CLIPBOARD when
-    /// PRIMARY is empty or unavailable (e.g. non-Linux, or nothing selected anywhere).
-    fn get_primary(&mut self) -> Option<String> {
+    /// PRIMARY is empty or unavailable (e.g. non-Linux, or nothing selected anywhere). The
+    /// reported failure is the CLIPBOARD's, since that is the one that had the last word.
+    fn read_primary(&mut self) -> ClipRead {
         #[cfg(target_os = "linux")]
         if let Some(clip) = self.clipboard.as_mut() {
             use arboard::{GetExtLinux, LinuxClipboardKind};
             if let Ok(t) = clip.get().clipboard(LinuxClipboardKind::Primary).text() {
                 if !t.is_empty() {
-                    return Some(t);
+                    return ClipRead::Text(t);
                 }
             }
         }
-        self.clipboard.as_mut().and_then(|c| c.get_text().ok())
+        self.read_clipboard()
     }
 
     /// Paste from the CLIPBOARD (Ctrl+Shift+V).
     fn paste_clipboard(&mut self) {
-        if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
-            self.paste_text(text);
-        }
+        let read = self.read_clipboard();
+        self.paste_read(read);
     }
 
     /// Paste from the PRIMARY selection (middle-click) — the X11 select-to-paste convention.
     fn paste_primary(&mut self) {
-        if let Some(text) = self.get_primary() {
-            self.paste_text(text);
+        let read = self.read_primary();
+        self.paste_read(read);
+    }
+
+    /// Either paste the text, or say why there was none. Without this the two failure
+    /// modes are indistinguishable from a working paste of nothing (PR #158).
+    fn paste_read(&mut self, read: ClipRead) {
+        match read {
+            ClipRead::Text(text) => self.paste_text(text),
+            other => {
+                if let Some((level, msg)) = clip_read_toast(&other) {
+                    self.show_toast(level, msg);
+                }
+            }
         }
+    }
+
+    /// Raise a transient corner message, replacing any live one. Nothing blocks and no key
+    /// dismisses it: it expires on its own, and a timer thread nudges the loop awake then
+    /// so the final frame (without it) actually gets drawn under `ControlFlow::Wait`.
+    fn show_toast(&mut self, level: ToastLevel, text: impl Into<String>) {
+        let dwell = level.dwell();
+        self.toast = Some(Toast { text: text.into(), level, until: std::time::Instant::now() + dwell });
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(dwell + std::time::Duration::from_millis(30));
+            let _ = proxy.send_event(UserEvent::Redraw);
+        });
+        self.request_redraw();
     }
 
     /// Common paste path: strip the injection marker, then either send or (for a risky
@@ -9106,6 +9249,14 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         // Visual bell: flash a border while `bell_until` is in the future, re-drawing
         // until it lapses (then one final frame clears it).
         let bell = self.bell_until.is_some_and(|t| std::time::Instant::now() < t);
+        // Transient corner message (failed/empty paste, and whatever else wants one later):
+        // drawn only while it is live, dropped below once it lapses.
+        let now = std::time::Instant::now();
+        let toast = self
+            .toast
+            .as_ref()
+            .filter(|t| t.visible_at(now))
+            .map(|t| ToastView { text: &t.text, level: t.level });
         // Lay the panes out from the split tree: each leaf gets an absolute pixel rect (single
         // pane → the whole grid region). The rects are parallel to `pane_snaps` (both in leaf
         // traversal order). Dividers are the strips between siblings, drawn as thin rules.
@@ -9141,7 +9292,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let pending = self.pending_analyze.take();
         let mut captured_png: Option<Vec<u8>> = None;
         if let Some(gfx) = &mut self.gfx {
-            gfx.render(&pane_views, &divider_rects, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), ai.as_ref(), du.as_ref(), preedit, bell);
+            gfx.render(&pane_views, &divider_rects, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), ai.as_ref(), du.as_ref(), preedit, bell, toast.as_ref());
             if pending.is_some() {
                 captured_png = gfx.paint_to_png(&pane_views, &divider_rects, &tabs, active, search.as_deref(), palette.as_ref(), panel.as_ref(), help.as_deref(), du.as_ref(), preedit, bell);
             }
@@ -9157,6 +9308,10 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         }
         if bell {
             self.request_redraw();
+        }
+        // Drop a lapsed toast once its last frame is behind us (this frame already left it out).
+        if self.toast.as_ref().is_some_and(|t| !t.visible_at(now)) {
+            self.toast = None;
         }
         self.update_a11y();
     }
@@ -9910,6 +10065,7 @@ struct Renderer {
     buffer: Buffer,
     tab_buffers: Vec<Buffer>,     // one per tab-bar label, grown lazily
     search_buffer: Buffer,        // the search-bar text
+    toast_buffer: Buffer,         // the transient corner message
     palette_buffers: Vec<Buffer>, // [0] = query line, [1..] = result rows
     panel_title_buffer: Buffer, // bottom-panel header (man/preview)
     panel_body_buffer: Buffer,  // bottom-panel body (multi-line)
@@ -9966,6 +10122,7 @@ impl Renderer {
         let cell_w = measure_cell_w(&mut font_system, font_size, line_h, &font_family);
         let buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let search_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
+        let toast_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let panel_title_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let panel_body_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
         let help_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_h));
@@ -10129,6 +10286,7 @@ impl Renderer {
             buffer,
             tab_buffers: Vec::new(),
             search_buffer,
+            toast_buffer,
             palette_buffers: Vec::new(),
             panel_title_buffer,
             panel_body_buffer,
@@ -10252,6 +10410,7 @@ impl Renderer {
         self.cell_w = measure_cell_w(&mut self.font_system, font_size, self.line_h, &self.font_family);
         self.buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.search_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
+        self.toast_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.panel_title_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.panel_body_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
         self.help_buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, self.line_h));
@@ -10519,7 +10678,7 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, panes: &[PaneRender], dividers: &[[f32; 4]], view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
+    fn paint(&mut self, panes: &[PaneRender], dividers: &[[f32; 4]], view: &wgpu::TextureView, w: u32, h: u32, tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool, toast: Option<&ToastView>) {
         // The grid starts below the tab bar when it's shown (more than one tab); the
         // search bar and the bottom panel (man page / command preview) each overlay a
         // strip/panel at the bottom.
@@ -10793,6 +10952,24 @@ impl Renderer {
                 color: self.color4(self.theme.fg),
             });
         }
+        // Transient toast: a small opaque box in the bottom-right of the grid band with a
+        // level-colored rule down its left edge. Floating — it covers grid cells rather
+        // than reserving rows, so nothing reflows when it comes and goes.
+        let toast_box = toast.map(|t| {
+            let cells = t.text.chars().count();
+            toast_rect(cells, self.cell_w, self.line_h, w as f32, top, grid_bottom)
+        });
+        if let (Some(t), Some([bx, by, bw, bh])) = (toast, toast_box) {
+            let accent = match t.level {
+                ToastLevel::Note => blend(self.theme.bg, self.theme.fg, 0.55),
+                ToastLevel::Error => TOAST_WARN,
+            };
+            bg_quads.push(QuadInstance {
+                rect: [bx, by, bw, bh],
+                color: self.color4(blend(self.theme.bg, self.theme.fg, 0.16)),
+            });
+            deco_quads.push(QuadInstance { rect: [bx, by, 2.0, bh], color: self.color4(accent) });
+        }
         // Visual bell: a bright border frame over everything (drawn in the deco pass).
         if bell {
             let (wf, hf, t) = (w as f32, h as f32, 3.0);
@@ -10880,6 +11057,18 @@ impl Renderer {
             self.search_buffer.set_size(Some((w as f32 - 2.0 * PAD).max(1.0)), Some(SEARCH_H));
             self.search_buffer.set_rich_text([(text, attrs)], &Attrs::new(), Shaping::Advanced, None);
             self.search_buffer.shape_until_scroll(&mut self.font_system, false);
+        }
+        if let (Some(t), Some([_, _, bw, _])) = (toast, toast_box) {
+            let col = match t.level {
+                ToastLevel::Note => blend(self.theme.bg, self.theme.fg, 0.75),
+                ToastLevel::Error => TOAST_WARN,
+            };
+            let attrs = Attrs::new()
+                .family(family_of(&self.font_family))
+                .color(Color::rgb(col[0], col[1], col[2]));
+            self.toast_buffer.set_size(Some((bw - 18.0).max(1.0)), Some(self.line_h));
+            self.toast_buffer.set_rich_text([(t.text, attrs)], &Attrs::new(), Shaping::Advanced, None);
+            self.toast_buffer.shape_until_scroll(&mut self.font_system, false);
         }
         if let Some(pv) = panel {
             let fam = family_of(&self.font_family);
@@ -11188,6 +11377,26 @@ impl Renderer {
                 });
             }
         }
+        if let (Some(t), Some([bx, by, bw, bh])) = (toast, toast_box) {
+            let col = match t.level {
+                ToastLevel::Note => blend(self.theme.bg, self.theme.fg, 0.75),
+                ToastLevel::Error => TOAST_WARN,
+            };
+            text_areas.push(TextArea {
+                buffer: &self.toast_buffer,
+                left: bx + 10.0,
+                top: by + ((bh - self.line_h) / 2.0).max(0.0),
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: bx as i32,
+                    top: by as i32,
+                    right: (bx + bw) as i32,
+                    bottom: (by + bh) as i32,
+                },
+                default_color: Color::rgb(col[0], col[1], col[2]),
+                custom_glyphs: &[],
+            });
+        }
         if let Err(e) = self.text_renderer.prepare(
             &self.device,
             &self.queue,
@@ -11383,7 +11592,7 @@ impl Gfx {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, panes: &[PaneRender], dividers: &[[f32; 4]], tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool) {
+    fn render(&mut self, panes: &[PaneRender], dividers: &[[f32; 4]], tabs: &[String], active: usize, search: Option<&str>, palette: Option<&PaletteView>, panel: Option<&PanelView>, help: Option<&[(String, String)]>, ai: Option<&AiCard>, du: Option<&DuView>, preedit: Option<(&str, usize, usize, usize)>, bell: bool, toast: Option<&ToastView>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -11407,6 +11616,7 @@ impl Gfx {
             du,
             preedit,
             bell,
+            toast,
         );
         self.r.queue.present(frame);
     }
@@ -11447,7 +11657,7 @@ impl Gfx {
         // Paint the terminal as-is (no AI card — it's showing "Analyzing…").
         self.r.paint(
             panes, dividers, &view, w, h, tabs, active, search, palette, panel, help, None, du, preedit,
-            bell,
+            bell, None,
         );
 
         let bpr = (w * 4).div_ceil(256) * 256; // 256-byte row alignment
@@ -11685,6 +11895,11 @@ fn capture(path: &str) -> Result<()> {
         man_body = demo_man[1..].join("\n");
         Some(PanelView { title: &man_title, body: &man_body, body_spans: None })
     };
+    // `SAMPA_CAPTURE_TOAST=<text>` draws an error toast, for the screenshot harness.
+    let demo_toast_text = std::env::var("SAMPA_CAPTURE_TOAST").ok();
+    let demo_toast = demo_toast_text
+        .as_deref()
+        .map(|text| ToastView { text, level: ToastLevel::Error });
     r.paint(
         &[PaneRender { snap: &snap, x: 0.0, y: top_offset(1), w: w as f32, h: h as f32, focused: true, hovered_link: None }],
         &[],
@@ -11704,6 +11919,7 @@ fn capture(path: &str) -> Result<()> {
             .as_deref()
             .map(|t| (t, 6usize, 8usize, t.chars().count().min(2))),
         std::env::var("SAMPA_CAPTURE_BELL").is_ok(),
+        demo_toast.as_ref(),
     );
 
     let bpr = (w * 4).div_ceil(256) * 256; // 256-byte row alignment
@@ -13683,6 +13899,68 @@ mod tests {
         assert!(p.starts_with("a x\nb")); // tab → space, first two lines
         assert!(p.contains("+2 more lines"));
         assert_eq!(paste_preview("one\ntwo\nthree").1, "one\ntwo\n… (+1 more line)");
+    }
+
+    #[test]
+    fn clip_read_toast_separates_the_three_silent_cases() {
+        // Text pastes — no message at all; that is the unchanged success path.
+        assert!(clip_read_toast(&ClipRead::Text("hi".into())).is_none());
+        // An empty clipboard is the user's own doing: a quiet note, not an error.
+        let (level, msg) = clip_read_toast(&ClipRead::Empty).expect("empty deserves a note");
+        assert_eq!(level, ToastLevel::Note);
+        assert_eq!(msg, "Clipboard is empty");
+        // No backend at all (the PR #158 Wayland shape) → visible error.
+        let (level, msg) = clip_read_toast(&ClipRead::Unavailable).expect("unavailable deserves an error");
+        assert_eq!(level, ToastLevel::Error);
+        assert!(msg.contains("unavailable"), "got {msg:?}");
+        // A backend error carries its own message, on one line.
+        let (level, msg) = clip_read_toast(&ClipRead::Failed("X11 not available\nbacktrace…".into()))
+            .expect("a read error deserves an error");
+        assert_eq!(level, ToastLevel::Error);
+        assert_eq!(msg, "Clipboard read failed: X11 not available");
+    }
+
+    #[test]
+    fn first_line_trims_and_caps() {
+        assert_eq!(first_line("  one  \ntwo"), "one");
+        assert_eq!(first_line(""), "");
+        let long = first_line(&"z".repeat(200));
+        assert_eq!(long.chars().count(), 80); // 79 + the ellipsis
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn toast_dwell_is_longer_for_errors() {
+        assert_eq!(ToastLevel::Note.dwell(), TOAST_NOTE);
+        assert_eq!(ToastLevel::Error.dwell(), TOAST_ERROR);
+        assert!(ToastLevel::Error.dwell() > ToastLevel::Note.dwell());
+    }
+
+    #[test]
+    fn toast_expires_at_its_deadline() {
+        let now = std::time::Instant::now();
+        let t = Toast { text: "x".into(), level: ToastLevel::Note, until: now + TOAST_NOTE };
+        assert!(t.visible_at(now));
+        assert!(t.visible_at(now + TOAST_NOTE - std::time::Duration::from_millis(1)));
+        // The deadline itself is already gone — the frame at `until` draws nothing.
+        assert!(!t.visible_at(now + TOAST_NOTE));
+        assert!(!t.visible_at(now + TOAST_NOTE + std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn toast_rect_sits_bottom_right_inside_the_band() {
+        // 10 cells × 8px + 20px padding = 100 wide; 16 + 8 = 24 tall.
+        let [x, y, w, h] = toast_rect(10, 8.0, 16.0, 800.0, 40.0, 600.0);
+        assert_eq!([w, h], [100.0, 24.0]);
+        assert_eq!(x, 800.0 - 100.0 - 12.0); // right-aligned with a 12px margin
+        assert_eq!(y, 600.0 - 24.0 - 12.0); // sits above the bottom of the grid band
+        // A long message is capped to the window rather than overflowing it.
+        let [x, _, w, _] = toast_rect(400, 8.0, 16.0, 800.0, 40.0, 600.0);
+        assert_eq!(w, 776.0);
+        assert_eq!(x, 12.0);
+        // A band too short to hold the box clamps to its top instead of going negative.
+        let [_, y, _, _] = toast_rect(10, 8.0, 16.0, 800.0, 40.0, 50.0);
+        assert_eq!(y, 42.0);
     }
 
     #[test]
