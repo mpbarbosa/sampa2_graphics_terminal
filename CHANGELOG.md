@@ -5,6 +5,33 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.14.0] - 2026-10-17
+
+**CJK, emoji and symbols finally render properly.** The native build gained real **font
+fallback** — a glyph the primary font lacks is now drawn from a system face instead of a
+tofu box — and **wide characters no longer leave a stray spacer cell**, so a CJK or emoji
+run sits on the grid at its true two-cell width. The second theme is **clipboard
+reliability**: **Ctrl+Shift+V works under Wayland** at last (`arboard` was being built with
+the X11 backend alone), and a paste that finds nothing to paste — no clipboard backend, a
+backend error, or simply an empty clipboard — now says which it was in a **transient
+toast** instead of doing nothing at all. Also here: the **command palette can run a command
+immediately** rather than only inserting it at the prompt.
+
+### Features
+
+- Font fallback for CJK / emoji / symbols — N5
+- Wide-char (CJK/emoji) rendering — drop the spacer cell — N6
+- Transient toast for a failed or empty paste (§13 paste safety)
+- Command-palette run-immediately affordance — N4
+
+### Bug Fixes
+
+- Ctrl+Shift+V paste under Wayland — build `arboard` with `wayland-data-control`
+
+### Testing
+
+- Fix the weechat app-matrix case; full-matrix smoke pass recorded — N6
+
 ## [0.13.0] - 2026-09-30
 
 Two themes headline this release. **Nested split layouts** — the panes are now a recursive
