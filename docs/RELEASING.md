@@ -47,8 +47,9 @@ The crate is also marked `publish = false`: git dependencies can't be published 
    git add CHANGELOG.md Cargo.lock crates/sampa-native/Cargo.toml
    git commit -m "chore(release): X.Y.Z"
    ```
-   (The pushed tag's **GitHub Release notes** are still generated fresh by git-cliff in CI, so the
-   curation is only for the committed `CHANGELOG.md`.)
+   (This curated section *is* the **GitHub Release notes**: the workflow pulls the `## [X.Y.Z]`
+   section out of the committed `CHANGELOG.md` at the tagged commit, so get it right before
+   you tag.)
 
 4. **Tag the merge commit and push the tag:**
    ```bash
@@ -57,7 +58,11 @@ The crate is also marked `publish = false`: git dependencies can't be published 
    ```
 
 Pushing the `vX.Y.Z` tag triggers [`.github/workflows/release.yml`](../.github/workflows/release.yml),
-which regenerates that tag's notes with git-cliff and publishes a **GitHub Release**.
+which publishes a **GitHub Release** whose body is the `## [X.Y.Z]` section of `CHANGELOG.md`
+as committed at the tagged commit — the curated text, verbatim. If that section is missing or
+empty (a tag pushed before the changelog entry was merged), the workflow logs a warning and
+falls back to git-cliff's raw commit list rather than publishing an empty body; fix it by
+merging the entry and re-running the workflow, or with `gh release edit vX.Y.Z --notes-file`.
 
 ## Install git-cliff
 

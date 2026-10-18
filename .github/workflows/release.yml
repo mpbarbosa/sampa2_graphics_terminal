@@ -1,9 +1,12 @@
 name: Release
 
-# Cut a GitHub Release whenever a version tag is pushed. git-cliff turns the tag's
-# Conventional Commits into release notes — it reads only git history, so this works
-# despite the crate's path deps to the sibling sampa_graphics_terminal repo (which a
-# cargo-based tool like release-plz could not resolve in CI). See docs/RELEASING.md.
+# Cut a GitHub Release whenever a version tag is pushed. The release body is the
+# hand-curated `## [X.Y.Z]` section of CHANGELOG.md, which docs/RELEASING.md has
+# already merged to main by the time the tag is pushed. git-cliff stays only as a
+# fallback for a tag pushed ahead of its changelog entry — it reads only git
+# history, so it works despite the crate's path deps to the sibling
+# sampa_graphics_terminal repo (which a cargo-based tool like release-plz could not
+# resolve in CI). See docs/RELEASING.md.
 
 on:
   push:
@@ -21,7 +24,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Generate release notes for this tag
+      # Fallback body only: overwritten below when CHANGELOG.md has this tag's section.
+      - name: Generate fallback release notes with git-cliff
         uses: orhun/git-cliff-action@v4
         id: cliff
         with:
@@ -29,6 +33,27 @@ jobs:
           args: --latest --strip header
         env:
           OUTPUT: RELEASE_NOTES.md
+
+      - name: Prefer the curated CHANGELOG.md section
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v hdr="## [$version]" '
+            index($0, hdr) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > CHANGELOG_SECTION.md
+          if grep -q '[^[:space:]]' CHANGELOG_SECTION.md; then
+            printf '%s\n' "$(cat CHANGELOG_SECTION.md)" > RELEASE_NOTES.md
+            echo "Using the curated CHANGELOG.md section for $version as the release body."
+          else
+            echo "::warning::No CHANGELOG.md section found for $version - falling back to the git-cliff notes."
+          fi
+          rm -f CHANGELOG_SECTION.md
+          echo "--- release body ---"
+          cat RELEASE_NOTES.md
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
