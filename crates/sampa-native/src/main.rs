@@ -39,6 +39,7 @@ use alacritty_terminal::vte::ansi::Processor;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
+use glyphon::cosmic_text::Align;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
@@ -839,6 +840,187 @@ fn squarify(weights: &[u64], rect: [f32; 4]) -> Vec<[f32; 4]> {
     out
 }
 
+/// One laid-out ring segment of the `du` sunburst (spec-du-rings.md §4): an annulus sector
+/// centred on the hub, its angular span ∝ `size_kb` and its radius band set by its depth.
+/// Angles are radians from 12 o'clock, increasing clockwise — the convention `ARC_SHADER`
+/// and [`arc_hit`] both measure in, so the pointer picks what the eye sees.
+#[derive(Clone)]
+struct DuArc {
+    center: [f32; 2],
+    r0: f32, // inner / outer radius in physical pixels
+    r1: f32,
+    a0: f32, // start / end angle, radians clockwise from 12 o'clock
+    a1: f32,
+    name: String,
+    path: String,
+    size_kb: u64,
+    /// Child-index path from the current view node, so a click descends to any ring in one
+    /// step. `None` for the `(files here)` remainder — there is no directory to go into.
+    zoom: Option<Vec<usize>>,
+    /// Branch tint, lightened a step per depth. `None` for the remainder, which the
+    /// renderer fills from the theme like the treemap's muted box.
+    color: Option<[u8; 3]>,
+}
+
+/// How many scanned levels the rings show. The `du` scan is `--max-depth=4`, so this draws
+/// everything it collected; deeper nodes don't exist to lay out.
+const DU_RING_DEPTH: usize = 4;
+/// The thinnest sector worth an instance (radians, ~0.7°). Below this a segment is barely a
+/// pixel at the outer ring, so it and its subtree are dropped rather than inflating the
+/// instance count with invisible geometry.
+const DU_MIN_SWEEP: f32 = 0.012;
+
+/// Sunburst (polar treemap) layout for the `du` rings view: walk `view`'s subtree and emit
+/// one annulus sector per descendant, each child's angular span proportional to its share
+/// of its parent's size. Where the squarified treemap shows one level and makes you zoom,
+/// this puts every scanned depth on screen at once — the same `DuNode` tree, read radially.
+///
+/// `hub` is the radius of the empty centre (which carries the view node's own label),
+/// `ring` the thickness of one depth band, and `levels` how many bands to emit. Returns
+/// sectors in tree order.
+fn sunburst(view: &DuNode, center: [f32; 2], hub: f32, ring: f32, levels: usize) -> Vec<DuArc> {
+    let mut out = Vec::new();
+    let mut zoom = Vec::new();
+    push_ring(view, center, hub, ring, levels, 0, 0.0, std::f32::consts::TAU, &mut zoom, None, &mut out);
+    out
+}
+
+/// How many levels of children `node` has, capped at `cap`. The rings divide their radius
+/// by this rather than by [`DU_RING_DEPTH`], so a view only one level deep gets one
+/// full-thickness band instead of a thin ring adrift in a circle sized for a tree that
+/// isn't there — which is what zooming to the bottom of the scan leaves you with.
+fn subtree_depth(node: &DuNode, cap: usize) -> usize {
+    if cap == 0 || node.children.is_empty() {
+        return 0;
+    }
+    1 + node.children.iter().map(|c| subtree_depth(c, cap - 1)).max().unwrap_or(0)
+}
+
+/// One level of [`sunburst`]: lay `node`'s children across `sweep` radians starting at
+/// `a0`, then recurse into each. `tint` is the top-level ancestor's palette colour,
+/// inherited down the branch so a whole subtree reads as one family.
+#[allow(clippy::too_many_arguments)]
+fn push_ring(
+    node: &DuNode,
+    center: [f32; 2],
+    hub: f32,
+    ring: f32,
+    levels: usize,
+    depth: usize,
+    a0: f32,
+    sweep: f32,
+    zoom: &mut Vec<usize>,
+    tint: Option<[u8; 3]>,
+    out: &mut Vec<DuArc>,
+) {
+    if depth >= levels || node.size_kb == 0 || sweep < DU_MIN_SWEEP {
+        return;
+    }
+    let (r0, r1) = (hub + depth as f32 * ring, hub + (depth + 1) as f32 * ring);
+    let mut a = a0;
+    for (i, child) in node.children.iter().enumerate() {
+        let span = sweep * (child.size_kb as f32 / node.size_kb as f32);
+        if span < DU_MIN_SWEEP {
+            a += span;
+            continue;
+        }
+        // Depth 0 seeds the branch colour from the palette; deeper rings inherit it.
+        let branch = tint.unwrap_or(DU_PALETTE[i % DU_PALETTE.len()]);
+        zoom.push(i);
+        out.push(DuArc {
+            center,
+            r0,
+            r1,
+            a0: a,
+            a1: a + span,
+            name: child.name.clone(),
+            path: child.path.clone(),
+            size_kb: child.size_kb,
+            zoom: Some(zoom.clone()),
+            color: Some(blend(branch, [0xff, 0xff, 0xff], depth as f32 * 0.11)),
+        });
+        push_ring(child, center, hub, ring, levels, depth + 1, a, span, zoom, Some(branch), out);
+        zoom.pop();
+        a += span;
+    }
+    // The bytes in `node` itself (its size minus its children's) close the ring, so each
+    // level's sectors sum to its parent's sweep — the radial form of the treemap's
+    // `(files here)` box. Not zoomable: there is no child directory behind it.
+    let child_sum: u64 = node.children.iter().map(|c| c.size_kb).sum();
+    let remainder = node.size_kb.saturating_sub(child_sum);
+    if remainder > 0 && !node.children.is_empty() {
+        let span = sweep * (remainder as f32 / node.size_kb as f32);
+        if span >= DU_MIN_SWEEP {
+            out.push(DuArc {
+                center,
+                r0,
+                r1,
+                a0: a,
+                a1: a + span,
+                name: "(files here)".to_string(),
+                path: node.path.clone(),
+                size_kb: remainder,
+                zoom: None,
+                color: None,
+            });
+        }
+    }
+}
+
+/// The radius and angle of `(x, y)` about `center` — angle from 12 o'clock, clockwise, in
+/// `[0, TAU)`. Mirrors `ARC_SHADER`'s fragment math so hit-testing agrees with the pixels.
+fn polar(center: [f32; 2], x: f32, y: f32) -> (f32, f32) {
+    let (dx, dy) = (x - center[0], y - center[1]);
+    let mut ang = dx.atan2(-dy);
+    if ang < 0.0 {
+        ang += std::f32::consts::TAU;
+    }
+    (dx.hypot(dy), ang)
+}
+
+/// Does `(x, y)` fall inside `arc`? The epsilon keeps the hairline where a level's sectors
+/// meet (and the seam at 12 o'clock, where accumulated spans land a hair short of `TAU`)
+/// from reading as a gap the pointer can fall through.
+fn arc_hit(arc: &DuArc, x: f32, y: f32) -> bool {
+    let (r, ang) = polar(arc.center, x, y);
+    r >= arc.r0 && r <= arc.r1 && ang >= arc.a0 - 1e-3 && ang <= arc.a1 + 1e-3
+}
+
+/// A sector's label anchor and the room it has: the centroid (mid radius, mid angle), the
+/// chord across the sector at that radius, and the ring thickness. Labels are horizontal —
+/// glyphon 0.12 has no per-text-area transform, so they cannot follow the ring's curve.
+fn arc_label_box(arc: &DuArc) -> ([f32; 2], f32, f32) {
+    let rm = 0.5 * (arc.r0 + arc.r1);
+    let am = 0.5 * (arc.a0 + arc.a1);
+    let pos = [arc.center[0] + rm * am.sin(), arc.center[1] - rm * am.cos()];
+    let chord = 2.0 * rm * (0.5 * (arc.a1 - arc.a0)).sin();
+    (pos, chord, arc.r1 - arc.r0)
+}
+
+/// Tight pixel bounding box of an annulus sector, used as the instance's quad so the
+/// fragment shader only runs where the sector can be. Padded a pixel for the edge AA.
+fn arc_bbox(arc: &DuArc) -> [f32; 4] {
+    use std::f32::consts::FRAC_PI_2;
+    let pt = |r: f32, a: f32| [arc.center[0] + r * a.sin(), arc.center[1] - r * a.cos()];
+    let mut xs = [f32::INFINITY, f32::NEG_INFINITY];
+    let mut ys = [f32::INFINITY, f32::NEG_INFINITY];
+    let mut add = |p: [f32; 2]| {
+        xs = [xs[0].min(p[0]), xs[1].max(p[0])];
+        ys = [ys[0].min(p[1]), ys[1].max(p[1])];
+    };
+    for (r, a) in [(arc.r0, arc.a0), (arc.r0, arc.a1), (arc.r1, arc.a0), (arc.r1, arc.a1)] {
+        add(pt(r, a));
+    }
+    // Every quarter-turn the sweep crosses puts the outer radius at an axis extreme, which
+    // the four corners above miss (a sector spanning north bulges past both its ends).
+    let mut k = (arc.a0 / FRAC_PI_2).ceil();
+    while k * FRAC_PI_2 <= arc.a1 {
+        add(pt(arc.r1, k * FRAC_PI_2));
+        k += 1.0;
+    }
+    [xs[0] - 1.0, ys[0] - 1.0, xs[1] - xs[0] + 2.0, ys[1] - ys[0] + 2.0]
+}
+
 /// Display name for a provenance [`Group`] (spec §6 order).
 fn group_name(g: Group) -> &'static str {
     match g {
@@ -1209,11 +1391,18 @@ fn adjust_divider(ratios: &[f32], idx: usize, boundary: f32) -> Vec<f32> {
     out
 }
 
-/// The `du` disk-usage treemap overlay for one frame (spec-du-treemap.md): the laid-out
-/// boxes to draw, a breadcrumb/status title, and an optional centered message shown
-/// instead of the boxes (scanning / timeout / empty).
+/// The `du` disk-usage overlay for one frame: the laid-out chart, a breadcrumb/status
+/// title, and an optional centered message shown instead of it (scanning / timeout /
+/// empty). Exactly one of `boxes` (the squarified treemap, spec-du-treemap.md) and `arcs`
+/// (the rings, spec-du-rings.md) is populated, per `rings`.
 struct DuView<'a> {
     boxes: &'a [DuBox],
+    arcs: &'a [DuArc],
+    rings: bool,
+    /// Index into `arcs` under the pointer — drawn a shade brighter than its neighbours.
+    hover: Option<usize>,
+    /// Centre, radius and label of the rings' hub (the directory in view).
+    hub: Option<&'a ([f32; 2], f32, String)>,
     title: &'a str,
     msg: Option<&'a str>,
 }
@@ -3105,6 +3294,10 @@ fn main() -> Result<()> {
         du_root: None,
         du_zoom: Vec::new(),
         du_boxes: Vec::new(),
+        du_rings: false,
+        du_arcs: Vec::new(),
+        du_hover: None,
+        du_hub: None,
         du_msg: None,
         du_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         free_on: false,
@@ -3622,6 +3815,10 @@ struct App {
     du_root: Option<DuNode>, // the parsed tree (None while scanning / on failure)
     du_zoom: Vec<usize>,     // child indices from the root to the current view node
     du_boxes: Vec<DuBox>,    // laid-out cells of the current view (for drawing + click hit-test)
+    du_rings: bool,          // rings (sunburst) instead of the squarified treemap — `t` toggles
+    du_arcs: Vec<DuArc>,     // laid-out sectors of the rings view (drawing + hit-test)
+    du_hover: Option<usize>, // index into `du_arcs` under the pointer, for the readout strip
+    du_hub: Option<([f32; 2], f32)>, // rings centre + hub radius, for the centre label
     du_msg: Option<String>,  // status line: "scanning…", a timeout, or "empty"
     du_gen: std::sync::Arc<std::sync::atomic::AtomicU64>, // supersede token for the async scan
     // free memory gauge (spec-free-gauge.md), also overloaded on the ps chord.
@@ -5166,6 +5363,12 @@ impl App {
                     self.tab_drag = Some(to);
                 }
             }
+            return;
+        }
+        // The `du` rings view is modal and reads out the sector under the pointer, so it
+        // takes the motion instead of the grid (no selection or mouse reporting beneath it).
+        if self.du_on && self.du_rings {
+            self.du_hover_at(x as f32, y as f32);
             return;
         }
         let (col, row, side) = self.cell_at(x, y);
@@ -7703,6 +7906,8 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.du_root = None;
         self.du_zoom.clear();
         self.du_boxes.clear();
+        self.du_arcs.clear();
+        self.du_hover = None;
 
         let Some(cwd) = self.session_cwd() else {
             self.du_msg = Some("Can't determine the current directory.".into());
@@ -7721,9 +7926,12 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
 
     fn du_close(&mut self) {
         self.du_on = false;
+        self.du_hub = None;
         self.du_root = None;
         self.du_zoom.clear();
         self.du_boxes.clear();
+        self.du_arcs.clear();
+        self.du_hover = None;
         self.du_msg = None;
         self.request_redraw();
     }
@@ -7756,10 +7964,16 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         Some(node)
     }
 
-    /// Recompute the treemap cells for the current view into the overlay rectangle. Called
-    /// each frame the overlay is drawn, so it tracks window resizes and zoom changes.
+    /// Recompute the current view's layout into the overlay rectangle — squarified boxes,
+    /// or annulus sectors in rings mode. Called each frame the overlay is drawn, so it
+    /// tracks window resizes, zoom changes and the mode toggle.
     fn du_relayout(&mut self, area: [f32; 4]) {
         self.du_boxes.clear();
+        self.du_arcs.clear();
+        if self.du_rings {
+            self.du_relayout_rings(area);
+            return;
+        }
         // Snapshot the view's children (name, size) and total, then drop the borrow so the
         // boxes can be pushed into `self`.
         let (children, view_size): (Vec<(String, u64)>, u64) = match self.du_view() {
@@ -7785,9 +7999,60 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         }
     }
 
+    /// Lay the rings out in the largest circle the overlay rect holds (spec-du-rings.md §4).
+    /// The hub is left empty for the view node's own label and the radius that remains
+    /// splits evenly into one band per scanned depth, so every level gets equal thickness
+    /// however deep the tree goes.
+    fn du_relayout_rings(&mut self, area: [f32; 4]) {
+        self.du_hub = None;
+        let outer = 0.5 * area[2].min(area[3]) - 2.0;
+        if outer < 24.0 {
+            return; // no room to draw rings anyone could read
+        }
+        let center = [area[0] + 0.5 * area[2], area[1] + 0.5 * area[3]];
+        let hub = (outer * 0.26).max(10.0);
+        self.du_arcs = match self.du_view() {
+            Some(v) => {
+                // Only as many bands as this view has levels, so the rings always fill the
+                // circle — however deep into the scan the zoom has gone.
+                let levels = subtree_depth(v, DU_RING_DEPTH).max(1);
+                sunburst(v, center, hub, (outer - hub) / levels as f32, levels)
+            }
+            None => return,
+        };
+        self.du_hub = Some((center, hub));
+        // A hover index kept across a resize or a zoom would name a different directory.
+        if self.du_hover.is_some_and(|i| i >= self.du_arcs.len()) {
+            self.du_hover = None;
+        }
+    }
+
+    /// The sector under the pointer, innermost ring first. Sectors never overlap, so the
+    /// first hit is the only hit; the order just makes the scan stop early near the hub.
+    fn du_arc_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.du_arcs.iter().position(|a| arc_hit(a, x, y))
+    }
+
+    /// Track the sector under the pointer while the rings are open, so the strip can read
+    /// out its full path and size. Redraws only when the sector actually changes.
+    fn du_hover_at(&mut self, x: f32, y: f32) {
+        let hit = self.du_arc_at(x, y);
+        if hit != self.du_hover {
+            self.du_hover = hit;
+            self.request_redraw();
+        }
+    }
+
     fn du_key(&mut self, key: &Key) {
         match key {
             Key::Named(NamedKey::Escape) => self.du_close(),
+            // `t` swaps the layout: rings show every scanned depth at once, the treemap
+            // shows one level at a time with more room for labels.
+            Key::Character(c) if c.eq_ignore_ascii_case("t") => {
+                self.du_rings = !self.du_rings;
+                self.du_hover = None;
+                self.request_redraw();
+            }
             Key::Named(NamedKey::Backspace) => {
                 if self.du_zoom.pop().is_some() {
                     self.request_redraw();
@@ -7800,9 +8065,25 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         }
     }
 
-    /// A left-click while the treemap is open: zoom into the clicked box if it's a
-    /// directory with children (spec §5).
+    /// A left-click while the overlay is open: zoom into the clicked directory if it has
+    /// children (spec §5). In rings mode a sector carries its whole index path, so a click
+    /// on an outer ring descends every level at once rather than one at a time.
     fn du_click(&mut self, x: f32, y: f32) {
+        if self.du_rings {
+            let Some(path) = self.du_arc_at(x, y).and_then(|i| self.du_arcs[i].zoom.clone()) else {
+                return;
+            };
+            let mut node = self.du_view();
+            for &i in &path {
+                node = node.and_then(|n| n.children.get(i));
+            }
+            if node.is_some_and(|n| !n.children.is_empty()) {
+                self.du_zoom.extend(path);
+                self.du_hover = None;
+                self.request_redraw();
+            }
+            return;
+        }
         if let Some(b) = self.du_boxes.iter().find(|b| {
             x >= b.rect[0] && x < b.rect[0] + b.rect[2] && y >= b.rect[1] && y < b.rect[1] + b.rect[3]
         }) {
@@ -7833,16 +8114,26 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.du_close();
     }
 
-    /// The breadcrumb / status strip above the treemap: the current path, its total size,
-    /// and the key hints (or just "du" while a message is showing instead of boxes).
+    /// The breadcrumb / status strip above the chart: the current path and total size, the
+    /// key hints, and — in rings mode, where sectors are too narrow to label — the full
+    /// path and size of whatever the pointer is over. "du" alone while a message shows.
     fn du_title(&self) -> String {
-        match self.du_view() {
-            Some(v) if self.du_msg.is_none() => format!(
-                "du · {} · {}   ·  click zoom · Backspace up · Enter cd here · Esc",
+        let Some(v) = self.du_view().filter(|_| self.du_msg.is_none()) else {
+            return "du".to_string();
+        };
+        let mode = if self.du_rings { "t treemap" } else { "t rings" };
+        match self.du_hover.and_then(|i| self.du_arcs.get(i)) {
+            // Hovering: the sector's own path/size, since nothing else can show it.
+            Some(a) => format!(
+                "du · {} · {}   ·  click zoom · Backspace up · Enter cd here · {mode} · Esc",
+                a.path,
+                fmt_kib(a.size_kb),
+            ),
+            None => format!(
+                "du · {} · {}   ·  click zoom · Backspace up · Enter cd here · {mode} · Esc",
                 v.path,
                 fmt_kib(v.size_kb),
             ),
-            _ => "du".to_string(),
         }
     }
 
@@ -8829,6 +9120,8 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         // Treemap relayout up front (it borrows `self` mutably), cloned into owned locals so
         // the later view builders — palette/ai/panel, which borrow `self` — don't collide.
         let du_boxes_local: Vec<DuBox>;
+        let du_arcs_local: Vec<DuArc>;
+        let du_hub_local: Option<([f32; 2], f32, String)>;
         let du_title_local: String;
         let du_msg_local: Option<String>;
         if self.du_on {
@@ -8847,10 +9140,17 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             ];
             self.du_relayout(area);
             du_boxes_local = self.du_boxes.clone();
+            du_arcs_local = self.du_arcs.clone();
+            // The hub label names the directory the rings describe — the one `Enter` cds to.
+            du_hub_local = self.du_hub.zip(self.du_view()).map(|((c, r), v)| {
+                (c, r, format!("{}\n{}", v.name, fmt_kib(v.size_kb)))
+            });
             du_title_local = self.du_title();
             du_msg_local = self.du_msg.clone();
         } else {
             du_boxes_local = Vec::new();
+            du_arcs_local = Vec::new();
+            du_hub_local = None;
             du_title_local = String::new();
             du_msg_local = None;
         }
@@ -9243,9 +9543,15 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             w.set_ime_cursor_area(PhysicalPosition::new(x, y), PhysicalSize::new(cw * 8.0, lh));
         }
         // Build the treemap view from the owned locals computed at the top (no `self` borrow).
-        let du = self
-            .du_on
-            .then(|| DuView { boxes: &du_boxes_local, title: &du_title_local, msg: du_msg_local.as_deref() });
+        let du = self.du_on.then(|| DuView {
+            boxes: &du_boxes_local,
+            arcs: &du_arcs_local,
+            rings: self.du_rings,
+            hover: self.du_hover,
+            hub: du_hub_local.as_ref(),
+            title: &du_title_local,
+            msg: du_msg_local.as_deref(),
+        });
         // Visual bell: flash a border while `bell_until` is in the future, re-drawing
         // until it lapses (then one final frame clears it).
         let bell = self.bell_until.is_some_and(|t| std::time::Instant::now() < t);
@@ -10007,6 +10313,104 @@ fn vs(@builtin(vertex_index) vi: u32,
 fn fs(in: VsOut) -> @location(0) vec4<f32> { return in.color; }
 "#;
 
+/// One annulus sector for the `du` rings view. The quad pass can only place axis-aligned
+/// rectangles, so a sector is drawn as its bounding quad and carved out per-fragment by
+/// `ARC_SHADER`: `rect` is that quad, the rest is the sector it keeps.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ArcInstance {
+    rect: [f32; 4],   // x, y, w, h in pixels — the sector's bounding box
+    color: [f32; 4],  // rgba, target-space
+    center: [f32; 2], // hub centre in pixels
+    radii: [f32; 2],  // r0, r1
+    angles: [f32; 2], // a0, a1 — radians clockwise from 12 o'clock, a0 <= a1
+    _pad: [f32; 2],
+}
+
+/// Annulus-sector pass: the vertex stage expands each instance's bounding quad (as
+/// `QUAD_SHADER` does) and hands the fragment stage the pixel it is shading; the fragment
+/// stage converts to polar about the hub and keeps only what lies inside the sector.
+///
+/// The radial and angular edges are eroded by `GAP` **pixels** rather than by a constant
+/// angle, so the seams between sectors stay the same visual width on every ring instead of
+/// fanning out with radius, and `smoothstep` over one pixel antialiases all four edges —
+/// which is what makes the thin outer rings legible. A sector spanning the whole turn (a
+/// lone child) skips the angular test, or its own start and end would cut a seam at 12
+/// o'clock.
+const ARC_SHADER: &str = r#"
+struct Screen { size: vec2<f32>, _pad: vec2<f32> };
+@group(0) @binding(0) var<uniform> screen: Screen;
+
+const TAU: f32 = 6.2831853;
+const GAP: f32 = 0.75; // half the seam between neighbouring sectors, in pixels
+const AA: f32 = 0.7;   // edge softening, in pixels
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) px: vec2<f32>,
+    @location(2) center: vec2<f32>,
+    @location(3) radii: vec2<f32>,
+    @location(4) angles: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32,
+      @location(0) rect: vec4<f32>,
+      @location(1) color: vec4<f32>,
+      @location(2) center: vec2<f32>,
+      @location(3) radii: vec2<f32>,
+      @location(4) angles: vec2<f32>) -> VsOut {
+    let corner = vec2<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u));
+    let px = rect.xy + corner * rect.zw;
+    let ndc = vec2<f32>(px.x / screen.size.x * 2.0 - 1.0, 1.0 - px.y / screen.size.y * 2.0);
+    var out: VsOut;
+    out.pos = vec4<f32>(ndc, 0.0, 1.0);
+    out.color = color;
+    out.px = px;
+    out.center = center;
+    out.radii = radii;
+    out.angles = angles;
+    return out;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    let d = in.px - in.center;
+    let r = length(d);
+    // Angle from 12 o'clock, increasing clockwise, lifted into [0, TAU).
+    var ang = atan2(d.x, -d.y);
+    if (ang < 0.0) { ang = ang + TAU; }
+
+    // Radial edges: erode by GAP, soften over AA.
+    let r_in = smoothstep(in.radii.x + GAP - AA, in.radii.x + GAP + AA, r);
+    let r_out = 1.0 - smoothstep(in.radii.y - GAP - AA, in.radii.y - GAP + AA, r);
+
+    // Angular edges: GAP and AA are pixel distances, so divide by the radius to get the
+    // angle they subtend here. A full turn has no neighbours to separate from.
+    var a_in = 1.0;
+    var a_out = 1.0;
+    if (in.angles.y - in.angles.x < TAU - 0.001) {
+        let rr = max(r, 1.0);
+        let g = GAP / rr;
+        let e = AA / rr;
+        // A sector may be sampled a turn away from where it was laid out (its span can run
+        // up to TAU, while `ang` wrapped into [0, TAU)); test both and keep the better.
+        let lo = in.angles.x;
+        let hi = in.angles.y;
+        let a1 = smoothstep(lo + g - e, lo + g + e, ang) * (1.0 - smoothstep(hi - g - e, hi - g + e, ang));
+        let w = ang + TAU;
+        let a2 = smoothstep(lo + g - e, lo + g + e, w) * (1.0 - smoothstep(hi - g - e, hi - g + e, w));
+        a_in = max(a1, a2);
+        a_out = 1.0;
+    }
+
+    let cover = r_in * r_out * a_in * a_out;
+    if (cover < 0.004) { discard; }
+    return vec4<f32>(in.color.rgb, in.color.a * cover);
+}
+"#;
+
 const IMAGE_SHADER: &str = r#"
 struct Screen { size: vec2<f32>, _pad: vec2<f32> };
 @group(0) @binding(0) var<uniform> screen: Screen;
@@ -10077,6 +10481,7 @@ struct Renderer {
     pane_buffers: Vec<Buffer>,  // one grid text buffer per split pane, grown lazily
     grid_font_size: f32,        // point size the grid buffers use (for lazily-grown pane buffers)
     quad_pipeline: wgpu::RenderPipeline,
+    arc_pipeline: wgpu::RenderPipeline, // `du` rings view (annulus sectors)
     quad_uniform: wgpu::Buffer,
     quad_bind_group: wgpu::BindGroup,
     // inline images
@@ -10201,6 +10606,49 @@ impl Renderer {
             cache: None,
         });
 
+        // Arc pipeline: the `du` rings view's annulus sectors. Same instanced triangle-strip
+        // quad and same group-0 screen uniform as the quad pass (the fragment stage needs no
+        // uniform — it gets its pixel as a varying), with a wider instance layout.
+        let arc_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("arc"),
+            source: wgpu::ShaderSource::Wgsl(ARC_SHADER.into()),
+        });
+        const ARC_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+            0 => Float32x4, 1 => Float32x4, 2 => Float32x2, 3 => Float32x2, 4 => Float32x2
+        ];
+        let arc_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("arc-pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &arc_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ArcInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &ARC_ATTRS,
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &arc_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Image pipeline: group 0 = screen uniform (reuses `bgl`), group 1 = texture+sampler.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("image-sampler"),
@@ -10298,6 +10746,7 @@ impl Renderer {
             pane_buffers: Vec::new(),
             grid_font_size: font_size,
             quad_pipeline,
+            arc_pipeline,
             quad_uniform,
             quad_bind_group,
             image_pipeline,
@@ -10601,6 +11050,10 @@ impl Renderer {
         if du.msg.is_some() {
             return labels;
         }
+        if du.rings {
+            self.shape_du_rings(du, &mut labels);
+            return labels;
+        }
         while self.du_buffers.len() < du.boxes.len() {
             let b = Buffer::new(&mut self.font_system, Metrics::new((self.line_h / 1.45).max(9.0), self.line_h));
             self.du_buffers.push(b);
@@ -10635,6 +11088,97 @@ impl Renderer {
             ));
         }
         labels
+    }
+
+    /// Label the rings (spec-du-rings.md §4): the hub carries the directory in view, and a
+    /// sector is labelled only where a horizontal label fits inside it — the chord at its
+    /// mid radius by the ring's thickness is all the room there is, and text cannot be
+    /// rotated to follow the curve (glyphon 0.12 has no per-text-area transform). Sectors
+    /// too narrow to label are named by the strip's hover readout instead.
+    ///
+    /// Labels are centre-aligned in a box centred on the sector's centroid, so each sits in
+    /// the middle of its own band rather than against one edge.
+    fn shape_du_rings(&mut self, du: &DuView, labels: &mut Vec<(usize, f32, f32, TextBounds)>) {
+        let fam = family_of(&self.font_family);
+        let label_col = Color::rgb(0xf2, 0xf4, 0xf7);
+        // One buffer per sector, plus one for the hub.
+        while self.du_buffers.len() < du.arcs.len() + 1 {
+            let b = Buffer::new(&mut self.font_system, Metrics::new((self.line_h / 1.45).max(9.0), self.line_h));
+            self.du_buffers.push(b);
+        }
+        let shape = |buf: &mut Buffer,
+                         fs: &mut FontSystem,
+                         text: &str,
+                         col: Color,
+                         bold: bool,
+                         at: [f32; 2],
+                         bw: f32,
+                         bh: f32| {
+            buf.set_size(Some(bw.max(1.0)), Some(bh));
+            let mut attrs = Attrs::new().family(fam).color(col);
+            if bold {
+                attrs = attrs.weight(Weight::BOLD);
+            }
+            buf.set_rich_text([(text, attrs)], &Attrs::new(), Shaping::Advanced, None);
+            for line in buf.lines.iter_mut() {
+                line.set_align(Some(Align::Center));
+            }
+            buf.shape_until_scroll(fs, false);
+            let (left, top) = (at[0] - 0.5 * bw, at[1] - 0.5 * bh);
+            (
+                left,
+                top,
+                TextBounds {
+                    left: left as i32,
+                    top: top as i32,
+                    right: (left + bw) as i32,
+                    bottom: (top + bh) as i32,
+                },
+            )
+        };
+        for (i, a) in du.arcs.iter().enumerate() {
+            let (pos, chord, thick) = arc_label_box(a);
+            if chord < 46.0 || thick < self.line_h * 1.25 {
+                continue;
+            }
+            // Two lines (name + size) only where the band is thick enough for both.
+            let two = thick >= self.line_h * 2.3;
+            let text = if two {
+                format!("{}\n{}", a.name, fmt_kib(a.size_kb))
+            } else {
+                a.name.clone()
+            };
+            let bw = chord.min(220.0) - 6.0;
+            let bh = if two { self.line_h * 2.0 } else { self.line_h };
+            let (l, t, b) = shape(
+                &mut self.du_buffers[i],
+                &mut self.font_system,
+                &text,
+                label_col,
+                false,
+                pos,
+                bw,
+                bh,
+            );
+            labels.push((i, l, t, b));
+        }
+        if let Some((center, r, text)) = du.hub {
+            let fg = self.theme.fg;
+            let idx = du.arcs.len();
+            let bw = r * 1.7;
+            let bh = self.line_h * 2.0;
+            let (l, t, b) = shape(
+                &mut self.du_buffers[idx],
+                &mut self.font_system,
+                text,
+                Color::rgb(fg[0], fg[1], fg[2]),
+                true,
+                *center,
+                bw,
+                bh,
+            );
+            labels.push((idx, l, t, b));
+        }
     }
 
     /// Emit the decoration quads for a cell's underline `kind` at `(x, y)` in `color`. Single is
@@ -10770,6 +11314,8 @@ impl Renderer {
         // (underline/strikethrough, drawn over it).
         let mut bg_quads: Vec<QuadInstance> = Vec::new();
         let mut deco_quads: Vec<QuadInstance> = Vec::new();
+        // `du` rings sectors — their own pipeline, drawn over `bg_quads` and under the text.
+        let mut arc_quads: Vec<ArcInstance> = Vec::new();
         // Tab-bar segment quads render first, under everything.
         self.tab_bar_quads(tabs, active, w, &mut bg_quads);
         // Grid cell backgrounds, decorations, and the cursor — per pane. Each pane draws
@@ -10907,12 +11453,45 @@ impl Renderer {
             bg_quads.push(QuadInstance { rect: [cx, cy, cw, ai_header_h], color: header });
             bg_quads.push(QuadInstance { rect: [cx, cy + ai_header_h, cw, 1.0], color: rule });
         }
-        // du treemap: an opaque cover over the grid, then a fill+border quad per box (area
-        // ∝ disk usage). Labels are added as text areas below; the grid text is suppressed.
+        // du: an opaque cover over the grid, then the chart — a fill+border quad per
+        // treemap box (area ∝ disk usage), or an annulus sector per ring segment (angle ∝
+        // disk usage). Labels are added as text areas below; the grid text is suppressed.
         if let Some(du) = du {
             let cover = self.color4(blend(self.theme.bg, self.theme.fg, 0.04));
             bg_quads.push(QuadInstance { rect: [0.0, top, w as f32, h as f32 - top], color: cover });
-            if du.msg.is_none() {
+            if du.rings && du.msg.is_none() {
+                let muted = blend(self.theme.bg, self.theme.fg, 0.28);
+                for (i, a) in du.arcs.iter().enumerate() {
+                    // The hovered sector lifts toward the foreground so the readout in the
+                    // strip is tied to something visible — the rings carry no cursor.
+                    let base = a.color.unwrap_or(muted);
+                    let rgb = if du.hover == Some(i) {
+                        blend(base, self.theme.fg, 0.35)
+                    } else {
+                        base
+                    };
+                    arc_quads.push(ArcInstance {
+                        rect: arc_bbox(a),
+                        color: self.color4(rgb),
+                        center: a.center,
+                        radii: [a.r0, a.r1],
+                        angles: [a.a0, a.a1],
+                        _pad: [0.0, 0.0],
+                    });
+                }
+                // A disc under the hub so the innermost ring reads as sitting on something.
+                if let Some(&(c, r, _)) = du.hub {
+                    arc_quads.push(ArcInstance {
+                        rect: [c[0] - r - 1.0, c[1] - r - 1.0, 2.0 * r + 2.0, 2.0 * r + 2.0],
+                        color: self.color4(blend(self.theme.bg, self.theme.fg, 0.12)),
+                        center: c,
+                        radii: [0.0, r],
+                        angles: [0.0, std::f32::consts::TAU],
+                        _pad: [0.0, 0.0],
+                    });
+                }
+            }
+            if !du.rings && du.msg.is_none() {
                 let border = self.color4(self.theme.bg);
                 for (i, b) in du.boxes.iter().enumerate() {
                     if b.rect[2] < 1.5 || b.rect[3] < 1.5 {
@@ -11447,6 +12026,13 @@ impl Renderer {
         };
         let bg_buf = mk_buf(&self.device, &bg_quads);
         let deco_buf = mk_buf(&self.device, &deco_quads);
+        let arc_buf = (!arc_quads.is_empty()).then(|| {
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("arc-instances"),
+                contents: bytemuck::cast_slice(&arc_quads),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
 
         let bg = self.color4(self.theme.bg);
         let mut encoder = self
@@ -11480,6 +12066,13 @@ impl Renderer {
                 pass.set_bind_group(0, &self.quad_bind_group, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..4, 0..bg_quads.len() as u32);
+            }
+            // `du` rings: over the overlay's cover, under the labels.
+            if let Some(buf) = &arc_buf {
+                pass.set_pipeline(&self.arc_pipeline);
+                pass.set_bind_group(0, &self.quad_bind_group, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..4, 0..arc_quads.len() as u32);
             }
             // Inline images composite scissored to the visible grid area so they never bleed
             // into the tab bar, palette dropdown, or search bar. A macro draws one z-ordered
@@ -13983,6 +14576,116 @@ mod tests {
         // Empty / zero-weight inputs don't panic.
         assert!(squarify(&[], rect).is_empty());
         assert_eq!(squarify(&[0, 0], rect).len(), 2);
+    }
+
+    /// A `DuNode` literal, for the sunburst layout tests.
+    fn du(name: &str, size_kb: u64, children: Vec<DuNode>) -> DuNode {
+        DuNode { name: name.to_string(), path: format!("/r/{name}"), size_kb, children }
+    }
+
+    #[test]
+    fn sunburst_angles_are_proportional() {
+        use std::f32::consts::TAU;
+        // 60 + 30 under a 100 root, so 10 is the root's own `(files here)` remainder.
+        let tree = du("root", 100, vec![du("a", 60, vec![du("a1", 60, vec![])]), du("b", 30, vec![])]);
+        let arcs = sunburst(&tree, [200.0, 200.0], 40.0, 30.0, DU_RING_DEPTH);
+        // a (depth 0), a1 (depth 1, nested in a), b (depth 0), the remainder (depth 0).
+        assert_eq!(arcs.len(), 4);
+        let span = |i: usize| arcs[i].a1 - arcs[i].a0;
+        assert!((span(0) - TAU * 0.6).abs() < 1e-4, "a should take 60% of the turn");
+        assert!((span(2) - TAU * 0.3).abs() < 1e-4, "b should take 30%");
+        assert!((span(3) - TAU * 0.1).abs() < 1e-4, "the remainder closes the ring");
+        // Sectors tile their parent's sweep: b starts where a ends, and the ring closes.
+        assert!((arcs[0].a0 - 0.0).abs() < 1e-4, "the first sector starts at 12 o'clock");
+        assert!((arcs[2].a0 - arcs[0].a1).abs() < 1e-4);
+        assert!((arcs[3].a1 - TAU).abs() < 1e-3, "the sectors sum to a full turn");
+        // Depth sets the radius band; a child is nested inside its parent's sweep.
+        assert_eq!([arcs[0].r0, arcs[0].r1], [40.0, 70.0]);
+        assert_eq!([arcs[1].r0, arcs[1].r1], [70.0, 100.0]);
+        assert!(arcs[1].a0 >= arcs[0].a0 - 1e-4 && arcs[1].a1 <= arcs[0].a1 + 1e-4);
+        // The remainder is not zoomable and takes the renderer's muted fill, not a palette one.
+        assert!(arcs[3].zoom.is_none() && arcs[3].color.is_none());
+        assert_eq!(arcs[3].name, "(files here)");
+        // Real directories carry the index path from the view node, deepest-last.
+        assert_eq!(arcs[0].zoom.as_deref(), Some(&[0usize][..]));
+        assert_eq!(arcs[1].zoom.as_deref(), Some(&[0usize, 0][..]));
+        assert_eq!(arcs[2].zoom.as_deref(), Some(&[1usize][..]));
+    }
+
+    #[test]
+    fn sunburst_drops_slivers_and_bounds_depth() {
+        // A child too thin to see takes its subtree with it rather than emitting geometry.
+        let tiny = du("root", 1_000_000, vec![du("big", 999_999, vec![]), du("sliver", 1, vec![du("x", 1, vec![])])]);
+        let arcs = sunburst(&tiny, [100.0, 100.0], 20.0, 20.0, DU_RING_DEPTH);
+        assert!(arcs.iter().all(|a| a.name != "sliver" && a.name != "x"));
+        assert!(arcs.iter().any(|a| a.name == "big"));
+
+        // Nesting stops at DU_RING_DEPTH bands however deep the tree runs.
+        let mut node = du("leaf", 100, vec![]);
+        for i in 0..8 {
+            node = du(&format!("d{i}"), 100, vec![node]);
+        }
+        let arcs = sunburst(&node, [100.0, 100.0], 20.0, 10.0, DU_RING_DEPTH);
+        let outer = arcs.iter().fold(0.0_f32, |m, a| m.max(a.r1));
+        assert_eq!(outer, 20.0 + DU_RING_DEPTH as f32 * 10.0);
+        assert!(arcs.iter().all(|a| a.r0 >= 20.0));
+
+        // Degenerate inputs don't panic or emit anything.
+        assert!(sunburst(&du("empty", 0, vec![]), [0.0, 0.0], 10.0, 10.0, 4).is_empty());
+        assert!(sunburst(&du("leaf", 10, vec![]), [0.0, 0.0], 10.0, 10.0, 4).is_empty());
+
+        // The band count follows the view's own depth, which is what keeps the rings
+        // filling the circle after a zoom to the bottom of the scan.
+        let flat = du("root", 10, vec![du("only", 10, vec![])]);
+        assert_eq!(subtree_depth(&flat, DU_RING_DEPTH), 1);
+        assert_eq!(subtree_depth(&du("leaf", 1, vec![]), DU_RING_DEPTH), 0);
+        assert_eq!(subtree_depth(&tiny, DU_RING_DEPTH), 2);
+    }
+
+    #[test]
+    fn arc_hit_agrees_with_the_layout() {
+        let tree = du("root", 100, vec![du("a", 50, vec![]), du("b", 50, vec![])]);
+        let arcs = sunburst(&tree, [200.0, 200.0], 40.0, 60.0, DU_RING_DEPTH);
+        assert_eq!(arcs.len(), 2);
+        // Each sector's own centroid hits it, and only it.
+        for (i, a) in arcs.iter().enumerate() {
+            let (pos, _, _) = arc_label_box(a);
+            assert!(arc_hit(a, pos[0], pos[1]), "sector {i} should contain its centroid");
+            for (j, other) in arcs.iter().enumerate() {
+                if i != j {
+                    assert!(!arc_hit(other, pos[0], pos[1]), "sector {j} should not claim {i}'s centroid");
+                }
+            }
+        }
+        // An equal split puts `a` on the right of the dial and `b` on the left (clockwise
+        // from 12 o'clock), which is what the angle convention promises.
+        assert!(arc_hit(&arcs[0], 280.0, 200.0) && !arc_hit(&arcs[1], 280.0, 200.0));
+        assert!(arc_hit(&arcs[1], 120.0, 200.0) && !arc_hit(&arcs[0], 120.0, 200.0));
+        // The hub and the space beyond the outer ring belong to no sector.
+        assert!(arcs.iter().all(|a| !arc_hit(a, 200.0, 200.0)));
+        assert!(arcs.iter().all(|a| !arc_hit(a, 200.0, 20.0)));
+    }
+
+    #[test]
+    fn arc_bbox_covers_its_sector() {
+        let tree = du("root", 100, vec![du("a", 55, vec![]), du("b", 25, vec![]), du("c", 20, vec![])]);
+        let arcs = sunburst(&tree, [150.0, 150.0], 30.0, 50.0, DU_RING_DEPTH);
+        for a in &arcs {
+            let [bx, by, bw, bh] = arc_bbox(a);
+            // Sample the sector densely: every point inside it must be inside the quad, or
+            // the fragment shader would never be asked to shade it.
+            for k in 0..=20 {
+                let t = k as f32 / 20.0;
+                let ang = a.a0 + t * (a.a1 - a.a0);
+                for &r in &[a.r0, 0.5 * (a.r0 + a.r1), a.r1] {
+                    let (x, y) = (a.center[0] + r * ang.sin(), a.center[1] - r * ang.cos());
+                    assert!(
+                        x >= bx && x <= bx + bw && y >= by && y <= by + bh,
+                        "({x}, {y}) at r={r} escapes the bbox [{bx}, {by}, {bw}, {bh}]"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

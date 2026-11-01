@@ -19,7 +19,8 @@ run, never on its own.
 - **Enhance views — `Ctrl+Shift+D`**, dispatched on the command you've typed
   ([overview](docs/spec-enhance-views.md)):
   - `cd` → a **directory tree picker** → composes `cd <path>`
-  - `du` → a **disk-usage treemap** (squarify + zoom) → composes `cd <path>`
+  - `du` → a **disk-usage treemap** (squarify + zoom) → composes `cd <path>`, or
+    **rings** (a sunburst showing every scanned depth at once — `t` toggles)
   - `free` → a **memory gauge** (RAM/swap segmented bars) — display-only
   - `df` → a **disk-free gauge** (one bar per filesystem, fullest-first) — display-only
   - `ping <host>` → a **latency chart** (per-packet RTT sparkline + loss ticks) — display-only
