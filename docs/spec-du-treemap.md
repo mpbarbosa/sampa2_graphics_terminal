@@ -7,6 +7,9 @@
   breadcrumb strip on top, click-to-zoom, `Backspace` up a level, `Enter` composes `cd
   <path>` at the prompt (insert-never-run), `Esc` closes. The keybinding is the native ps
   chord (`Ctrl+Shift+D`), dispatched on the typed command like the `cd` picker.
+- **Second layout:** the same view also draws as **rings** (a sunburst) — `t` toggles.
+  Scan, tree, zoom stack and `cd` composition are shared; see
+  [spec-du-rings.md](spec-du-rings.md).
 - **Applies to:** visualising the current directory's disk usage as a treemap, opened from
   the keyboard. Language-agnostic behavioral contract so any frontend (webview or native
   Rust) behaves identically.
