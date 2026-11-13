@@ -84,6 +84,12 @@ available. A sector is therefore labelled only where a horizontal label fits ins
 **chord at its mid radius** by the **ring thickness** is the whole budget (name alone in a
 thin band, name + size where two lines fit), centre-aligned on the sector's centroid.
 
+The chord is an **estimate, not a bound** — through a sector facing east a horizontal line
+runs radially, where the room is the band thickness — and its **sweep is clamped to half a
+turn** before the chord is taken. Unclamped, `sin(sweep/2)` falls back to zero at a full
+turn, so the sectors with the most room were the ones refused a label: a directory holding
+one dominant child drew that child unlabelled while labelling its own smaller children.
+
 That leaves most outer sectors unlabelled, so the breadcrumb strip doubles as a **hover
 readout**: the sector under the pointer puts its full path and size in the strip, and lifts
 toward the foreground so the readout is tied to something visible. This is how `baobab` and
