@@ -5,6 +5,24 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.15.1] - 2026-11-13
+
+**The `du` views are usable on a real home directory again.** The disk-usage scan had a
+**6-second budget**, but `du` prints nothing until it has walked the whole subtree — so the
+timeout was never a safety margin around a fast operation, it was the ceiling on what the
+view could show at all, and any sizeable `$HOME` hit it and displayed only `du timed out
+after 6s`. Measured here, a 132 GB home takes **67 s**, so the budget is now **90 s**. The
+overlay already says `scanning <path> …` while it waits and `Esc` closes it, which is what
+makes the longer wait tolerable; a progressive scan that fills the view as it goes remains
+the real fix, and is recorded as a follow-up in the rings spec. The duration is now a single
+named constant with the message formatted from it, rather than the number being written out
+in three places. `df`'s own 6-second timeout is unchanged — a stale mount is a different
+failure, and waiting longer there helps nobody.
+
+### Bug Fixes
+
+- Raise the `du` scan budget from 6s to 90s — a real `$HOME` never finished inside the old one
+
 ## [0.15.0] - 2026-11-13
 
 **`du` now draws rings.** The disk-usage view gained a second layout — a **sunburst** over
