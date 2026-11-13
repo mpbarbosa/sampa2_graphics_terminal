@@ -5,6 +5,26 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.15.0] - 2026-11-13
+
+**`du` now draws rings.** The disk-usage view gained a second layout — a **sunburst** over
+the same scan, where a sector's angle is its share of its parent and each ring is one level
+deeper — so the whole hierarchy is on screen at once instead of one level per zoom. **`t`
+toggles** it against the existing squarified treemap; the scan, breadcrumb, zoom stack and
+insert-never-run `cd` are all shared, and nothing extra is scanned to draw it. Since most
+sectors are far too narrow to label, **hovering one puts its full path and size in the
+breadcrumb strip**, and **clicking an outer ring descends every level between it and the
+current view in one step** — so a deep chain of single large directories
+(`.cache/ollama/models/blobs`) is one click away rather than four zooms. The sectors are
+drawn by a new annulus-sector shader: the quad pass can only place axis-aligned rectangles,
+so each one is submitted as its bounding quad and carved out per fragment, with its edges
+eroded by a fixed number of pixels rather than a fixed angle so the seams stay even on
+every ring.
+
+### Features
+
+- `du` disk-usage rings — a sunburst showing every scanned depth at once, `t` toggles
+
 ## [0.14.0] - 2026-10-17
 
 **CJK, emoji and symbols finally render properly.** The native build gained real **font
