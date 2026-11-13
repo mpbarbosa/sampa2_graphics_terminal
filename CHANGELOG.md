@@ -5,6 +5,38 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.15.2] - 2026-11-13
+
+**Two dead ends in the `du` views, both of which told you nothing where they should have
+said something.** In the rings, a sector's label was gated on the chord across it, and that
+chord shrinks back to **zero** as a sector approaches a full turn — so the sectors with the
+most room were the ones refused a label. Any directory holding one dominant child drew that
+child blank while labelling its own smaller children: zoomed into `~/Documents`, the ring
+carrying the entire 34.2 G view was the only unlabelled thing on screen. The sweep is now
+clamped to half a turn before the chord is taken, so the width rises and then holds at the
+band's diameter and no sector is labelled less generously than a narrower one beside it.
+The chord remains an estimate rather than a bound — through a sector facing east a
+horizontal label runs radially, where the room is the band thickness — and the code now
+says so instead of implying otherwise.
+
+Separately, the **preview panel's `✗` now points somewhere**. `du` and its neighbours are
+deliberately off `sampa-preview`'s read-only allowlist *because* an enhance view supersedes
+them, but the refusal never said that; it now names the chord that opens the matching view,
+read from the live binding, so a `[keybindings]` rebind shows the right key and an unbound
+action names none.
+
+### Bug Fixes
+
+- Label the sector that sweeps the whole dial — a full-turn ring reported zero room and was
+  skipped by the label gate
+- Point a preview refusal at the command's enhance view, using the live binding rather than
+  a hardcoded chord
+
+### Documentation
+
+- Record the clamp in the rings spec, which had stated the chord rule that was wrong
+- Add the `git status` preview to the enhance-views table
+
 ## [0.15.1] - 2026-11-13
 
 **The `du` views are usable on a real home directory again.** The disk-usage scan had a
