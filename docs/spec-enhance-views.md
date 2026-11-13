@@ -17,6 +17,7 @@ you've typed** (keystroke-derived — autosuggestions never affect it) selects t
 | `ping` | **latency chart** | a per-packet RTT sparkline (height ∝ RTT, banded) + loss ticks + summary | ❌ display-only |
 | `uptime` | **load gauge** | three load bars (1/5/15 min) scaled to CPU cores, banded by load÷cores | ❌ display-only |
 | `netstat` / `ss` | **connections table** | open sockets as a state-coloured table (listening-first) + a summary | ❌ display-only |
+| `git` | **git status preview** | the changed paths grouped as `git status` shows them — staged / unstaged / untracked / conflicted, colour-coded; a clean tree says so | ❌ display-only |
 | *anything else* (incl. `ps`) | **ps output enhancement** | the last `ps aux`, decorated: quiet columns / bars + live sort / grouped inspector (by width) | `k` → `kill <pid>` in the inspector |
 
 Each is a **modal overlay**: `Esc` (and its view-specific keys) dismisses it and returns
@@ -25,7 +26,8 @@ focus to the terminal.
 ## The rules they share
 
 - **Read-only.** Every view either runs a read-only command (`du -k`, `free -k`, `df -k`, a
-  bounded `ping`, `uptime`) or reads the scrollback/cwd. Nothing runs on your behalf.
+  bounded `ping`, `uptime`, `git status --porcelain -b`) or reads the scrollback/cwd.
+  Nothing runs on your behalf.
 - **Insert-never-run.** The views that produce a command (`cd`, `du` → `cd <path>`; the ps
   inspector → `kill <pid>`) **compose it at the prompt and never press Enter** — you review
   and run it yourself. The `free` gauge has no command to compose, so it's purely
