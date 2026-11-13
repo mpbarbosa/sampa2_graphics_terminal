@@ -594,9 +594,30 @@ const DU_PALETTE: &[[u8; 3]] = &[
     [0x5b, 0xa6, 0x93], [0xa6, 0x7d, 0x5b], [0x7d, 0x5b, 0xa6], [0x5b, 0x6f, 0xa6],
 ];
 
+/// How long a `du` scan may run before the child is killed (spec-du-treemap.md §3).
+///
+/// Six seconds was too tight to be useful. `du` prints nothing until it has walked the
+/// whole subtree, so this budget is not a safety margin around a fast operation — it is the
+/// real limit on what the view can show at all, and under it a home directory of any size
+/// showed only the timeout message. Measured on a 132 GB `$HOME`:
+///
+/// ```text
+/// du -k -x --max-depth=4 /home/<user>   ->  67.18 seconds
+/// ```
+///
+/// Hence 90: clear of that with headroom, and tolerable only because the overlay says
+/// `scanning <path> …` while it waits and `Esc` closes it (the orphaned scan's result is
+/// dropped by the generation token). The real fix is a progressive scan that fills the view
+/// as it goes, which is recorded as a follow-up in spec-du-rings.md §8.
+///
+/// `df`'s own 6s is a different thing — a stale mount, where waiting longer helps nobody —
+/// and is deliberately left alone.
+const DU_TIMEOUT_SECS: u64 = 90;
+
 /// Run a **read-only, timeout-bounded** `du -k -x --max-depth=4 <cwd>` off the caller's
 /// thread and parse it into a tree (spec-du-treemap.md §3). A reader thread drains stdout so
-/// the pipe never fills; if the scan overruns 6s the child is killed and an error returned.
+/// the pipe never fills; if the scan overruns [`DU_TIMEOUT_SECS`] the child is killed and an
+/// error returned.
 fn run_du(cwd: &str) -> Result<DuNode, String> {
     use std::io::Read;
     let mut child = std::process::Command::new("du")
@@ -614,14 +635,15 @@ fn run_du(cwd: &str) -> Result<DuNode, String> {
         }
         let _ = tx.send(s);
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+    match rx.recv_timeout(std::time::Duration::from_secs(DU_TIMEOUT_SECS)) {
         Ok(text) => {
             let _ = child.wait();
             parse_du(&text).ok_or_else(|| "Nothing to show (empty or unreadable directory).".to_string())
         }
         Err(_) => {
             let _ = child.kill();
-            Err("du timed out after 6s — the directory is very large.".to_string())
+            // Formatted from the constant: the hardcoded "6s" here would otherwise outlive it.
+            Err(format!("du timed out after {DU_TIMEOUT_SECS}s — the directory is very large."))
         }
     }
 }

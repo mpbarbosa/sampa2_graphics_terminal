@@ -31,7 +31,7 @@ It is the same read-only view as the treemap: the one side effect it offers is c
 
 ## 3. Scanning
 
-Unchanged — the same read-only, 6 s-timeout-bounded `du -k -x --max-depth=4 <cwd>` on a
+Unchanged — the same read-only, 90 s-timeout-bounded `du -k -x --max-depth=4 <cwd>` on a
 background thread, parsed by `sampa_dumap::parse_du` into the same `DuNode` tree
 (spec-du-treemap.md §3). **Nothing extra is scanned to draw the rings**; they are a second
 reading of the data the treemap already had.
