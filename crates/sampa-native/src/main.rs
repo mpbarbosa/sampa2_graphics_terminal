@@ -4912,6 +4912,26 @@ fn gh_subcommands(line: &str) -> Vec<String> {
     subcommand_path(line, "gh")
 }
 
+/// The dedicated `Ctrl+Shift+D` enhance view for a command, if it has one — the same
+/// dispatch table `Action::EnhancePs` uses (spec-enhance-views.md §2). Returns the view's
+/// human name, used to turn a preview refusal into a pointer at the richer view instead
+/// of a dead end: several of these commands (`du` above all) were deliberately dropped
+/// from `sampa-preview`'s read-only allowlist *because* the view supersedes them.
+fn enhance_view_for(cmd: &str) -> Option<&'static str> {
+    Some(match cmd {
+        "cd" => "directory tree picker",
+        "du" => "disk-usage treemap",
+        "free" => "memory gauge",
+        "df" => "disk-free gauge",
+        "ping" => "latency chart",
+        "uptime" => "load gauge",
+        "netstat" | "ss" => "connections table",
+        "git" => "git status preview",
+        "ps" => "ps decorator",
+        _ => return None,
+    })
+}
+
 fn first_command_token(line: &str) -> &str {
     let mut it = line.split_whitespace();
     let first = it.next().unwrap_or("");
@@ -8952,7 +8972,18 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         } else if self.preview_ran {
             format!("preview ✓ {}", self.preview_line)
         } else {
-            format!("preview ✗ {} — {}", self.preview_line, self.preview_text)
+            let base = format!("preview ✗ {} — {}", self.preview_line, self.preview_text);
+            // Not a dead end when the command has a richer view: name the chord that opens
+            // it (live binding, so a rebind shows here too).
+            let chord = self.keys.chord_str(Action::EnhancePs);
+            match enhance_view_for(first_command_token(&self.preview_line)) {
+                // An unbound enhance action has no chord to name — stay silent rather
+                // than point at a key that does nothing.
+                Some(view) if !chord.is_empty() => {
+                    format!("{base}  ·  {} opens the {view}", prettify_chord(chord))
+                }
+                _ => base,
+            }
         }
     }
 
@@ -12804,6 +12835,26 @@ mod tests {
         // A missing file loads empty (fail-safe), never errors.
         assert!(PaletteFrecency::load(&dir.join("nope.tsv")).uses.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A preview refusal for a command that has a dedicated Ctrl+Shift+D view must name
+    // that view rather than dead-end: `du` is off the read-only allowlist precisely
+    // because the treemap supersedes it, so the gate's "no" has to say where to go.
+    #[test]
+    fn refused_commands_with_a_view_point_at_it() {
+        assert_eq!(enhance_view_for("du"), Some("disk-usage treemap"));
+        assert_eq!(enhance_view_for("ss"), Some("connections table"));
+        assert_eq!(enhance_view_for("rm"), None);
+        // The dispatch sees the same token `Action::EnhancePs` dispatches on.
+        assert_eq!(
+            enhance_view_for(first_command_token("sudo du -sh -- */ | sort -n")),
+            Some("disk-usage treemap")
+        );
+        // Every command the EnhancePs match arm names has an entry here, so the two
+        // tables can't drift apart silently.
+        for cmd in ["cd", "du", "free", "df", "ping", "uptime", "netstat", "ss", "git"] {
+            assert!(enhance_view_for(cmd).is_some(), "{cmd} has no view name");
+        }
     }
 
     // §17 exit criterion: a command previewed by the native build never mutates the
