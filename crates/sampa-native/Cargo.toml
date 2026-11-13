@@ -1,6 +1,6 @@
 [package]
 name = "sampa-native"
-version = "0.15.1"
+version = "0.15.2"
 edition.workspace = true
 license.workspace = true
 description = "Sampa — Rust-only (native) graphical terminal (Path C)."
