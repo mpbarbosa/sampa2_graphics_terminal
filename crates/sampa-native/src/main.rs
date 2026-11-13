@@ -1008,15 +1008,29 @@ fn arc_hit(arc: &DuArc, x: f32, y: f32) -> bool {
     r >= arc.r0 && r <= arc.r1 && ang >= arc.a0 - 1e-3 && ang <= arc.a1 + 1e-3
 }
 
-/// A sector's label anchor and the room it has: the centroid (mid radius, mid angle), the
-/// chord across the sector at that radius, and the ring thickness. Labels are horizontal —
+/// A sector's label anchor and the room it has: the centroid (mid radius, mid angle), an
+/// estimate of the width available there, and the ring thickness. Labels are horizontal —
 /// glyphon 0.12 has no per-text-area transform, so they cannot follow the ring's curve.
+///
+/// The width is the chord at the mid radius, which is an **estimate and not a bound**: a
+/// horizontal line through a sector facing east runs radially, where the room is the band
+/// thickness and not the chord at all. It is kept because it reads well in practice at the
+/// angles where sectors are actually labelled, and because the drawn box is capped at
+/// 220 px regardless.
+///
+/// The sweep is clamped to half a turn first, and that part *is* load-bearing.
+/// `sin(sweep/2)` peaks at a half turn and falls back to **zero** at a full one, so an
+/// unclamped chord rejects exactly the sectors with the most room: a directory holding one
+/// dominant child drew that child unlabelled while labelling its own smaller children —
+/// seen on `~/Documents`, where `GitHub` is 34.2 G of 34.2 G and swept the whole dial.
+/// Clamped, the width rises with the sweep and then holds at the diameter `2·rm`, so no
+/// sector can be labelled less generously than a narrower one in the same band.
 fn arc_label_box(arc: &DuArc) -> ([f32; 2], f32, f32) {
     let rm = 0.5 * (arc.r0 + arc.r1);
     let am = 0.5 * (arc.a0 + arc.a1);
     let pos = [arc.center[0] + rm * am.sin(), arc.center[1] - rm * am.cos()];
-    let chord = 2.0 * rm * (0.5 * (arc.a1 - arc.a0)).sin();
-    (pos, chord, arc.r1 - arc.r0)
+    let sweep = (arc.a1 - arc.a0).min(std::f32::consts::PI);
+    (pos, 2.0 * rm * (0.5 * sweep).sin(), arc.r1 - arc.r0)
 }
 
 /// Tight pixel bounding box of an annulus sector, used as the instance's quad so the
@@ -11190,8 +11204,8 @@ impl Renderer {
             )
         };
         for (i, a) in du.arcs.iter().enumerate() {
-            let (pos, chord, thick) = arc_label_box(a);
-            if chord < 46.0 || thick < self.line_h * 1.25 {
+            let (pos, room, thick) = arc_label_box(a);
+            if room < 46.0 || thick < self.line_h * 1.25 {
                 continue;
             }
             // Two lines (name + size) only where the band is thick enough for both.
@@ -11201,7 +11215,7 @@ impl Renderer {
             } else {
                 a.name.clone()
             };
-            let bw = chord.min(220.0) - 6.0;
+            let bw = room.min(220.0) - 6.0;
             let bh = if two { self.line_h * 2.0 } else { self.line_h };
             let (l, t, b) = shape(
                 &mut self.du_buffers[i],
@@ -14713,6 +14727,39 @@ mod tests {
         assert_eq!(subtree_depth(&flat, DU_RING_DEPTH), 1);
         assert_eq!(subtree_depth(&du("leaf", 1, vec![]), DU_RING_DEPTH), 0);
         assert_eq!(subtree_depth(&tiny, DU_RING_DEPTH), 2);
+    }
+
+    #[test]
+    fn arc_label_room_never_shrinks_as_a_sector_widens() {
+        // The defect this guards: a sector sweeping the whole dial reported zero room and
+        // was dropped by the label gate, so the single biggest directory in a zoomed view
+        // went unlabelled while its smaller children were labelled.
+        let whole = du("root", 100, vec![du("only", 100, vec![])]);
+        let arcs = sunburst(&whole, [200.0, 200.0], 40.0, 60.0, 1);
+        assert_eq!(arcs.len(), 1);
+        assert!(
+            (arcs[0].a1 - arcs[0].a0 - std::f32::consts::TAU).abs() < 1e-3,
+            "expected a full turn, got {}",
+            arcs[0].a1 - arcs[0].a0
+        );
+        let (_, room, _) = arc_label_box(&arcs[0]);
+        assert!(room > 46.0, "a full-turn sector must clear the label gate, got {room}");
+        // At or past a half turn the room holds at the diameter at that radius.
+        assert!((room - 2.0 * 0.5 * (40.0 + 100.0)).abs() < 1e-3, "got {room}");
+
+        // The property the unclamped chord broke: within one band, a wider sector is never
+        // given less room than a narrower one. Sweeps either side of the half turn.
+        let mut widest = 0.0_f32;
+        for parts in [16_u64, 8, 5, 4, 3, 2, 1] {
+            let kids: Vec<_> = (0..parts).map(|i| du(&format!("k{i}"), 100, vec![])).collect();
+            let arcs = sunburst(&du("root", 100 * parts, kids), [200.0, 200.0], 40.0, 60.0, 1);
+            let (_, room, _) = arc_label_box(&arcs[0]);
+            assert!(
+                room >= widest,
+                "{parts} equal parts: room {room} is less than the {widest} of a narrower sector"
+            );
+            widest = room;
+        }
     }
 
     #[test]
