@@ -31,7 +31,7 @@ focus to the terminal.
   and run it yourself. The `free` gauge has no command to compose, so it's purely
   informational. This is the same boundary the command palette and AI overlays honour.
 - **Fail-safe.** A malformed or missing target (no `ps aux` in the buffer, an unreadable
-  directory, a `du` that overruns its 6 s budget) shows a one-line message, never garbage.
+  directory, a `du` that overruns its 90 s budget) shows a one-line message, never garbage.
 - **Width-gated (ps only).** `[enhance] ps = off | quiet | bars | inspector` picks the ps
   level; below the width thresholds it steps down (`resolve_level`).
 

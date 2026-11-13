@@ -1,7 +1,7 @@
 # Spec — `du` disk-usage treemap
 
 - **Status (this native/Path C build):** **implemented.** Typed `du` + `Ctrl+Shift+D`
-  scans the session cwd with a read-only, 6s-timeout-bounded `du -k -x --max-depth=4` on a
+  scans the session cwd with a read-only, 90s-timeout-bounded `du -k -x --max-depth=4` on a
   background thread (`run_du`), parses it with `sampa_dumap::parse_du`, and draws a
   **squarified treemap** (native `squarify`) as coloured, labelled quads over the grid — a
   breadcrumb strip on top, click-to-zoom, `Backspace` up a level, `Enter` composes `cd
@@ -39,7 +39,10 @@ DESIGN.md §10.1 / §13).
   `du -k -x --max-depth=4 <cwd>`: kibibytes (portable), one filesystem (`-x`, so it doesn't
   wander into mounts), depth-capped to bound the output.
 - **`du` traverses the whole subtree and can be slow**, so it runs off the UI/async thread
-  with a **wall-clock timeout** (default 6 s); on expiry the child is killed and the overlay
+  with a **wall-clock timeout** (`DU_TIMEOUT_SECS`, 90 s — six was too tight to be useful: `du`
+  prints nothing until it has walked the whole subtree, so the budget is the real limit on
+  what the view can show, and a 132 GB `$HOME` measured 67 s);
+  on expiry the child is killed and the overlay
   shows a short message. Nothing is retried automatically.
 - `du` only stats the filesystem — no writes, and the path is never interpolated into a
   shell.
