@@ -1237,6 +1237,20 @@ fn arc_label_box(arc: &DuArc) -> ([f32; 2], f32, f32) {
     (pos, 2.0 * rm * (0.5 * sweep).sin(), arc.r1 - arc.r0)
 }
 
+/// What a marker index is pointing at, in terms that survive a relayout: the sector's own
+/// path, plus whether it is the `(files here)` remainder — which shares its parent's path
+/// and so would otherwise be indistinguishable from it.
+fn arc_mark_id(arcs: &[DuArc], at: Option<usize>) -> Option<(String, bool)> {
+    at.and_then(|i| arcs.get(i)).map(|a| (a.path.clone(), a.zoom.is_none()))
+}
+
+/// Find that sector again in a freshly laid-out set. `None` when it is no longer on screen
+/// — a zoom moved the view, say — which drops the marker, as it should.
+fn arc_mark_find(arcs: &[DuArc], id: Option<(String, bool)>) -> Option<usize> {
+    let (path, remainder) = id?;
+    arcs.iter().position(|a| a.path == path && a.zoom.is_none() == remainder)
+}
+
 /// Which way a keyboard step moves through the rings (spec-du-rings.md §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DuStep {
@@ -8383,10 +8397,14 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
     /// or annulus sectors in rings mode. Called each frame the overlay is drawn, so it
     /// tracks window resizes, zoom changes and the mode toggle.
     fn du_relayout(&mut self, area: [f32; 4]) {
+        // Read what the marker names *before* the sectors are dropped — `du_arcs` is the
+        // only place that mapping exists, and the next line destroys it.
+        let marked = self.du_mark_id(self.du_focus);
+        let hovered = self.du_mark_id(self.du_hover);
         self.du_boxes.clear();
         self.du_arcs.clear();
         if self.du_rings {
-            self.du_relayout_rings(area);
+            self.du_relayout_rings(area, marked, hovered);
             return;
         }
         // Snapshot the view's children (name, size) and total, then drop the borrow so the
@@ -8418,7 +8436,12 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
     /// The hub is left empty for the view node's own label and the radius that remains
     /// splits evenly into one band per scanned depth, so every level gets equal thickness
     /// however deep the tree goes.
-    fn du_relayout_rings(&mut self, area: [f32; 4]) {
+    fn du_relayout_rings(
+        &mut self,
+        area: [f32; 4],
+        marked: Option<(String, bool)>,
+        hovered: Option<(String, bool)>,
+    ) {
         self.du_hub = None;
         let outer = 0.5 * area[2].min(area[3]) - 2.0;
         if outer < 24.0 {
@@ -8436,14 +8459,23 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             None => return,
         };
         self.du_hub = Some((center, hub));
-        // An index kept across a resize, a zoom or a mid-scan update would name a
-        // different directory — and `du_arcs` is rebuilt by every one of those.
-        if self.du_hover.is_some_and(|i| i >= self.du_arcs.len()) {
-            self.du_hover = None;
-        }
-        if self.du_focus.is_some_and(|i| i >= self.du_arcs.len()) {
-            self.du_focus = None;
-        }
+        // Re-point the marker at the sector it was on, by identity rather than by
+        // position. `du_arcs` is rebuilt by every resize, zoom and — since the scan became
+        // progressive — four times a second while it runs, and the index that named
+        // `.config` one frame names `Documents` the next as sectors are inserted ahead of
+        // it. Clearing only an out-of-range index does not catch that: the index stays
+        // perfectly valid while quietly meaning something else, so the strip reads out a
+        // directory the user never marked and `Enter` composes a `cd` to it.
+        self.du_focus = self.du_mark_find(marked);
+        self.du_hover = self.du_mark_find(hovered);
+    }
+
+    fn du_mark_id(&self, at: Option<usize>) -> Option<(String, bool)> {
+        arc_mark_id(&self.du_arcs, at)
+    }
+
+    fn du_mark_find(&self, id: Option<(String, bool)>) -> Option<usize> {
+        arc_mark_find(&self.du_arcs, id)
     }
 
     /// The sector under the pointer, innermost ring first. Sectors never overlap, so the
@@ -15265,6 +15297,77 @@ mod tests {
         let t = b.tree().unwrap();
         assert_eq!(t.children.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["a"]);
         assert_eq!(t.size_kb, 7);
+    }
+
+    #[test]
+    fn the_marker_survives_a_mid_scan_relayout() {
+        // The defect: `du_focus`/`du_hover` are indices into `du_arcs`, and the
+        // progressive scan rebuilds that list four times a second. A directory finishing
+        // its walk grows and overtakes its siblings, every later sector shifts along, and
+        // the index that named one directory silently names another. Observed live on
+        // 0.17.0: a marker left on `.config` read `Documents` nine seconds later with no
+        // key pressed, and `Enter` would have composed a `cd` to the wrong one.
+        let center = [200.0, 200.0];
+        // Mid-scan: `.config` has been fully walked, `Documents` has barely started.
+        // Root totals exceed the children deliberately, so each layout also carries a
+        // `(files here)` remainder to mark.
+        let during = du(
+            "root",
+            120,
+            vec![
+                du(".config", 60, vec![du("gtk", 40, vec![])]),
+                du("Documents", 30, vec![du("GitHub", 30, vec![])]),
+                du(".cache", 10, vec![du("pip", 10, vec![])]),
+            ],
+        );
+        let before = sunburst(&during, center, 40.0, 60.0, 2);
+        let at = before.iter().position(|a| a.name == ".config").unwrap();
+        let id = arc_mark_id(&before, Some(at));
+        assert_eq!(id, Some(("/r/.config".to_string(), false)));
+
+        // A few hundred milliseconds later `Documents` has overtaken it.
+        let after_tree = du(
+            "root",
+            180,
+            vec![
+                du("Documents", 80, vec![du("GitHub", 80, vec![])]),
+                du(".config", 60, vec![du("gtk", 40, vec![])]),
+                du(".cache", 10, vec![du("pip", 10, vec![])]),
+            ],
+        );
+        let after = sunburst(&after_tree, center, 40.0, 60.0, 2);
+
+        // The index alone is still perfectly in range — and now means something else.
+        // That is why "clear it when out of range" never caught this.
+        assert!(at < after.len());
+        assert_ne!(after[at].name, ".config", "the drift this guards against");
+
+        // Re-pointed by identity, the marker is still on `.config`.
+        let moved = arc_mark_find(&after, id.clone()).expect("still on screen");
+        assert_eq!(after[moved].name, ".config");
+        assert_ne!(moved, at, "it genuinely had to move");
+
+        // `(files here)` carries its *parent's* path, so a path alone is ambiguous: with
+        // `.config` keeping bytes of its own, two sectors in this layout have the path
+        // `/r/.config` — the directory, and the remainder inside it. Identity has to say
+        // which, or marking one can re-point onto the other.
+        let twins: Vec<usize> =
+            (0..after.len()).filter(|&i| after[i].path == "/r/.config").collect();
+        assert_eq!(twins.len(), 2, "expected the directory and its own remainder");
+        assert_eq!(arc_mark_find(&after, id).map(|i| after[i].zoom.is_some()), Some(true));
+        let rem = before
+            .iter()
+            .position(|a| a.zoom.is_none() && a.path == "/r/.config")
+            .unwrap();
+        let rem_id = arc_mark_id(&before, Some(rem));
+        assert_eq!(rem_id, Some(("/r/.config".to_string(), true)));
+        let rem_moved = arc_mark_find(&after, rem_id).expect("still on screen");
+        assert!(after[rem_moved].zoom.is_none(), "the remainder re-pointed onto its parent");
+        assert_ne!(rem_moved, moved, "the two sectors must not collapse into one mark");
+
+        // A sector that is gone drops the marker rather than landing on a stranger.
+        assert_eq!(arc_mark_find(&after, Some(("/r/nowhere".into(), false))), None);
+        assert_eq!(arc_mark_find(&after, None), None);
     }
 
     #[test]
