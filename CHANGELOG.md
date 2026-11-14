@@ -5,6 +5,31 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.17.1] - 2026-11-14
+
+**The marker in the disk-usage rings no longer drifts while a scan is running.** The
+keyboard marker and the hover readout are held as indices into the laid-out sectors, and
+since 0.16.0 that list is rebuilt four times a second as `du` streams in. A directory
+finishing its walk overtakes its siblings, every later sector shifts along, and the index
+that named one directory comes to name another — in range, and quietly wrong. Left alone
+for nine seconds mid-scan, a marker on `.config · 16.5G` read `Documents · 35.6G`. It was
+not only cosmetic: `Enter` composes a `cd` for the marked sector, so the drift could put a
+directory at the prompt that was never marked.
+
+The marker is now re-pointed by identity after every relayout — by path, plus whether it is
+the `(files here)` remainder, which carries its parent's path and is otherwise
+indistinguishable from it. A sector that is genuinely gone, because a zoom moved the view,
+still drops the marker.
+
+### Bug Fixes
+
+- Stop the rings marker drifting onto a different directory while a scan is still running
+
+### Documentation
+
+- Correct `spec-du-rings.md` §5, which claimed a relayout could not leave the marker stale
+  — true of the stepper, which is stateless, and wrong about the index held between presses
+
 ## [0.17.0] - 2026-11-14
 
 **The disk-usage rings are navigable without a mouse.** Most sectors in a sunburst are far
