@@ -33,7 +33,7 @@ focus to the terminal.
   and run it yourself. The `free` gauge has no command to compose, so it's purely
   informational. This is the same boundary the command palette and AI overlays honour.
 - **Fail-safe.** A malformed or missing target (no `ps aux` in the buffer, an unreadable
-  directory, a `du` that overruns its 90 s budget) shows a one-line message, never garbage.
+  directory, a `du` with nothing readable under it) shows a one-line message, never garbage.
 - **The preview panel points here.** `du` (and the other commands in the table) are off
   `sampa-preview`'s read-only allowlist *because* a view supersedes them, so a refusal in
   the preview panel (`Ctrl+Shift+E`) names the chord that opens the view —
