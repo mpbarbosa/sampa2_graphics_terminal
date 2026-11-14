@@ -5,6 +5,37 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.17.0] - 2026-11-14
+
+**The disk-usage rings are navigable without a mouse.** Most sectors in a sunburst are far
+too narrow to carry a label, so the hover readout in the breadcrumb strip *is* the
+labelling — and until now summoning it needed a pointer. Arrow keys move a marker: `←`/`→`
+along the current ring, `↑`/`↓` across rings, inward toward the hub or outward into the
+sector sitting below this one. `Space` zooms to the marker, and `Enter` composes a `cd` for
+it — still inserted, never run — falling back to the directory in view when nothing is
+marked, so neither key changes meaning when the marker is absent. The pointer and the
+arrows share one marker rather than keeping a hover and a focus apart, so the strip never
+has two things to read out.
+
+Stepping is computed from the layout alone: a ring is the set of sectors sharing a radius,
+and because one ring's sectors tile their parent's sweep exactly, the sector below any
+other is the one in the next ring out whose sweep contains its mid-angle. Nothing is stored
+between steps, which is what keeps the marker honest while the rings are still filling in
+from a running scan. Along a ring the marker wraps rather than stopping — a ring is a
+circle, and an end-stop at 12 o'clock would strand the sectors either side of the seam.
+
+Rings only: the treemap shows one level at a time and is navigated by clicking into it.
+
+### Features
+
+- Walk the `du` rings with the arrow keys — along and across rings, `Space` to zoom,
+  `Enter` to `cd` to the marked sector
+
+### Documentation
+
+- Rewrite `spec-du-rings.md` §5 with the key table, the shared marker and the three
+  deliberate end-stop asymmetries; §8 now records both of its follow-ups as implemented
+
 ## [0.16.0] - 2026-11-13
 
 **The disk-usage views fill in while `du` is still walking.** Until now the overlay was
