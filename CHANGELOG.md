@@ -5,6 +5,54 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.20.0] - 2026-11-14
+
+**The `ps` table says what each process is.** A `DESCRIPTION` column carries a one-line
+summary per row — the gap between a screen full of paths and knowing which of them matter.
+`/usr/lib/syst` on its own tells you nothing; beside "A userspace out-of-memory (OOM)
+killer" it tells you everything you opened the table for.
+
+The summaries come from `whatis`, the system's own man-db database, and from nowhere else.
+One batched call per panel open: read-only, no shell, a timeout, and a cap on how many
+names are asked about. On an 832-process `ps aux` that is 134 distinct names answered in
+17 ms, of which 80 have a manual page. The rest — browser processes, Electron helpers,
+vendor daemons — stay **blank**, which is the honest answer. There is no curated list of
+hand-written descriptions to go stale, or to be wrong on a machine that is not this one.
+
+**The name is read from `/proc/<pid>/comm`, not from the command text**, and that is what
+makes the column work rather than a nicety on top of it. `ps aux` truncates `COMMAND` to
+the terminal width, so `/usr/lib/systemd/systemd` arrives as `/usr/lib/syst` and its
+basename is `syst` — a lookup for nothing. Read from the kernel instead, three rows whose
+visible command is the same cut string resolve to `systemd-oomd`, `systemd-udevd` and
+`systemd-logind`, with three different descriptions. A process that has since exited falls
+back to whatever the text can give.
+
+**A process name is not trusted input.** A process chooses its own `argv[0]`, and these
+names become arguments to another program: only `[A-Za-z0-9._+-]` survives, and a leading
+`-` is stripped, because a login shell prints as `-zsh` and `whatis` reads that as an
+option — which fails the entire batch, so a `--` terminator alone is not enough. A pid must
+be digits for the same reason: `/proc/<pid>/comm` is built by interpolation, and `..` in
+that slot leaves `/proc` altogether.
+
+**Width.** Below 100 columns the column is dropped and the table looks exactly as it did,
+the same step-down rule the bars and the inspector follow. Above it the description takes a
+third of the spare width, capped, and is dropped again if what remains is too narrow to say
+anything in; `COMMAND` keeps the rest and is padded to the widest one actually drawn, so
+the descriptions sit beside the commands rather than across a gap. The two-pane inspector
+takes over at 120 columns and draws its own rows, so this column lives between the two
+thresholds — or at any width with `ps = bars` under `[enhance]`.
+
+### Features
+
+- Show a one-line description of each process in the `ps` table, from the system's own
+  `whatis` database
+
+### Documentation
+
+- Correct `spec-ps-output-enhancement.md` §5 and §6, which promised `Y` copies the "full
+  command line" and that the detail pane shows "the untruncated command line". Both are
+  bounded by `ps`'s own width truncation, and the enrich query never asked for `args`
+
 ## [0.19.0] - 2026-11-14
 
 **The `ps` table is navigable at every width, not only the widest one.** The two-pane
