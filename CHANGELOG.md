@@ -5,6 +5,45 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.18.0] - 2026-11-14
+
+**The disk-usage treemap is navigable without a mouse.** 0.17.0 gave the rings arrow keys;
+the treemap — the view `du` opens in by default — still needed a pointer. The same four
+keys now move a marker across it, `Space` zooms into the marked cell, and `Enter` composes
+a `cd` for it, falling back to the directory in view when nothing is marked. The marked
+cell is drawn lifted toward the foreground with a bright surround, and the breadcrumb strip
+reads out its full path and size, so the readout and `Enter` can never disagree.
+
+**The keys mean the four screen directions here, not what they mean in the rings.** A
+sunburst has two axes to spend them on — around a ring, and across to the ring inside or
+outside it — whereas a treemap shows a single level tiling a rectangle. The two layouts
+therefore keep separate step types (`DuDir` beside `DuStep`) rather than sharing one, since
+one set of variant names would otherwise be a lie about what the keys do. The strip names
+whichever set is live.
+
+A squarified treemap is a *tiling, not a grid*: rows run full-width or full-height, but the
+cells within a row have unequal extent, so "the cell to the right" is not a column index.
+A step prefers a cell that overlaps the current one across the direction of travel, then
+the nearest along it — which is what keeps a sideways step inside its row when a cell in
+the row above happens to have a nearer centre. At the edge of the map the marker stays put;
+a rectangle has no seam to wrap around, and `Backspace` is what clears a treemap marker.
+
+The marker is re-pointed by identity after every relayout, as 0.17.1 made the rings' do and
+for the same reason: the cells are rebuilt four times a second while a scan runs. Within
+one level a name is unique, so the name is the identity — paired with whether the cell is
+the `(files here)` remainder, which carries the view's own path and which a real directory
+could even share a name with.
+
+### Features
+
+- Walk the disk-usage treemap with the arrow keys, zoom with `Space`, and `cd` to the
+  marked cell with `Enter`
+
+### Documentation
+
+- Correct `spec-du-treemap.md` §4, which claimed every box carries a hover tooltip: the
+  native build labels boxes in place and has no hover state over them at all
+
 ## [0.17.1] - 2026-11-14
 
 **The marker in the disk-usage rings no longer drifts while a scan is running.** The
