@@ -70,8 +70,13 @@ lives in the core, is authoritative there, and fails safe to raw output.
 
 ## 4. Direction 1a — Quiet columns (default)
 
-Text and colour only. No box drawing, no interaction. Safe over SSH, safe in script
-captures, safe on a serial console.
+Text and colour only. No box drawing. Safe over SSH, safe in script captures, safe on a
+serial console.
+
+"No interaction" here is a property of the **output**, not of the panel: what 1a produces
+is plain aligned text that copies, pipes and renders on a serial console unchanged. The
+panel the emulator draws over it is navigable at every level (§5) — the selection is a
+caret in the first column, so even a copy of the panel body stays plain text.
 
 | Transform | Rule | Rationale |
 |---|---|---|
@@ -106,6 +111,45 @@ which is what makes a 300-row table scannable rather than readable.
   command. Toggling the kernel fold reveals threads inline and updates the count, the page
   bar, and the row set together.
 
+### Keyboard navigation (1a and 1b)
+
+The flat table carries a **moving selection**, not just a scroll position. Without one the
+only way to copy a pid or compose a `kill` was to widen the window far enough to reach the
+1c inspector (§6) — so the narrow terminal, which is where `ps aux` is hardest to read, was
+also the one where nothing could be done with a row.
+
+| Key | Action |
+|---|---|
+| `↑ ↓` / `j` | Move the selection (`j` down; **no** `k` for up — `k` signals) |
+| `PgUp` `PgDn` | Move a page |
+| `Home` `End` | First / last row |
+| `y` / `Y` | Copy PID / copy full command line |
+| `k` | **Signal** — writes `kill <pid>` to the prompt, **never executes it** |
+| `c` / `m` / `p` | Live sort (1b only) |
+| `q` / `Esc` | Close the panel |
+
+`y`, `Y`, `k` and `q` are the same four the inspector binds, so a window resize that steps
+the level up or down never changes what a key does.
+
+**The selection is a caret in the first column**, not a highlighted row: 1a's promise is
+that the output is plain text, and a background would not survive a copy while `❯ ` does.
+The kernel-summary line carries the same two-column indent so the columns stay aligned, and
+is not selectable — it is a count of folded threads, not a process.
+
+**The window scrolls by the minimum needed to keep the selection in view.** The inspector
+recentres, which suits a short grouped list beside a detail pane; this table runs to
+hundreds of rows and is read by scanning, and a view that jumps half a screen per arrow key
+loses the reader's place. Nothing wraps at either end — `k` composes a `kill` for whatever
+is selected, so a key meaning "one further down" must never move the selection the length
+of the table.
+
+**A re-sort carries the selection with its process.** `ps_sel` is a position in the
+displayed order, and `c`/`m`/`p` reorder the table without re-running `ps`, so holding the
+position would leave the selection on a different process — with `k` then composing a
+`kill` for one the user never chose. This is the same defect the disk-usage marker had
+across a relayout (spec-du-rings.md §5), and the same remedy: read what is selected before
+the order changes, and find it again after.
+
 ## 6. Direction 1c — Two-pane inspector
 
 The emulator promotes the printed table to a **selectable region in place**. Scrollback
@@ -122,7 +166,7 @@ above and below stays ordinary text; only this command's block becomes interacti
 
 | Key | Action |
 |---|---|
-| `↑ ↓` / `j k` | Move selection |
+| `↑ ↓` / `j` | Move selection (`j` down; there is **no** `k` for up — `k` signals) |
 | `← →` / `h l` | Collapse / expand a group |
 | `/` | Incremental filter on command and user |
 | `y` / `Y` | Copy PID / copy full command line |

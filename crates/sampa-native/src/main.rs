@@ -5594,6 +5594,85 @@ fn ps_sort_order(rows: &[sampa_ps_decorate::QuietRow], sort: PsSort) -> Vec<usiz
     order
 }
 
+/// Which way a keyboard step moves the flat `ps` table's selection (spec §5).
+///
+/// The grouped inspector walks a list of *visual lines* — headers and rows interleaved,
+/// with collapse folding rows in and out — so its stepping lives in `ps_inspector_key`.
+/// The flat table has only rows, in whatever order the live sort put them, so its stepping
+/// is plain arithmetic over one index and can be a pure function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PsStep {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    First,
+    Last,
+}
+
+/// Move the flat table's selection, clamped to `0..n`.
+///
+/// Nothing wraps. A table is a list with two ends, not a ring: wrapping from the last row
+/// to the first would move the selection the length of the table on a key that means "one
+/// further down", and `k` composes a `kill` for whatever is selected — so a surprise jump
+/// here is not merely disorienting. An empty table pins the selection at 0.
+fn ps_step(sel: usize, n: usize, page: usize, step: PsStep) -> usize {
+    let last = n.saturating_sub(1);
+    // One clamp, at the end, rather than a `.min(last)` per downward arm as well: the
+    // trailing one subsumes those, and a guard whose removal no test can observe is
+    // decoration. It also catches a selection left over from a longer table, which a
+    // per-arm clamp on the downward steps alone would not.
+    match step {
+        PsStep::Up => sel.saturating_sub(1),
+        PsStep::Down => sel + 1,
+        PsStep::PageUp => sel.saturating_sub(page),
+        PsStep::PageDown => sel + page,
+        PsStep::First => 0,
+        PsStep::Last => last,
+    }
+    .min(last)
+}
+
+/// The smallest window start that keeps `sel` visible, given the window currently starts at
+/// `start` and shows `visible` rows of `total`.
+///
+/// Minimal scroll rather than the inspector's recentring: this table runs to hundreds of
+/// rows and is read by scanning, so a view that jumps by half a screen on every arrow key
+/// loses the reader's place. The window therefore moves only when the selection would
+/// otherwise leave it, and then by exactly enough.
+fn scroll_into_view(sel: usize, start: usize, visible: usize, total: usize) -> usize {
+    if visible == 0 || total == 0 {
+        return 0;
+    }
+    // Never leave a gap at the bottom when there are rows above that could fill it.
+    // Clamping the *incoming* start is what does the work: a window left beyond the end
+    // by a resize or a shorter result set must be pulled back, or the last page shows a
+    // gap. The outgoing value needs no clamp of its own — `sel + 1 - visible` is at most
+    // `total - visible`, and the `sel < start` branch is below a start already clamped.
+    let max_start = total.saturating_sub(visible);
+    let start = start.min(max_start);
+    if sel < start {
+        sel
+    } else if sel >= start + visible {
+        sel + 1 - visible
+    } else {
+        start
+    }
+}
+
+/// Where the selected row lands after the display order changes — its position in `order`,
+/// or 0 if it is no longer there.
+///
+/// `ps_sel` is a position in the *displayed* order, not a row identity, and `c`/`m`/`p`
+/// reorder the whole table without re-running `ps`. Holding the position across a re-sort
+/// would silently move the selection to a different process: the same defect the disk-usage
+/// marker had across a relayout (spec-du-rings.md §5), and worse here, because `k` composes
+/// a `kill` for whatever is selected and `y` copies its pid.
+fn ps_resel(order: &[usize], row: Option<usize>) -> usize {
+    let Some(row) = row else { return 0 };
+    order.iter().position(|&i| i == row).unwrap_or(0)
+}
+
 /// Shell-quote a `cd` argument (spec-cd-tree-picker.md §5): a "safe" path (only characters
 /// that never need quoting) passes through; anything else is single-quoted with embedded
 /// single quotes escaped as `'\''`. Purely for composing text at the prompt — never run.
@@ -7856,31 +7935,48 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         }
     }
 
-    /// `y`/`Y` — copy the selected row's PID, or its full (untruncated) command line.
-    fn ps_copy_selected(&mut self, full_command: bool) {
-        let text = if let Some(PsView::Table(q)) = self.ps_view.as_ref() {
+    /// Index into `q.rows` of whatever the selection is on, in whichever layout is live.
+    ///
+    /// The two layouts index different things — the inspector's `ps_sel` is a position in
+    /// the visual-line list (headers included, so it can be on no row at all), the flat
+    /// table's is a position in the live sort order — and everything that acts on the
+    /// selection goes through here so the two can never be confused for one another.
+    fn ps_selected_row(&self) -> Option<usize> {
+        let Some(PsView::Table(q)) = self.ps_view.as_ref() else {
+            return None;
+        };
+        if self.ps_is_inspector() {
             match self.ps_vlines_for(q).get(self.ps_sel).copied() {
-                Some(PsVLine::Row(_, ri)) => q.rows.get(ri).map(|r| {
-                    if full_command { r.command.clone() } else { r.pid.clone() }
-                }),
-                _ => None,
+                Some(PsVLine::Row(_, ri)) => Some(ri),
+                _ => None, // a group header selects no process
             }
         } else {
-            None
-        };
+            ps_sort_order(&q.rows, self.ps_sort).get(self.ps_sel).copied()
+        }
+    }
+
+    /// `y`/`Y` — copy the selected row's PID, or its full (untruncated) command line.
+    fn ps_copy_selected(&mut self, full_command: bool) {
+        let text = self.ps_selected_row().and_then(|ri| {
+            let Some(PsView::Table(q)) = self.ps_view.as_ref() else {
+                return None;
+            };
+            q.rows
+                .get(ri)
+                .map(|r| if full_command { r.command.clone() } else { r.pid.clone() })
+        });
         if let (Some(text), Some(clip)) = (text, self.clipboard.as_mut()) {
             let _ = clip.set_text(text);
         }
     }
 
-    /// The selected row's pid, if the selection is a row (not a group header).
+    /// The selected row's pid, if the selection is on a row (not a group header).
     fn ps_selected_pid(&self) -> Option<u32> {
-        if let Some(PsView::Table(q)) = self.ps_view.as_ref() {
-            if let Some(PsVLine::Row(_, ri)) = self.ps_vlines_for(q).get(self.ps_sel).copied() {
-                return q.rows.get(ri).and_then(|r| r.pid.parse::<u32>().ok());
-            }
-        }
-        None
+        let ri = self.ps_selected_row()?;
+        let Some(PsView::Table(q)) = self.ps_view.as_ref() else {
+            return None;
+        };
+        q.rows.get(ri).and_then(|r| r.pid.parse::<u32>().ok())
     }
 
     fn ps_key(&mut self, key: &Key) {
@@ -7888,46 +7984,89 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             self.ps_inspector_key(key);
             return;
         }
-        let page = PS_VISIBLE.saturating_sub(1).max(1);
+        let page = PS_VISIBLE.saturating_sub(2).max(1);
+        let step = match key {
+            Key::Named(NamedKey::ArrowDown) => Some(PsStep::Down),
+            Key::Named(NamedKey::ArrowUp) => Some(PsStep::Up),
+            Key::Named(NamedKey::PageDown) => Some(PsStep::PageDown),
+            Key::Named(NamedKey::PageUp) => Some(PsStep::PageUp),
+            Key::Named(NamedKey::Home) => Some(PsStep::First),
+            Key::Named(NamedKey::End) => Some(PsStep::Last),
+            // `j` moves down, as it does in the inspector. There is deliberately no `k`
+            // for "up": `k` signals, and a key that kills must not be one a vim reflex
+            // reaches for while scrolling.
+            Key::Character(c) if c.as_str() == "j" => Some(PsStep::Down),
+            _ => None,
+        };
+        if let Some(step) = step {
+            self.ps_move(step, page);
+            return;
+        }
         match key {
             Key::Named(NamedKey::Escape) => self.ps_close(),
-            Key::Named(NamedKey::ArrowDown) => self.ps_scroll_by(1, true),
-            Key::Named(NamedKey::ArrowUp) => self.ps_scroll_by(1, false),
-            Key::Named(NamedKey::PageDown) => self.ps_scroll_by(page, true),
-            Key::Named(NamedKey::PageUp) => self.ps_scroll_by(page, false),
-            Key::Named(NamedKey::Home) => {
-                self.ps_scroll = 0;
-                self.request_redraw();
-            }
-            // Live sort (1b): re-order without re-running. Toggling a key back to itself
-            // restores the printed `ps` order.
-            Key::Character(s) if self.ps_has_bars() => {
-                let next = match s.as_str() {
-                    "c" | "C" => PsSort::Cpu,
-                    "m" | "M" => PsSort::Mem,
-                    "p" | "P" => PsSort::Pid,
-                    _ => return,
-                };
-                self.ps_sort = if self.ps_sort == next { PsSort::Order } else { next };
-                self.ps_scroll = 0;
-                self.request_redraw();
-            }
+            Key::Character(c) => match c.as_str() {
+                // Same three as the inspector (spec §6), so the keys do not change
+                // meaning when a window resize steps the level up or down.
+                "y" => self.ps_copy_selected(false),
+                "Y" => self.ps_copy_selected(true),
+                "k" => self.ps_signal_kill(),
+                "q" => self.ps_close(),
+                // Live sort (1b): re-order without re-running. Toggling a key back to
+                // itself restores the printed `ps` order.
+                "c" | "C" | "m" | "M" | "p" | "P" if self.ps_has_bars() => {
+                    let next = match c.as_str() {
+                        "c" | "C" => PsSort::Cpu,
+                        "m" | "M" => PsSort::Mem,
+                        _ => PsSort::Pid,
+                    };
+                    self.ps_resort(if self.ps_sort == next { PsSort::Order } else { next });
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
 
-    fn ps_scroll_by(&mut self, delta: usize, down: bool) {
-        // Scroll span = data rows + the optional kernel-summary line (the header is pinned).
-        let scrollable = match self.ps_view.as_ref() {
-            Some(PsView::Table(q)) => q.rows.len() + usize::from(q.kernel_summary().is_some()),
+    /// Move the flat table's selection and scroll only as far as it takes to keep it in
+    /// view (spec §5).
+    fn ps_move(&mut self, step: PsStep, page: usize) {
+        let rows = match self.ps_view.as_ref() {
+            Some(PsView::Table(q)) => q.rows.len(),
             _ => 0,
         };
-        let max = scrollable.saturating_sub(1);
-        self.ps_scroll = if down {
-            (self.ps_scroll + delta).min(max)
-        } else {
-            self.ps_scroll.saturating_sub(delta)
+        // The folded-kernel summary is a stop, not a process. Stepping has to reach it or
+        // it becomes unreachable — it sits below the last row, so a selection that stopped
+        // at the last *process* would pin the window one line short of it forever, and the
+        // line states its own count and how to unfold it (spec §4). Landing on it selects
+        // no process, so `y`/`k` do nothing there, exactly as on a group header in 1c.
+        let total = rows + usize::from(self.ps_kernel_line());
+        self.ps_sel = ps_step(self.ps_sel, total, page, step);
+        self.ps_scroll =
+            scroll_into_view(self.ps_sel, self.ps_scroll, PS_VISIBLE.saturating_sub(1), total);
+        self.request_redraw();
+    }
+
+    /// Whether the table carries a folded-kernel summary line under the rows.
+    fn ps_kernel_line(&self) -> bool {
+        matches!(self.ps_view.as_ref(), Some(PsView::Table(q)) if q.kernel_summary().is_some())
+    }
+
+    /// Switch the live sort, carrying the selection with the process it was on rather than
+    /// leaving it on whatever row inherits the position (spec §5).
+    fn ps_resort(&mut self, sort: PsSort) {
+        let row = self.ps_selected_row();
+        // The kernel summary is the last line whatever the sort, so a selection resting on
+        // it stays there rather than being thrown to the top by `ps_resel`'s "gone" case.
+        let on_summary = row.is_none() && self.ps_kernel_line();
+        self.ps_sort = sort;
+        let order = match self.ps_view.as_ref() {
+            Some(PsView::Table(q)) => ps_sort_order(&q.rows, self.ps_sort),
+            _ => Vec::new(),
         };
+        self.ps_sel = if on_summary { order.len() } else { ps_resel(&order, row) };
+        let total = order.len() + usize::from(self.ps_kernel_line());
+        self.ps_scroll =
+            scroll_into_view(self.ps_sel, self.ps_scroll, PS_VISIBLE.saturating_sub(1), total);
         self.request_redraw();
     }
 
@@ -7959,14 +8098,15 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         w_user = w_user.min(12);
         // Each bar (level 1b) adds its 8 cells + a leading space after the percentage.
         let bar_w = if bars { sampa_ps_decorate::BAR_CELLS + 1 } else { 0 };
+        // `+ 2` for the selection caret column, which every line now carries.
         let fixed =
-            w_pid + 1 + w_user + 1 + w_cpu + bar_w + 1 + w_mem + bar_w + 1 + w_rss + 1 + w_start + 1;
+            2 + w_pid + 1 + w_user + 1 + w_cpu + bar_w + 1 + w_mem + bar_w + 1 + w_rss + 1 + w_start + 1;
         let cmd_budget = (self.cols as usize).saturating_sub(fixed).max(8);
 
         // Pinned column header (muted, bold). The bar columns are unlabelled spacers.
         let gap = |on: bool| if on { format!(" {:bw$}", "", bw = sampa_ps_decorate::BAR_CELLS) } else { String::new() };
         let header = format!(
-            "{:>wp$} {:<wu$} {:>wc$}{cb} {:>wm$}{mb} {:>wr$} {:<ws$} COMMAND",
+            "  {:>wp$} {:<wu$} {:>wc$}{cb} {:>wm$}{mb} {:>wr$} {:<ws$} COMMAND",
             "PID", "USER", "%CPU", "%MEM", "RSS", "START",
             wp = w_pid, wu = w_user, wc = w_cpu, wm = w_mem, wr = w_rss, ws = w_start,
             cb = gap(bars), mb = gap(bars),
@@ -7980,15 +8120,24 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let order = ps_sort_order(&q.rows, self.ps_sort);
 
         // One `Vec<BodySpan>` per data line (rows in display order, then the summary).
+        let accent = self.theme.cursor;
         let mut rows: Vec<Vec<BodySpan>> = Vec::with_capacity(q.rows.len() + 1);
-        for &i in &order {
+        for (pos, &i) in order.iter().enumerate() {
             let r = &q.rows[i];
             let user = truncate_chars(&r.user, w_user);
             let cmd = truncate_chars(&r.command, cmd_budget);
             let cpu_c = heat_band(r.cpu_val, r.cpu == "–", no_color, fg, muted);
             let mem_c = heat_band(r.mem_val, r.mem == "–", no_color, fg, muted);
+            // The caret is the only mark of the selection here: the flat table is plain
+            // text that survives a copy (spec §4), so the row is not given a background.
+            let selected = pos == self.ps_sel;
+            let caret = if selected { "❯ " } else { "  " };
+            let name_c = if selected { accent } else { fg };
             let mut line: Vec<BodySpan> = vec![
-                (format!("{:>wp$} {:<wu$} ", r.pid, user, wp = w_pid, wu = w_user), fg, false, false),
+                (
+                    format!("{caret}{:>wp$} {:<wu$} ", r.pid, user, wp = w_pid, wu = w_user),
+                    name_c, false, false,
+                ),
                 (format!("{:>wc$}", r.cpu, wc = w_cpu), cpu_c, false, false),
             ];
             if let Some(bp) = &bar_pairs {
@@ -8006,13 +8155,17 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             rows.push(line);
         }
         if let Some(sum) = q.kernel_summary() {
-            rows.push(vec![(sum, muted, false, true)]);
+            let caret = if self.ps_sel == order.len() { "❯ " } else { "  " };
+            rows.push(vec![(format!("{caret}{sum}"), muted, false, true)]);
         }
 
         // Scroll window over the data rows; the header line is always shown on top.
         let total = rows.len();
-        let start = self.ps_scroll.min(total.saturating_sub(1));
-        let end = (start + visible.saturating_sub(1)).min(total);
+        let rows_shown = visible.saturating_sub(1);
+        // The same rule the arrow keys apply, so a resize that shrinks the panel pulls the
+        // selection back into view instead of leaving the caret off-screen.
+        let start = scroll_into_view(self.ps_sel, self.ps_scroll, rows_shown, total);
+        let end = (start + rows_shown).min(total);
 
         let mut spans: Vec<BodySpan> = vec![(header, muted, true, false)];
         for line in &rows[start..end] {
@@ -8034,12 +8187,12 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             let cpu_sum: f32 = q.rows.iter().map(|r| r.cpu_val).sum();
             let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1);
             format!(
-                "ps aux — {} proc{} · CPU {:.1}% of {}%   {}   ·  c/m/p sort ({}) · Esc",
+                "ps aux — {} proc{} · CPU {:.1}% of {}%   {}   ·  ↑↓ select · y/Y copy · k kill · c/m/p sort ({}) · Esc",
                 n, kernel, cpu_sum, cores * 100, readout, self.ps_sort.label(),
             )
         } else {
             format!(
-                "ps aux — {} process{}{}   {}   ·  ↑/↓ PgUp/PgDn · Esc",
+                "ps aux — {} process{}{}   {}   ·  ↑↓ select · y/Y copy · k kill · Esc",
                 n, if n == 1 { "" } else { "es" }, kernel, readout,
             )
         };
@@ -15126,6 +15279,140 @@ mod tests {
         assert_eq!(ps_sort_order(&rows, PsSort::Cpu), vec![1, 0, 2]); // 9,5,1
         assert_eq!(ps_sort_order(&rows, PsSort::Mem), vec![2, 0, 1]); // 8,2,1
         assert_eq!(ps_sort_order(&rows, PsSort::Pid), vec![1, 2, 0]); // 10,20,30
+    }
+
+    /// A `QuietRow`, for the flat-table selection tests.
+    fn ps_row(pid: &str, cpu: f32, mem: f32) -> sampa_ps_decorate::QuietRow {
+        sampa_ps_decorate::QuietRow {
+            pid: pid.to_string(),
+            user: "u".into(),
+            cpu: "–".into(),
+            mem: "–".into(),
+            rss: "–".into(),
+            rss_kb: 0,
+            start: "12:03".into(),
+            command: "c".into(),
+            cpu_val: cpu,
+            mem_val: mem,
+        }
+    }
+
+    #[test]
+    fn the_flat_selection_stops_at_both_ends() {
+        // No wrapping: a table is a list with two ends, not a ring. `k` composes a `kill`
+        // for whatever is selected, so a key meaning "one further down" must never move
+        // the selection the length of the table.
+        let n = 5;
+        let page = 3;
+        assert_eq!(ps_step(0, n, page, PsStep::Up), 0, "up from the top stays");
+        assert_eq!(ps_step(4, n, page, PsStep::Down), 4, "down from the bottom stays");
+        assert_eq!(ps_step(0, n, page, PsStep::PageUp), 0);
+        assert_eq!(ps_step(4, n, page, PsStep::PageDown), 4);
+
+        assert_eq!(ps_step(2, n, page, PsStep::Up), 1);
+        assert_eq!(ps_step(2, n, page, PsStep::Down), 3);
+        assert_eq!(ps_step(3, n, page, PsStep::PageUp), 0, "a short page clamps, not wraps");
+        assert_eq!(ps_step(1, n, page, PsStep::PageDown), 4);
+        assert_eq!(ps_step(2, n, page, PsStep::First), 0);
+        assert_eq!(ps_step(2, n, page, PsStep::Last), 4);
+
+        // An empty table has no row to select, and a stale selection left over from a
+        // longer one is pulled back in range rather than indexing past the end.
+        for step in [PsStep::Up, PsStep::Down, PsStep::PageUp, PsStep::PageDown, PsStep::First, PsStep::Last] {
+            assert_eq!(ps_step(0, 0, page, step), 0, "{step:?} on an empty table");
+            // Whatever the step means, it lands on a row that exists — a selection left
+            // over from a longer table never indexes past the end of a shorter one.
+            assert!(ps_step(99, n, page, step) < n, "{step:?} from a stale selection");
+        }
+        // `Up` from a stale selection is the one that needs the final clamp: 99 - 1 is
+        // still past the end, so without it the caret would point at nothing.
+        assert_eq!(ps_step(99, n, page, PsStep::Up), 4);
+    }
+
+    #[test]
+    fn the_window_moves_only_as_far_as_it_must() {
+        // Minimal scroll, not recentring: this table runs to hundreds of rows and is read
+        // by scanning, so the view must not jump half a screen on every arrow key.
+        let (visible, total) = (10, 100);
+        assert_eq!(scroll_into_view(5, 0, visible, total), 0, "already in view — do not move");
+        assert_eq!(scroll_into_view(9, 0, visible, total), 0, "the last visible row is in view");
+        assert_eq!(scroll_into_view(10, 0, visible, total), 1, "one past the end scrolls by one");
+        assert_eq!(scroll_into_view(11, 1, visible, total), 2);
+        assert_eq!(scroll_into_view(4, 10, visible, total), 4, "scrolling back shows it at the top");
+        assert_eq!(scroll_into_view(50, 0, visible, total), 41, "a jump shows it at the bottom");
+
+        // Never a gap at the bottom: the last page is full even when the selection is the
+        // very last row, and a window start left beyond the end is pulled back.
+        assert_eq!(scroll_into_view(99, 0, visible, total), 90);
+        assert_eq!(scroll_into_view(99, 95, visible, total), 90);
+        assert_eq!(scroll_into_view(0, 95, visible, total), 0);
+
+        // Degenerate shapes answer 0 rather than panicking on the subtraction.
+        assert_eq!(scroll_into_view(0, 0, 0, total), 0);
+        assert_eq!(scroll_into_view(0, 0, visible, 0), 0);
+        assert_eq!(scroll_into_view(3, 0, visible, 4), 0, "fewer rows than the window");
+    }
+
+    #[test]
+    fn a_re_sort_carries_the_selection_with_its_process() {
+        // The defect this guards: `ps_sel` is a position in the *displayed* order, and
+        // `c`/`m`/`p` reorder the table without re-running `ps`. Holding the position
+        // across a re-sort leaves the selection on a different process — and `k` composes
+        // a `kill` for whatever is selected, `y` copies its pid. Same shape as the
+        // disk-usage marker drifting across a relayout.
+        let rows = vec![ps_row("30", 5.0, 2.0), ps_row("10", 9.0, 1.0), ps_row("20", 1.0, 8.0)];
+
+        // Printed order; the user selects position 2, which is pid 20.
+        let printed = ps_sort_order(&rows, PsSort::Order);
+        let sel = 2usize;
+        let picked = printed[sel];
+        assert_eq!(rows[picked].pid, "20");
+
+        // Sort by CPU: pid 20 is the slowest, so it is still last here — pick a sort that
+        // actually moves it, or the test proves nothing.
+        let by_mem = ps_sort_order(&rows, PsSort::Mem); // 8, 2, 1 -> pid 20, 30, 10
+        assert_ne!(by_mem[sel], picked, "the position must genuinely come to mean another process");
+        assert_eq!(rows[by_mem[sel]].pid, "10", "holding the position would select pid 10");
+
+        let moved = ps_resel(&by_mem, Some(picked));
+        assert_eq!(moved, 0);
+        assert_eq!(rows[by_mem[moved]].pid, "20", "still on the process the user chose");
+
+        // And back again, by the same route.
+        let back = ps_sort_order(&rows, PsSort::Order);
+        assert_eq!(rows[back[ps_resel(&back, Some(picked))]].pid, "20");
+
+        // Nothing selected (a group header in the inspector, or an empty table) lands on
+        // the first row rather than leaving a stale index behind.
+        assert_eq!(ps_resel(&by_mem, None), 0);
+        assert_eq!(ps_resel(&by_mem, Some(99)), 0, "a row that is gone drops to the top");
+        assert_eq!(ps_resel(&[], Some(0)), 0);
+    }
+
+    #[test]
+    fn the_kernel_summary_is_the_last_stop_and_selects_no_process() {
+        // The summary sits below the last row and states how many kernel threads were
+        // folded and how to unfold them (spec §4). A selection that stopped at the last
+        // *process* would pin the window one line short of it, making it unreachable —
+        // which is how this was caught: `End` showed `505-521/522` with line 522 off
+        // screen and no key able to reach it.
+        let rows = 3;
+        let total = rows + 1; // three processes, then the summary
+        let page = 2;
+        assert_eq!(ps_step(0, total, page, PsStep::Last), 3, "End reaches the summary");
+        assert_eq!(ps_step(2, total, page, PsStep::Down), 3);
+        assert_eq!(ps_step(3, total, page, PsStep::Down), 3, "and stops there");
+        assert_eq!(ps_step(3, total, page, PsStep::Up), 2, "and steps back off it");
+
+        // Without a summary line the last row is the last stop.
+        assert_eq!(ps_step(0, rows, page, PsStep::Last), 2);
+
+        // Landing on it selects no process: the flat lookup is `order.get(sel)`, and the
+        // summary's index is one past the end of the order, so `y`/`Y`/`k` find nothing
+        // to act on — the same answer a group header gives in the 1c inspector.
+        let order = vec![2usize, 0, 1];
+        assert_eq!(order.get(3).copied(), None, "the summary indexes past the order");
+        assert_eq!(order.get(2).copied(), Some(1), "the last row still resolves");
     }
 
     #[test]
