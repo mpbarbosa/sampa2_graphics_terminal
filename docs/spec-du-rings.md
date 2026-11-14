@@ -95,8 +95,18 @@ the marker back.
 Stepping is computed from the layout alone (`arc_step`), not from stored tree state: a ring
 is the set of sectors sharing an `r0`, and because one ring's sectors tile their parent's
 sweep exactly, "the sector below this one" is the one in the next ring out whose sweep
-contains the current sector's mid-angle. So a relayout — a resize, or one of the mid-scan
-updates in §3 — cannot leave the marker describing a tree that is no longer on screen.
+contains the current sector's mid-angle.
+
+**The marker itself is re-pointed by identity after every relayout**, which the stepper
+being stateless does *not* give you for free. It is held as an index into the laid-out
+sectors, and §3's progressive scan rebuilds those four times a second: a directory that
+finishes its walk overtakes its siblings, every later sector shifts along, and the index
+that named `.config` comes to name `Documents` — in range, and quietly meaning something
+else. Observed on 0.17.0: a marker left alone for nine seconds mid-scan moved on its own,
+and `Enter` would have composed a `cd` to the wrong directory. So `du_relayout` reads what
+the marker names *before* dropping the old sectors and finds it again in the new ones, by
+path plus whether it is the `(files here)` remainder — which shares its parent's path and
+is otherwise indistinguishable from it. A sector that is genuinely gone drops the marker.
 
 The two end-stops differ deliberately. `↑` from the innermost ring **drops the marker**, so
 the strip reads the whole view again; `↓` from the outermost ring, or out of `(files
