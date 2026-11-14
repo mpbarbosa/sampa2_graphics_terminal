@@ -75,14 +75,36 @@ which is asserted by a test rather than assumed.
 |---|---|
 | Hover a sector | Its **full path and size** in the strip (see §6) |
 | Click a sector | **Zoom** to that directory — from any ring, descending every level between in one step |
+| `←` / `→` | Move the marker **along the current ring**, wrapping at 12 o'clock |
+| `↑` / `↓` | Move it **across rings** — in toward the hub, or out into the sector below this one |
+| `Space` | **Zoom** to the marked sector — the keyboard's click |
 | `Backspace` | Up one level |
 | `t` | Swap to the treemap (and back) |
-| `Enter` | **`cd` to the directory in view** — composed at the prompt, never run |
+| `Enter` | **`cd`** — to the marked sector if there is one, else to the directory in view; composed at the prompt, never run |
 | `Esc` | Close |
 
 Clicking an outer ring descends several levels at once: each sector carries its whole
 child-index path from the view node, which is the navigational advantage of showing the
 hierarchy. Clicking `(files here)`, or a directory with no children, does nothing.
+
+**The pointer and the arrows share one marker**, so the strip never has two things to read
+out and `Enter` never has two directories to choose between. Arrowing away from a hovered
+sector continues from where the pointer left off; moving the pointer onto a sector takes
+the marker back.
+
+Stepping is computed from the layout alone (`arc_step`), not from stored tree state: a ring
+is the set of sectors sharing an `r0`, and because one ring's sectors tile their parent's
+sweep exactly, "the sector below this one" is the one in the next ring out whose sweep
+contains the current sector's mid-angle. So a relayout — a resize, or one of the mid-scan
+updates in §3 — cannot leave the marker describing a tree that is no longer on screen.
+
+The two end-stops differ deliberately. `↑` from the innermost ring **drops the marker**, so
+the strip reads the whole view again; `↓` from the outermost ring, or out of `(files
+here)`, **leaves it where it is** rather than silently losing it. Along a ring there is no
+end-stop at all: a ring is a circle, and stopping at the 12 o'clock seam would strand the
+sectors either side of it.
+
+Rings only. The treemap shows one level at a time and is navigated by clicking into it.
 
 ## 6. Labels, and why there is a hover readout
 
@@ -125,6 +147,5 @@ most sunburst UIs behave too, for the same reason.
 A sibling of [spec-du-treemap.md](spec-du-treemap.md), which owns the scan, the tree, the
 zoom stack and the `cd` composition this view reuses verbatim; see
 [spec-enhance-views.md](spec-enhance-views.md) for how `du` is dispatched among the enhance
-views. The progressive scan recorded here as a follow-up is **implemented** (§3). Remaining
-follow-up: keyboard focus within the rings (arrow keys along and across bands) so the view
-is navigable without a pointer.
+views. Both follow-ups recorded here are now **implemented**: the progressive scan (§3) and
+keyboard navigation within the rings (§5).
