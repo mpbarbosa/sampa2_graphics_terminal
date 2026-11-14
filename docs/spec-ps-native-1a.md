@@ -167,7 +167,8 @@ documented 1a/1b/1c interaction is now implemented.)
    `←`/`→`/Enter; a moving selection (`↑`/`↓`/`j`, PgUp/PgDn) drives a detail pane fed by a
    read-only `ps -o … -p <pid>` enrich query (`parse_enrich`: ppid, threads, full state,
    elapsed); `k` composes `kill <pid>` at the prompt (insert-never-run), `y`/`Y` copy the
-   pid / full command, and `/` incrementally filters on command/user (hides non-matching
+   pid / the command as `ps` printed it (spec-ps-output-enhancement.md §5 — the scrape
+   carries `ps`'s own width truncation), and `/` incrementally filters on command/user (hides non-matching
    groups, ignores collapse so matches always show; Enter applies, Esc clears then closes).
    (The spec's key table lists `k` for both move and kill — resolved toward the kill signal:
    `↑`/`↓`/`j` move, `k` kills.) Fixing this surfaced a core `classify` bug — keyword tables

@@ -123,13 +123,30 @@ also the one where nothing could be done with a row.
 | `↑ ↓` / `j` | Move the selection (`j` down; **no** `k` for up — `k` signals) |
 | `PgUp` `PgDn` | Move a page |
 | `Home` `End` | First / last row |
-| `y` / `Y` | Copy PID / copy full command line |
+| `y` / `Y` | Copy PID / copy the command as `ps` printed it (see below) |
 | `k` | **Signal** — writes `kill <pid>` to the prompt, **never executes it** |
 | `c` / `m` / `p` | Live sort (1b only) |
 | `q` / `Esc` | Close the panel |
 
 `y`, `Y`, `k` and `q` are the same four the inspector binds, so a window resize that steps
 the level up or down never changes what a key does.
+
+**`Y` copies the command as `ps` printed it — which is not necessarily the whole command
+line.** Everything in this panel is a decoration of text already in the scrollback, and
+`ps aux` truncates `COMMAND` to the terminal width *itself*, when it ran. Characters `ps`
+never wrote are not in the buffer and cannot be recovered by reading it, so `Y` on a
+process started as `/usr/lib/systemd/systemd --switched-root --system` may yield
+`/usr/lib/systemd/systemd --s`.
+
+In practice **what you copy is what you see**, and that is the arithmetic rather than a
+coincidence: the panel drops `VSZ`, `TTY` and `TIME`, so its `COMMAND` column is about 25
+columns wider than what `ps aux` leaves — the scraped string nearly always fits the cell
+whole. The two can differ only when the panel is narrower than the terminal that produced
+the block, and then it is the *cell* that is short, not the copy. Do not read `Y` as a way
+of recovering more than the row shows.
+
+For the actual command line, `ps -p <pid> -o args=` — which is what the pid from `y` is
+for.
 
 **The selection is a caret in the first column**, not a highlighted row: 1a's promise is
 that the output is plain text, and a background would not survive a copy while `❯ ` does.
@@ -160,16 +177,19 @@ above and below stays ordinary text; only this command's block becomes interacti
   derived from the process tree and executable path, each with a CPU and RSS subtotal. A
   flat list of 300 becomes six things a developer recognises; the subtotal answers "what is
   my machine actually doing" at the group level.
-- **Detail pane.** Selecting a row shows PPID, full state, thread count, TTY, absolute
-  start time with elapsed duration, and the untruncated command line — the fields a
-  developer otherwise reaches for a second command to get.
+- **Detail pane.** Selecting a row shows PPID, full state, thread count, and elapsed
+  duration — the fields a developer otherwise reaches for a second command to get. They
+  come from a supplementary read-only `ps -o pid=,ppid=,nlwp=,stat=,etimes= -p <pid>`
+  keyed on the row's PID. The command line it shows alongside them is the scraped one, and
+  carries the same truncation as everything else here (§5) — the enrich query does not ask
+  for `args`, so there is no second source for it.
 
 | Key | Action |
 |---|---|
 | `↑ ↓` / `j` | Move selection (`j` down; there is **no** `k` for up — `k` signals) |
 | `← →` / `h l` | Collapse / expand a group |
 | `/` | Incremental filter on command and user |
-| `y` / `Y` | Copy PID / copy full command line |
+| `y` / `Y` | Copy PID / copy the command as `ps` printed it (§5) |
 | `k` | **Signal** — writes `kill <pid>` to the prompt, **never executes it** |
 | `q` / `Esc` | Freeze the block back to static text |
 
