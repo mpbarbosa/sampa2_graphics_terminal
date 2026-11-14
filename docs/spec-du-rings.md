@@ -31,14 +31,22 @@ It is the same read-only view as the treemap: the one side effect it offers is c
 
 ## 3. Scanning
 
-Unchanged — the same read-only, 90 s-timeout-bounded `du -k -x --max-depth=4 <cwd>` on a
-background thread, parsed by `sampa_dumap::parse_du` into the same `DuNode` tree
-(spec-du-treemap.md §3). **Nothing extra is scanned to draw the rings**; they are a second
-reading of the data the treemap already had.
+Unchanged — the same read-only `du -k -x --max-depth=4 <cwd>` on a background thread, now
+**streamed into the view as it arrives** (spec-du-treemap.md §3). **Nothing extra is
+scanned to draw the rings**; they are a second reading of the data the treemap already had.
 
-Because the scan completes before anything is drawn, the rings appear **all at once** (or
-the view shows a timeout message). They do not fill in progressively the way a dedicated
-analyser such as `baobab`, which walks the filesystem itself, can.
+So the rings **do** fill in progressively, the way a dedicated analyser such as `baobab`
+does — the bands appear within a second or so and thicken as rows land, with the breadcrumb
+showing `scanning… N dirs` until the walk ends. Sizes are lower bounds while that count is
+moving: a sector can only grow, and the ring it sits in can only gain neighbours.
+
+The tree is built by `DuBuild` rather than `sampa_dumap::parse_du`, which infers the root
+from the rows it is given. Mid-scan that inference lands four levels down, because `du`
+prints children before parents — so the partial view would be rooted in the wrong place and
+re-root itself repeatedly. `DuBuild` is told the root up front (it is the cwd being
+scanned) and links each row to it through every ancestor immediately, so a subtree is
+visible while it is still being walked. The finished tree is identical to the parser's,
+which is asserted by a test rather than assumed.
 
 ## 4. The rings
 
@@ -117,6 +125,6 @@ most sunburst UIs behave too, for the same reason.
 A sibling of [spec-du-treemap.md](spec-du-treemap.md), which owns the scan, the tree, the
 zoom stack and the `cd` composition this view reuses verbatim; see
 [spec-enhance-views.md](spec-enhance-views.md) for how `du` is dispatched among the enhance
-views. Possible follow-ups: a progressive scan so deep trees fill in rather than waiting on
-the whole `du`, and keyboard focus within the rings (arrow keys along and across bands) so
-the view is navigable without a pointer.
+views. The progressive scan recorded here as a follow-up is **implemented** (§3). Remaining
+follow-up: keyboard focus within the rings (arrow keys along and across bands) so the view
+is navigable without a pointer.

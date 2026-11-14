@@ -1,7 +1,7 @@
 # Spec — `du` disk-usage treemap
 
 - **Status (this native/Path C build):** **implemented.** Typed `du` + `Ctrl+Shift+D`
-  scans the session cwd with a read-only, 90s-timeout-bounded `du -k -x --max-depth=4` on a
+  scans the session cwd with a read-only, progressively-streamed `du -k -x --max-depth=4` on a
   background thread (`run_du`), parses it with `sampa_dumap::parse_du`, and draws a
   **squarified treemap** (native `squarify`) as coloured, labelled quads over the grid — a
   breadcrumb strip on top, click-to-zoom, `Backspace` up a level, `Enter` composes `cd
@@ -39,11 +39,18 @@ DESIGN.md §10.1 / §13).
   `du -k -x --max-depth=4 <cwd>`: kibibytes (portable), one filesystem (`-x`, so it doesn't
   wander into mounts), depth-capped to bound the output.
 - **`du` traverses the whole subtree and can be slow**, so it runs off the UI/async thread
-  with a **wall-clock timeout** (`DU_TIMEOUT_SECS`, 90 s — six was too tight to be useful: `du`
-  prints nothing until it has walked the whole subtree, so the budget is the real limit on
-  what the view can show, and a 132 GB `$HOME` measured 67 s);
-  on expiry the child is killed and the overlay
-  shows a short message. Nothing is retried automatically.
+  and its output is **streamed into the view as it arrives**. `du` prints each directory as
+  it finishes it — measured on a 142 GB `$HOME`, 10 924 rows spread evenly across 91 s: 11 %
+  of them within 9 s — so the overlay builds a tree from the rows it has and redraws every
+  `DU_PROGRESS_MS` (250 ms). Something is on screen about a second in, and the breadcrumb
+  says `scanning… N dirs` while sizes are still rising.
+- A directory whose own row has not arrived is sized by the children that have: a **lower
+  bound that only rises**, never a number that jumps around. The strip's total is therefore
+  "so far", not the answer, until the count stops.
+- `DU_TIMEOUT_SECS` (600 s) is now only a **backstop** against a `du` wedged on a dead
+  mount, not the limit on what the view can show. If it fires, whatever arrived is kept and
+  the strip says the view is partial. Closing the overlay or re-scanning **kills the child**
+  rather than leaving it walking a large tree unseen. Nothing is retried automatically.
 - `du` only stats the filesystem — no writes, and the path is never interpolated into a
   shell.
 
@@ -80,8 +87,12 @@ picker, and AI features all honor.
   builds the size-aggregated tree (children sorted largest-first) and **fails safe to
   `None`** on malformed input (no tab / non-numeric size), mirroring `ps-decorate`. Pure
   `std` + serde — **no shell, no Tauri**. Tested against sample and real `du` output.
-- **Bridge** — `run_du(path)` runs the read-only, timeout-bounded `du` off the async runtime
-  (`spawn_blocking`; child killed on expiry) and returns the parsed tree.
+- **Bridge** — in this native build, `stream_du(cwd, gen, …)` owns the child on its own
+  thread and posts `DuProgress` every 250 ms, `DuReady` at the end, or `DuTruncated` at the
+  backstop. A reader thread owns the pipe so the budget holds even if `du` stops printing,
+  and `DuBuild` turns rows into the tree from a root known up front (the parser infers one,
+  which only works on complete output). The web build's `run_du(path)` remains the
+  batch form: `spawn_blocking`, child killed on expiry, parsed tree returned.
 - **Frontend** — the `#dumap` SVG overlay owns the squarify layout, the zoom stack +
   breadcrumb, and the compose-and-insert step. Directory names reach the DOM via
   `textContent` only.

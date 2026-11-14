@@ -47,7 +47,7 @@ use glyphon::{
 use pty_core::pty::{spawn, PtyEvent, PtyHandle, SpawnConfig};
 use sampa_config::CursorStyle;
 use sampa_dfdec::{parse_df, FsUsage};
-use sampa_dumap::{parse_du, DuNode};
+use sampa_dumap::DuNode;
 use sampa_freemem::{parse_free, FreeInfo};
 use sampa_ghhelp::{parse_gh_description, parse_gh_help, GhCommand};
 use sampa_cargohelp::{parse_cargo_help, CargoCommand};
@@ -594,57 +594,261 @@ const DU_PALETTE: &[[u8; 3]] = &[
     [0x5b, 0xa6, 0x93], [0xa6, 0x7d, 0x5b], [0x7d, 0x5b, 0xa6], [0x5b, 0x6f, 0xa6],
 ];
 
-/// How long a `du` scan may run before the child is killed (spec-du-treemap.md §3).
+/// A **backstop** on a `du` scan, not the thing standing between the user and a view.
 ///
-/// Six seconds was too tight to be useful. `du` prints nothing until it has walked the
-/// whole subtree, so this budget is not a safety margin around a fast operation — it is the
-/// real limit on what the view can show at all, and under it a home directory of any size
-/// showed only the timeout message. Measured on a 132 GB `$HOME`:
+/// Until 0.15.2 this was the real limit on what the disk-usage view could show, because the
+/// scan was all-or-nothing: 6 s showed nothing on a real `$HOME`, and 90 s was chosen from a
+/// single measurement of 67 s. That measurement then went stale in a day — the same home
+/// directory measured **91.1 s** while this change was being written, i.e. the shipped
+/// budget had already become a coin toss.
+///
+/// The premise under all of that was wrong. `du` does **not** print only at the end; it
+/// prints each directory as it finishes it, so the output arrives steadily:
 ///
 /// ```text
-/// du -k -x --max-depth=4 /home/<user>   ->  67.18 seconds
+/// du -k -x --max-depth=4 /home/<user>   10 924 lines over 91.1 s
+///   by  9.1s   1 208 lines (11%)
+///   by 45.5s   5 533 lines (51%)
+///   by 91.1s  10 924 lines (100%)
 /// ```
 ///
-/// Hence 90: clear of that with headroom, and tolerable only because the overlay says
-/// `scanning <path> …` while it waits and `Esc` closes it (the orphaned scan's result is
-/// dropped by the generation token). The real fix is a progressive scan that fills the view
-/// as it goes, which is recorded as a follow-up in spec-du-rings.md §8.
+/// The view is therefore built from the rows as they land ([`DuBuild`]) and redrawn every
+/// [`DU_PROGRESS_MS`], so there is something on screen about a second in. What remains here
+/// only stops a scan that has gone truly unbounded — a `du` wedged on a dead mount — and at
+/// ten minutes it is far outside any scan a user is still waiting on. Whatever has arrived
+/// by then is kept and the strip says the view is partial.
 ///
-/// `df`'s own 6s is a different thing — a stale mount, where waiting longer helps nobody —
+/// `df`'s own 6 s is a different thing — a stale mount, where waiting longer helps nobody —
 /// and is deliberately left alone.
-const DU_TIMEOUT_SECS: u64 = 90;
+const DU_TIMEOUT_SECS: u64 = 600;
 
-/// Run a **read-only, timeout-bounded** `du -k -x --max-depth=4 <cwd>` off the caller's
-/// thread and parse it into a tree (spec-du-treemap.md §3). A reader thread drains stdout so
-/// the pipe never fills; if the scan overruns [`DU_TIMEOUT_SECS`] the child is killed and an
-/// error returned.
-fn run_du(cwd: &str) -> Result<DuNode, String> {
-    use std::io::Read;
-    let mut child = std::process::Command::new("du")
+/// How often a running scan hands the UI the tree it has so far. Four times a second is
+/// fast enough to read as filling in, and slow enough that the relayout is not the work.
+const DU_PROGRESS_MS: u64 = 250;
+
+/// Builds a [`DuNode`] tree from `du` rows **as they arrive**.
+///
+/// `sampa_dumap::parse_du` cannot do this: it infers the root from the rows, taking the
+/// largest entry whose parent is absent. Mid-scan that is some directory four levels down,
+/// because `du` prints children before parents — so a partial parse is rooted in the wrong
+/// place and reshuffles wildly as rows land. Here the root is known up front (it is the cwd
+/// being scanned) and never moves.
+///
+/// Linkage is kept separately from sizes for the same reason. A row for `a/b/c` links `c`
+/// to `b` and `b` to `a` **immediately**, before either ancestor's own row exists, so a
+/// subtree is visible while it is still being walked rather than appearing whole at the end.
+/// A directory whose own row has not arrived is sized by the children that have, which is a
+/// lower bound that only rises; when its row lands, the true size (which includes the files
+/// sitting directly in it) replaces the sum.
+struct DuBuild {
+    root: String,
+    size: std::collections::HashMap<String, u64>,
+    kids: std::collections::HashMap<String, Vec<String>>,
+    linked: std::collections::HashSet<String>,
+}
+
+impl DuBuild {
+    fn new(root: &str) -> Self {
+        Self {
+            root: du_norm(root),
+            size: std::collections::HashMap::new(),
+            kids: std::collections::HashMap::new(),
+            linked: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Record one `<size>\t<path>` row. `false` for a malformed line (the caller controls
+    /// the format, so this is defensive); blank lines are fine and ignored.
+    fn push_line(&mut self, line: &str) -> bool {
+        let line = line.trim_end().trim_end_matches('\r');
+        if line.trim().is_empty() {
+            return true;
+        }
+        let Some((s, p)) = line.split_once('\t') else { return false };
+        let Ok(kb) = s.trim().parse::<u64>() else { return false };
+        let path = du_norm(p);
+        if path.is_empty() {
+            return true;
+        }
+        self.link(&path);
+        self.size.insert(path, kb);
+        true
+    }
+
+    /// Link `path` to the root through every ancestor between them, creating the ancestors
+    /// as nodes if their own rows have not arrived. Stops at the first already-linked
+    /// ancestor, since everything above it is linked too. A path outside the root is
+    /// ignored rather than walked past `/`.
+    fn link(&mut self, path: &str) {
+        if path == self.root {
+            return;
+        }
+        if !path.starts_with(&self.root) || !path[self.root.len()..].starts_with('/') {
+            return;
+        }
+        let mut cur = path.to_string();
+        while cur != self.root {
+            let Some(par) = du_parent(&cur) else { return };
+            if !self.linked.insert(cur.clone()) {
+                return;
+            }
+            self.kids.entry(par.clone()).or_default().push(cur);
+            cur = par;
+        }
+    }
+
+    /// How many directories have been seen — rows parsed, not nodes linked.
+    fn dirs(&self) -> usize {
+        self.size.len()
+    }
+
+    /// The tree so far, or `None` before anything under the root has arrived.
+    fn tree(&self) -> Option<DuNode> {
+        if self.size.is_empty() {
+            return None;
+        }
+        Some(self.build(&self.root))
+    }
+
+    fn build(&self, path: &str) -> DuNode {
+        let mut children: Vec<DuNode> = self
+            .kids
+            .get(path)
+            .map(|k| k.iter().map(|c| self.build(c)).collect())
+            .unwrap_or_default();
+        children.sort_by(|a, b| b.size_kb.cmp(&a.size_kb).then_with(|| a.name.cmp(&b.name)));
+        let sum: u64 = children.iter().map(|c| c.size_kb).sum();
+        DuNode {
+            name: du_base(path),
+            path: path.to_string(),
+            // A parent's own row is authoritative once it lands; `max` only guards against
+            // a row that contradicts its children (it cannot, but the tree must stay sane).
+            size_kb: self.size.get(path).copied().unwrap_or(sum).max(sum),
+            children,
+        }
+    }
+}
+
+/// Trim a single trailing slash (keeping root `/`) and surrounding whitespace — the same
+/// normalization `sampa_dumap::parse_du` applies, so the two agree on what a path is.
+fn du_norm(p: &str) -> String {
+    let p = p.trim();
+    if p.len() > 1 { p.trim_end_matches('/').to_string() } else { p.to_string() }
+}
+
+/// The parent path, or `None` at a top-level entry.
+fn du_parent(p: &str) -> Option<String> {
+    match p.rsplit_once('/') {
+        Some(("", _)) | None => None,
+        Some((par, _)) => Some(par.to_string()),
+    }
+}
+
+/// The last path component (the directory's own name).
+fn du_base(p: &str) -> String {
+    match p.rsplit_once('/') {
+        Some((_, name)) if !name.is_empty() => name.to_string(),
+        _ => p.to_string(),
+    }
+}
+
+/// Run a **read-only** `du -k -x --max-depth=4 <cwd>` and stream what it prints into the
+/// overlay (spec-du-treemap.md §3), posting the tree so far every [`DU_PROGRESS_MS`].
+///
+/// Runs on its own thread and owns the child process. It stops early in three ways:
+/// superseded (`shared_gen` moved on — the overlay closed or re-scanned, so the child is
+/// killed rather than left walking a 142 GB home for nothing), [`DU_TIMEOUT_SECS`] reached,
+/// or `du` finishing. Only the last is the ordinary case.
+///
+/// A separate reader thread owns the pipe, so the budget is enforced even if `du` stops
+/// printing entirely: this loop is always in `recv_timeout`, never blocked on a read.
+fn stream_du(
+    cwd: &str,
+    gen: u64,
+    shared_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+) {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Duration, Instant};
+
+    let fail = |msg: String| {
+        let _ = proxy.send_event(UserEvent::DuReady { gen, result: Err(msg) });
+    };
+    let mut child = match std::process::Command::new("du")
         .args(["-k", "-x", "--max-depth=4", cwd])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| format!("du couldn't start: {e}"))?;
-    let stdout = child.stdout.take();
-    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        Ok(c) => c,
+        Err(e) => return fail(format!("du couldn't start: {e}")),
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return fail("du produced no output pipe.".to_string());
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut o) = stdout {
-            let _ = o.read_to_string(&mut s);
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
         }
-        let _ = tx.send(s);
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(DU_TIMEOUT_SECS)) {
-        Ok(text) => {
-            let _ = child.wait();
-            parse_du(&text).ok_or_else(|| "Nothing to show (empty or unreadable directory).".to_string())
-        }
-        Err(_) => {
+
+    let mut build = DuBuild::new(cwd);
+    let interval = Duration::from_millis(DU_PROGRESS_MS);
+    let deadline = Instant::now() + Duration::from_secs(DU_TIMEOUT_SECS);
+    let mut next_push = Instant::now() + interval;
+    let superseded =
+        |g: &std::sync::Arc<std::sync::atomic::AtomicU64>| g.load(std::sync::atomic::Ordering::SeqCst) != gen;
+
+    loop {
+        if superseded(&shared_gen) {
             let _ = child.kill();
-            // Formatted from the constant: the hardcoded "6s" here would otherwise outlive it.
-            Err(format!("du timed out after {DU_TIMEOUT_SECS}s — the directory is very large."))
+            let _ = child.wait();
+            return;
         }
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let note = format!("stopped after {}m — this directory is still being walked", DU_TIMEOUT_SECS / 60);
+            return match build.tree() {
+                Some(tree) => {
+                    let dirs = build.dirs();
+                    let _ = proxy.send_event(UserEvent::DuTruncated { gen, tree, dirs, note });
+                }
+                None => fail(note),
+            };
+        }
+        let wait = next_push.saturating_duration_since(now).min(deadline - now);
+        match rx.recv_timeout(wait) {
+            Ok(line) => {
+                build.push_line(&line);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        // Checked on every pass, not only on the timeout arm: while rows are flowing the
+        // channel is never empty, so a timeout-only push would never fire.
+        if Instant::now() >= next_push {
+            next_push = Instant::now() + interval;
+            if let Some(tree) = build.tree() {
+                let dirs = build.dirs();
+                let _ = proxy.send_event(UserEvent::DuProgress { gen, tree, dirs });
+            }
+        }
+    }
+
+    let _ = child.wait();
+    match build.tree() {
+        Some(tree) => {
+            let _ = proxy.send_event(UserEvent::DuReady { gen, result: Ok(tree) });
+        }
+        None => fail("Nothing to show (empty or unreadable directory).".to_string()),
     }
 }
 
@@ -2944,8 +3148,14 @@ enum UserEvent {
     AiAnalyzeReady { gen: u64, result: Result<String, String> },
     /// A URL preview came back: `Ok((final_url, card_text))` or an error message.
     UrlPreviewReady { gen: u64, result: Result<(String, String), String> },
-    /// A background `du` scan finished (or failed/timed out); `gen` drops stale replies.
+    /// A background `du` scan finished (or failed); `gen` drops stale replies.
     DuReady { gen: u64, result: Result<DuNode, String> },
+    /// A running `du` scan's tree so far, posted every `DU_PROGRESS_MS` so the view fills
+    /// in instead of waiting for the whole walk; `gen` drops stale replies.
+    DuProgress { gen: u64, tree: DuNode, dirs: usize },
+    /// A `du` scan hit `DU_TIMEOUT_SECS` with rows already in hand: the partial tree is
+    /// kept and `note` says so, rather than throwing away a nearly-complete scan.
+    DuTruncated { gen: u64, tree: DuNode, dirs: usize, note: String },
     /// A background `df` run finished (or failed/timed out); `gen` drops stale replies.
     DfReady { gen: u64, result: Result<Vec<FsUsage>, String> },
     /// A background `ping` run finished (or failed/timed out); `gen` drops stale replies.
@@ -3335,6 +3545,8 @@ fn main() -> Result<()> {
         du_hover: None,
         du_hub: None,
         du_msg: None,
+        du_scanning: None,
+        du_note: None,
         du_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         free_on: false,
         free_info: None,
@@ -3856,6 +4068,8 @@ struct App {
     du_hover: Option<usize>, // index into `du_arcs` under the pointer, for the readout strip
     du_hub: Option<([f32; 2], f32)>, // rings centre + hub radius, for the centre label
     du_msg: Option<String>,  // status line: "scanning…", a timeout, or "empty"
+    du_scanning: Option<usize>, // Some(dirs seen) while a scan is still running
+    du_note: Option<String>,    // why the tree on screen is partial, if it is
     du_gen: std::sync::Arc<std::sync::atomic::AtomicU64>, // supersede token for the async scan
     // free memory gauge (spec-free-gauge.md), also overloaded on the ps chord.
     free_on: bool,
@@ -3964,6 +4178,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::UrlPreviewReady { gen, result } => self.url_preview_ready(gen, result),
             UserEvent::AiAnalyzeReady { gen, result } => self.ai_analyze_ready(gen, result),
             UserEvent::DuReady { gen, result } => self.du_ready(gen, result),
+            UserEvent::DuProgress { gen, tree, dirs } => self.du_progress(gen, tree, dirs, None),
+            UserEvent::DuTruncated { gen, tree, dirs, note } => {
+                self.du_progress(gen, tree, dirs, Some(note))
+            }
             UserEvent::DfReady { gen, result } => self.df_ready(gen, result),
             UserEvent::PingReady { gen, result } => self.ping_ready(gen, result),
             UserEvent::AccessKit(e) => {
@@ -7971,13 +8189,15 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             return;
         };
         self.du_msg = Some(format!("scanning {cwd} …"));
+        self.du_scanning = Some(0);
+        self.du_note = None;
         self.request_redraw();
         let gen = self.du_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let proxy = self.proxy.clone();
-        std::thread::spawn(move || {
-            let result = run_du(&cwd);
-            let _ = proxy.send_event(UserEvent::DuReady { gen, result });
-        });
+        // The scan thread watches this same counter: closing the overlay or re-scanning
+        // bumps it, and the walk is killed instead of running on unseen.
+        let shared = std::sync::Arc::clone(&self.du_gen);
+        std::thread::spawn(move || stream_du(&cwd, gen, shared, proxy));
     }
 
     fn du_close(&mut self) {
@@ -7989,6 +8209,10 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.du_arcs.clear();
         self.du_hover = None;
         self.du_msg = None;
+        self.du_scanning = None;
+        self.du_note = None;
+        // Bumping the token tells a scan still walking the tree to kill its `du` and stop.
+        self.du_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.request_redraw();
     }
 
@@ -7997,11 +8221,16 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         if !self.du_on || gen != self.du_gen.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
+        self.du_scanning = None;
         match result {
             Ok(root) => {
+                // Keep the zoom the user set while the scan was running (by path — the
+                // indices move as rows land), rather than snapping them back to the root.
+                let here = self.du_zoom_path();
                 self.du_root = Some(root);
-                self.du_zoom.clear();
+                self.du_rezoom(&here);
                 self.du_msg = None;
+                self.du_note = None;
             }
             Err(e) => {
                 self.du_root = None;
@@ -8009,6 +8238,61 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             }
         }
         self.request_redraw();
+    }
+
+    /// Deliver the tree a running scan has so far. `note`, when set, means this is the last
+    /// one and the tree is incomplete.
+    fn du_progress(&mut self, gen: u64, tree: DuNode, dirs: usize, note: Option<String>) {
+        if !self.du_on || gen != self.du_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let here = self.du_zoom_path();
+        self.du_root = Some(tree);
+        self.du_rezoom(&here);
+        self.du_msg = None;
+        self.du_scanning = if note.is_some() { None } else { Some(dirs) };
+        if note.is_some() {
+            self.du_note = note;
+        }
+        self.request_redraw();
+    }
+
+    /// The names from the root to the current view. The zoom is stored as child *indices*,
+    /// which a mid-scan update invalidates the moment two siblings swap places — so it is
+    /// re-derived by name after every update rather than carried across one.
+    fn du_zoom_path(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let Some(mut node) = self.du_root.as_ref() else { return names };
+        for &i in &self.du_zoom {
+            match node.children.get(i) {
+                Some(c) => {
+                    names.push(c.name.clone());
+                    node = c;
+                }
+                None => break,
+            }
+        }
+        names
+    }
+
+    /// Point `du_zoom` back at `names` in the tree now held, stopping at the deepest one
+    /// that still exists (a directory can only appear, never vanish, mid-scan — but the
+    /// view must stay valid if it ever does).
+    fn du_rezoom(&mut self, names: &[String]) {
+        let mut zoom = Vec::new();
+        if let Some(root) = self.du_root.as_ref() {
+            let mut node = root;
+            for want in names {
+                match node.children.iter().position(|c| &c.name == want) {
+                    Some(i) => {
+                        zoom.push(i);
+                        node = &node.children[i];
+                    }
+                    None => break,
+                }
+            }
+        }
+        self.du_zoom = zoom;
     }
 
     /// The directory currently in view (root navigated by the `du_zoom` index path).
@@ -8178,15 +8462,22 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             return "du".to_string();
         };
         let mode = if self.du_rings { "t treemap" } else { "t rings" };
+        // While the scan runs, say so and keep a count moving — the sizes on screen are
+        // lower bounds until it stops, and a still picture would not admit that.
+        let state = match (self.du_scanning, self.du_note.as_deref()) {
+            (Some(n), _) => format!("scanning… {n} dirs · "),
+            (None, Some(note)) => format!("partial — {note} · "),
+            (None, None) => String::new(),
+        };
         match self.du_hover.and_then(|i| self.du_arcs.get(i)) {
             // Hovering: the sector's own path/size, since nothing else can show it.
             Some(a) => format!(
-                "du · {} · {}   ·  click zoom · Backspace up · Enter cd here · {mode} · Esc",
+                "du · {state}{} · {}   ·  click zoom · Backspace up · Enter cd here · {mode} · Esc",
                 a.path,
                 fmt_kib(a.size_kb),
             ),
             None => format!(
-                "du · {} · {}   ·  click zoom · Backspace up · Enter cd here · {mode} · Esc",
+                "du · {state}{} · {}   ·  click zoom · Backspace up · Enter cd here · {mode} · Esc",
                 v.path,
                 fmt_kib(v.size_kb),
             ),
@@ -14727,6 +15018,96 @@ mod tests {
         assert_eq!(subtree_depth(&flat, DU_RING_DEPTH), 1);
         assert_eq!(subtree_depth(&du("leaf", 1, vec![]), DU_RING_DEPTH), 0);
         assert_eq!(subtree_depth(&tiny, DU_RING_DEPTH), 2);
+    }
+
+    /// `du -k -x --max-depth=4` on a small tree, in the post-order `du` actually prints:
+    /// every child before its parent, the root last.
+    const DU_STREAM: &str = "\
+10\t/r/a/x/deep
+40\t/r/a/x
+50\t/r/a
+20\t/r/b
+100\t/r
+";
+
+    #[test]
+    fn a_finished_stream_agrees_with_the_batch_parser() {
+        // The streaming builder is a second implementation of something that already
+        // works, so the bar is that it agrees with it exactly once the rows are all in —
+        // names, paths, sizes, child order, every level.
+        let mut b = DuBuild::new("/r");
+        for line in DU_STREAM.lines() {
+            assert!(b.push_line(line), "rejected a well-formed row: {line}");
+        }
+        let streamed = b.tree().expect("a tree");
+        let batched = sampa_dumap::parse_du(DU_STREAM).expect("a tree");
+        assert_eq!(streamed, batched);
+        assert_eq!(b.dirs(), 5);
+    }
+
+    #[test]
+    fn a_partial_stream_is_rooted_where_the_scan_started() {
+        // This is the whole reason the builder exists. Mid-scan, `du` has printed only
+        // deep directories, and parse_du — which infers the root from the rows — roots the
+        // tree four levels down, where it reshuffles as more arrives.
+        let half = "10\t/r/a/x/deep\n40\t/r/a/x\n";
+        assert_eq!(sampa_dumap::parse_du(half).unwrap().path, "/r/a/x");
+
+        let mut b = DuBuild::new("/r");
+        for line in half.lines() {
+            b.push_line(line);
+        }
+        let t = b.tree().expect("a tree");
+        assert_eq!(t.path, "/r", "the view must stay rooted at the scanned directory");
+        // `a` has no row of its own yet, so it is sized by the one child that has arrived —
+        // a lower bound, and the chain to it is linked even though nothing printed it.
+        assert_eq!(t.size_kb, 40);
+        assert_eq!(t.children.len(), 1);
+        let a = &t.children[0];
+        assert_eq!((a.name.as_str(), a.size_kb), ("a", 40));
+        assert_eq!((a.children[0].name.as_str(), a.children[0].size_kb), ("x", 40));
+    }
+
+    #[test]
+    fn sizes_only_rise_as_rows_arrive() {
+        // Every prefix of the stream must be a sane tree, and the root's size must never
+        // fall — the view is read while it fills, so a size that jumped around would be
+        // worse than no number at all.
+        let mut b = DuBuild::new("/r");
+        let mut last = 0;
+        for line in DU_STREAM.lines() {
+            b.push_line(line);
+            if let Some(t) = b.tree() {
+                assert_eq!(t.path, "/r");
+                assert!(t.size_kb >= last, "root fell from {last} to {}", t.size_kb);
+                last = t.size_kb;
+                // A parent is never smaller than the children already under it.
+                fn check(n: &DuNode) {
+                    let sum: u64 = n.children.iter().map(|c| c.size_kb).sum();
+                    assert!(n.size_kb >= sum, "{} is {} but holds {sum}", n.path, n.size_kb);
+                    n.children.iter().for_each(check);
+                }
+                check(&t);
+            }
+        }
+        assert_eq!(last, 100);
+    }
+
+    #[test]
+    fn the_builder_refuses_malformed_rows_and_strays() {
+        let mut b = DuBuild::new("/r");
+        assert!(!b.push_line("no tab here"));
+        assert!(!b.push_line("notanumber\t/r/a"));
+        assert!(b.push_line(""), "blank lines are not an error");
+        assert!(b.tree().is_none(), "nothing valid has arrived");
+
+        // A path outside the scanned root is recorded but never linked into the tree, so
+        // it cannot walk the parent chain past the root.
+        assert!(b.push_line("5\t/elsewhere/x"));
+        assert!(b.push_line("7\t/r/a"));
+        let t = b.tree().unwrap();
+        assert_eq!(t.children.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(t.size_kb, 7);
     }
 
     #[test]
