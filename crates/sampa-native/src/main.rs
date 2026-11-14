@@ -566,6 +566,10 @@ struct CdNode {
 struct DuBox {
     rect: [f32; 4], // x, y, w, h in physical pixels
     name: String,
+    /// Full path, for the readout strip and the `cd` `Enter` composes. The remainder box
+    /// carries the view node's own path, as the rings' remainder sector does — it stands
+    /// for that directory's own files, so there is nowhere else for it to point.
+    path: String,
     size_kb: u64,
     child: Option<usize>,
 }
@@ -1064,6 +1068,103 @@ fn squarify(weights: &[u64], rect: [f32; 4]) -> Vec<[f32; 4]> {
         }
     }
     out
+}
+
+/// Which way a keyboard step moves across the treemap (spec-du-treemap.md §5).
+///
+/// Deliberately not [`DuStep`]: the rings have a ring axis and a depth axis, so their four
+/// keys mean *anticlockwise / clockwise / shallower / deeper*. The treemap shows one level
+/// tiling a rectangle, where the same four keys mean nothing but the four directions on
+/// screen. Sharing one enum between them would make either set of variant names a lie.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DuDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Move the keyboard focus one cell across a laid-out treemap, returning the cell to focus
+/// next.
+///
+/// Like [`arc_step`], the layout is the only state this needs, so a relayout mid-scan
+/// cannot leave the focus describing a tiling that is no longer there.
+///
+/// A squarified treemap is a tiling, not a grid: rows run full-width or full-height but a
+/// row's cells are of unequal extent, so "the cell to the right" is not a column index.
+/// Candidates are the cells whose centre lies in the direction of travel, ranked by
+/// whether the cell overlaps this one on the axis *across* the travel, then by distance
+/// along the travel, then by offset across it.
+///
+/// That first key is what keeps a step along a row from leaving the row: a cell sharing an edge
+/// with this one is the one the eye calls its neighbour, even when a cell in the next row
+/// over happens to have a nearer centre. The last key only breaks ties, so no step is
+/// ambiguous.
+///
+/// `None` means there is nowhere to go — the edge of the map in that direction. Unlike a
+/// ring there is nothing circular to wrap around, so the caller leaves the focus where it
+/// is rather than wrapping to the far side of the rectangle.
+fn rect_step(boxes: &[DuBox], from: Option<usize>, dir: DuDir) -> Option<usize> {
+    // Cells too thin to draw (the renderer skips them at the same threshold) are not
+    // destinations either: arrowing onto one would mark something invisible.
+    let live = |b: &DuBox| b.rect[2] >= 1.5 && b.rect[3] >= 1.5;
+    let Some(i) = from else {
+        // Nothing focused yet: the first drawable cell, which is the largest — `squarify`
+        // is fed the children largest-first.
+        return boxes.iter().position(live);
+    };
+    let cur = boxes.get(i)?;
+    let mid = |b: &DuBox| [b.rect[0] + 0.5 * b.rect[2], b.rect[1] + 0.5 * b.rect[3]];
+    let [cx, cy] = mid(cur);
+    // (along, across): distance in the direction of travel, and the perpendicular offset.
+    let project = |b: &DuBox| {
+        let [x, y] = mid(b);
+        match dir {
+            DuDir::Left => (cx - x, (y - cy).abs()),
+            DuDir::Right => (x - cx, (y - cy).abs()),
+            DuDir::Up => (cy - y, (x - cx).abs()),
+            DuDir::Down => (y - cy, (x - cx).abs()),
+        }
+    };
+    let overlaps = |b: &DuBox| match dir {
+        DuDir::Left | DuDir::Right => {
+            b.rect[1] < cur.rect[1] + cur.rect[3] && cur.rect[1] < b.rect[1] + b.rect[3]
+        }
+        DuDir::Up | DuDir::Down => {
+            b.rect[0] < cur.rect[0] + cur.rect[2] && cur.rect[0] < b.rect[0] + b.rect[2]
+        }
+    };
+    (0..boxes.len())
+        // Half a pixel of slack, not zero: a cell stacked squarely above or below this one
+        // shares its horizontal centre, and must not count as being to the side of it.
+        .filter(|&j| j != i && live(&boxes[j]) && project(&boxes[j]).0 > 0.5)
+        .min_by(|&a, &b| {
+            let (aa, ac) = project(&boxes[a]);
+            let (ba, bc) = project(&boxes[b]);
+            // `true` sorts first, hence b against a on the first key.
+            overlaps(&boxes[b])
+                .cmp(&overlaps(&boxes[a]))
+                .then(aa.total_cmp(&ba))
+                .then(ac.total_cmp(&bc))
+        })
+}
+
+/// What a marked treemap cell *is*, so the mark can be found again after a relayout —
+/// the counterpart of [`arc_mark_id`], and needed for the same reason: the boxes are
+/// rebuilt by every resize and four times a second while the scan runs, and the index
+/// that named `.config` one frame names `Documents` the next.
+///
+/// A name is enough here where the rings need a path, because one treemap holds a single
+/// level, within which names are unique. The flag separates the `(files here)` remainder
+/// from a real child, as it does for the rings — the remainder carries the view's own
+/// path, so the path alone would not tell them apart.
+fn box_mark_id(boxes: &[DuBox], at: Option<usize>) -> Option<(String, bool)> {
+    at.and_then(|i| boxes.get(i)).map(|b| (b.name.clone(), b.child.is_none()))
+}
+
+fn box_mark_find(boxes: &[DuBox], id: Option<(String, bool)>) -> Option<usize> {
+    let (name, remainder) = id?;
+    boxes.iter().position(|b| b.name == name && b.child.is_none() == remainder)
 }
 
 /// One laid-out ring segment of the `du` sunburst (spec-du-rings.md §4): an annulus sector
@@ -1724,7 +1825,8 @@ struct DuView<'a> {
     boxes: &'a [DuBox],
     arcs: &'a [DuArc],
     rings: bool,
-    /// Index into `arcs` under the pointer — drawn a shade brighter than its neighbours.
+    /// The marked cell — an index into whichever of `boxes`/`arcs` is populated, set by
+    /// the pointer or the arrow keys. Drawn a shade brighter than its neighbours.
     hover: Option<usize>,
     /// Centre, radius and label of the rings' hub (the directory in view).
     hub: Option<&'a ([f32; 2], f32, String)>,
@@ -8409,27 +8511,41 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         }
         // Snapshot the view's children (name, size) and total, then drop the borrow so the
         // boxes can be pushed into `self`.
-        let (children, view_size): (Vec<(String, u64)>, u64) = match self.du_view() {
-            Some(v) => (v.children.iter().map(|c| (c.name.clone(), c.size_kb)).collect(), v.size_kb),
+        let (children, view_size): (Vec<(String, u64, String)>, u64) = match self.du_view() {
+            Some(v) => (
+                v.children
+                    .iter()
+                    .map(|c| (c.name.clone(), c.size_kb, c.path.clone()))
+                    .collect(),
+                v.size_kb,
+            ),
             None => return,
         };
-        let child_sum: u64 = children.iter().map(|(_, s)| s).sum();
+        let view_path = match self.du_view() {
+            Some(v) => v.path.clone(),
+            None => return,
+        };
+        let child_sum: u64 = children.iter().map(|(_, s, _)| s).sum();
         // Weights: each child (largest-first), then a "(files here)" remainder for the bytes
         // in this directory itself, so the boxes sum to the whole (spec §4).
-        let mut weights: Vec<u64> = children.iter().map(|(_, s)| *s).collect();
+        let mut weights: Vec<u64> = children.iter().map(|(_, s, _)| *s).collect();
         let remainder = view_size.saturating_sub(child_sum);
         if remainder > 0 && !children.is_empty() {
             weights.push(remainder);
         }
         let rects = squarify(&weights, area);
         for (i, r) in rects.iter().enumerate() {
-            let (name, size_kb, child) = if i < children.len() {
-                (children[i].0.clone(), children[i].1, Some(i))
-            } else {
-                ("(files here)".to_string(), remainder, None)
+            let (name, path, size_kb, child) = match children.get(i) {
+                Some((n, s, p)) => (n.clone(), p.clone(), *s, Some(i)),
+                None => ("(files here)".to_string(), view_path.clone(), remainder, None),
             };
-            self.du_boxes.push(DuBox { rect: *r, name, size_kb, child });
+            self.du_boxes.push(DuBox { rect: *r, name, path, size_kb, child });
         }
+        // Re-point the keyboard marker at the cell it was on, by identity rather than by
+        // position — the same hazard the rings have, for the same reason (see
+        // `du_relayout_rings`). The pointer does not mark treemap cells, so only the focus
+        // is carried across.
+        self.du_focus = box_mark_find(&self.du_boxes, marked);
     }
 
     /// Lay the rings out in the largest circle the overlay rect holds (spec-du-rings.md §4).
@@ -8470,8 +8586,16 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.du_hover = self.du_mark_find(hovered);
     }
 
+    /// What the marker names, read against whichever layout is currently laid out. Both
+    /// layouts answer with an identity string and a "is the remainder cell" flag; the
+    /// strings are never compared across layouts, because switching layouts drops the
+    /// marker (`t` clears it) and a relayout only ever rebuilds the one that is open.
     fn du_mark_id(&self, at: Option<usize>) -> Option<(String, bool)> {
-        arc_mark_id(&self.du_arcs, at)
+        if self.du_rings {
+            arc_mark_id(&self.du_arcs, at)
+        } else {
+            box_mark_id(&self.du_boxes, at)
+        }
     }
 
     fn du_mark_find(&self, id: Option<(String, bool)>) -> Option<usize> {
@@ -8509,12 +8633,13 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                 self.du_focus = None;
                 self.request_redraw();
             }
-            // Arrow keys walk the rings without a pointer: along the current ring, or
-            // across to the ring inside or outside it (spec-du-rings.md §5).
-            Key::Named(NamedKey::ArrowLeft) => self.du_focus_step(DuStep::Prev),
-            Key::Named(NamedKey::ArrowRight) => self.du_focus_step(DuStep::Next),
-            Key::Named(NamedKey::ArrowUp) => self.du_focus_step(DuStep::In),
-            Key::Named(NamedKey::ArrowDown) => self.du_focus_step(DuStep::Out),
+            // Arrow keys walk the chart without a pointer — around and across the rings
+            // (spec-du-rings.md §5), or cell to cell over the treemap
+            // (spec-du-treemap.md §5).
+            Key::Named(NamedKey::ArrowLeft) => self.du_arrow(DuDir::Left),
+            Key::Named(NamedKey::ArrowRight) => self.du_arrow(DuDir::Right),
+            Key::Named(NamedKey::ArrowUp) => self.du_arrow(DuDir::Up),
+            Key::Named(NamedKey::ArrowDown) => self.du_arrow(DuDir::Down),
             // Space is the keyboard's click: zoom into whatever is focused. `Enter` keeps
             // its own meaning (compose a `cd`), so the two are never confused.
             Key::Named(NamedKey::Space) => self.du_zoom_focus(),
@@ -8531,8 +8656,43 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         }
     }
 
+    /// An arrow key while the overlay is open. The two layouts read the same four keys
+    /// differently, because they have different axes: the rings have a ring and a depth
+    /// (left/right go round, up/down go shallower/deeper), while the treemap is one level
+    /// tiling a rectangle, where the keys mean only the four directions on screen.
+    fn du_arrow(&mut self, dir: DuDir) {
+        if self.du_rings {
+            self.du_focus_step(match dir {
+                DuDir::Left => DuStep::Prev,
+                DuDir::Right => DuStep::Next,
+                DuDir::Up => DuStep::In,
+                DuDir::Down => DuStep::Out,
+            });
+        } else {
+            self.du_focus_move(dir);
+        }
+    }
+
+    /// Move the keyboard focus one treemap cell (spec-du-treemap.md §5). Treemap only —
+    /// the rings go through [`Self::du_focus_step`], which has a depth axis to offer.
+    fn du_focus_move(&mut self, dir: DuDir) {
+        if self.du_rings || self.du_boxes.is_empty() {
+            return;
+        }
+        // At the edge of the map, leave the focus where it is rather than dropping it: a
+        // rectangle has nothing to wrap around, and silently unmarking would read as the
+        // key having been missed. The rings' one exception — inward from the innermost
+        // ring clears the mark, because the hub *is* the view itself — has no counterpart
+        // here, where every cell sits at the same level. `Backspace` (up a level) is what
+        // clears a treemap mark.
+        if let Some(i) = rect_step(&self.du_boxes, self.du_focus, dir) {
+            self.du_focus = Some(i);
+            self.request_redraw();
+        }
+    }
+
     /// Move the keyboard focus one sector (spec-du-rings.md §5). Rings only — the treemap
-    /// shows one level at a time and is navigated by clicking into it.
+    /// goes through [`Self::du_focus_move`], which steps by screen direction instead.
     fn du_focus_step(&mut self, step: DuStep) {
         if !self.du_rings || self.du_arcs.is_empty() {
             return;
@@ -8558,14 +8718,22 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.request_redraw();
     }
 
-    /// `Space` — zoom into the focused sector, exactly as clicking it would.
+    /// `Space` — zoom into the focused cell, exactly as clicking it would. A ring sector
+    /// carries its whole index path and so descends every level at once; a treemap cell is
+    /// always one level down from the view, so it carries a single index.
     fn du_zoom_focus(&mut self) {
-        let Some(path) = self
-            .du_focus
-            .or(self.du_hover)
-            .and_then(|i| self.du_arcs.get(i))
-            .and_then(|a| a.zoom.clone())
-        else {
+        let path = if self.du_rings {
+            self.du_focus
+                .or(self.du_hover)
+                .and_then(|i| self.du_arcs.get(i))
+                .and_then(|a| a.zoom.clone())
+        } else {
+            self.du_focus
+                .and_then(|i| self.du_boxes.get(i))
+                .and_then(|b| b.child)
+                .map(|ci| vec![ci])
+        };
+        let Some(path) = path else {
             return;
         };
         self.du_zoom_into(path);
@@ -8616,14 +8784,12 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
     /// `Enter` — compose `cd <path>` for the directory in view (spec §5, insert-never-run):
     /// relativised to the scan root, shell-quoted, with the typed line cleared first.
     fn du_cd(&mut self) {
-        // A focused (or hovered) sector is what the strip is reading out, so that is the
-        // directory `Enter` means — otherwise it is the view itself, as before.
+        // A marked cell is what the strip is reading out, so that is the directory `Enter`
+        // means — otherwise it is the view itself, as before.
         let marked = self
-            .du_focus
-            .or(self.du_hover)
-            .and_then(|i| self.du_arcs.get(i))
-            .filter(|a| a.zoom.is_some())
-            .map(|a| a.path.clone());
+            .du_marked()
+            .filter(|&(_, _, dir)| dir)
+            .map(|(p, _, _)| p.to_string());
         let (root, path) = match (self.du_root.as_ref(), marked, self.du_view()) {
             (Some(r), Some(p), _) => (r.path.clone(), p),
             (Some(r), None, Some(v)) => (r.path.clone(), v.path.clone()),
@@ -8634,6 +8800,22 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.pty_write(format!("cd {arg} ").as_bytes());
         self.scroll(Scroll::Bottom);
         self.du_close();
+    }
+
+    /// Whatever the arrows or the pointer have marked, in whichever layout is open: its
+    /// full path and size for the readout strip, and whether it is a directory `Enter` can
+    /// `cd` to. `(files here)` is not one — it stands for its parent's own loose files, and
+    /// carries that parent's path, so following it would mean cd-ing to a directory the
+    /// user did not mark.
+    fn du_marked(&self) -> Option<(&str, u64, bool)> {
+        let at = self.du_focus.or(self.du_hover)?;
+        if self.du_rings {
+            let a = self.du_arcs.get(at)?;
+            Some((&a.path, a.size_kb, a.zoom.is_some()))
+        } else {
+            let b = self.du_boxes.get(at)?;
+            Some((&b.path, b.size_kb, b.child.is_some()))
+        }
     }
 
     /// The breadcrumb / status strip above the chart: the current path and total size, the
@@ -8651,19 +8833,19 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             (None, Some(note)) => format!("partial — {note} · "),
             (None, None) => String::new(),
         };
-        // Rings name the arrow keys; the treemap has no keyboard focus to offer.
+        // Each layout names its own arrow keys, because they move along different axes.
         let keys = if self.du_rings {
             "←→ ring · ↑↓ depth · Space zoom · Backspace up · Enter cd"
         } else {
-            "click zoom · Backspace up · Enter cd here"
+            "←→↑↓ move · Space zoom · Backspace up · Enter cd"
         };
         // Whatever is marked — by the pointer or by the arrows — is what the strip reads
         // out and what `Enter` acts on, so the two can never disagree.
-        match self.du_focus.or(self.du_hover).and_then(|i| self.du_arcs.get(i)) {
-            Some(a) => format!(
+        match self.du_marked() {
+            Some((path, size_kb, _)) => format!(
                 "du · {state}{} · {}   ·  {keys} · {mode} · Esc",
-                a.path,
-                fmt_kib(a.size_kb),
+                path,
+                fmt_kib(size_kb),
             ),
             None => format!(
                 "du · {state}{} · {}   ·  {keys} · {mode} · Esc",
@@ -12044,12 +12226,19 @@ impl Renderer {
                     if b.rect[2] < 1.5 || b.rect[3] < 1.5 {
                         continue;
                     }
-                    let fill = if b.child.is_none() {
-                        self.color4(blend(self.theme.bg, self.theme.fg, 0.28)) // muted remainder
+                    let base = if b.child.is_none() {
+                        blend(self.theme.bg, self.theme.fg, 0.28) // muted remainder
                     } else {
-                        self.color4(DU_PALETTE[i % DU_PALETTE.len()])
+                        DU_PALETTE[i % DU_PALETTE.len()]
                     };
-                    bg_quads.push(QuadInstance { rect: b.rect, color: border });
+                    // The marked cell lifts toward the foreground and takes a bright
+                    // surround, so the path in the strip is tied to something visible —
+                    // the treemap carries no cursor of its own.
+                    let marked = du.hover == Some(i);
+                    let fill =
+                        self.color4(if marked { blend(base, self.theme.fg, 0.35) } else { base });
+                    let edge = if marked { self.color4(self.theme.fg) } else { border };
+                    bg_quads.push(QuadInstance { rect: b.rect, color: edge });
                     let ins = 1.5;
                     bg_quads.push(QuadInstance {
                         rect: [b.rect[0] + ins, b.rect[1] + ins, (b.rect[2] - 2.0 * ins).max(0.0), (b.rect[3] - 2.0 * ins).max(0.0)],
@@ -15368,6 +15557,209 @@ mod tests {
         // A sector that is gone drops the marker rather than landing on a stranger.
         assert_eq!(arc_mark_find(&after, Some(("/r/nowhere".into(), false))), None);
         assert_eq!(arc_mark_find(&after, None), None);
+    }
+
+    /// A treemap cell, for the keyboard-navigation tests. `child` is `Some` for a real
+    /// directory and `None` for the `(files here)` remainder, exactly as `du_relayout`
+    /// builds them.
+    fn bx(name: &str, rect: [f32; 4]) -> DuBox {
+        DuBox {
+            rect,
+            name: name.to_string(),
+            path: format!("/r/{name}"),
+            size_kb: 1,
+            child: Some(0),
+        }
+    }
+
+    fn bx_name(boxes: &[DuBox], at: Option<usize>) -> Option<&str> {
+        at.map(|i| boxes[i].name.as_str())
+    }
+
+    #[test]
+    fn arrow_steps_walk_the_treemap() {
+        // A plain 2x2 tiling of a 100x100 area — the four directions should mean the four
+        // directions, with the edges as end-stops.
+        let boxes = vec![
+            bx("a", [0.0, 0.0, 50.0, 50.0]),
+            bx("b", [50.0, 0.0, 50.0, 50.0]),
+            bx("c", [0.0, 50.0, 50.0, 50.0]),
+            bx("d", [50.0, 50.0, 50.0, 50.0]),
+        ];
+        let at = |n: &str| boxes.iter().position(|b| b.name == n);
+        let step = |from: &str, dir| bx_name(&boxes, rect_step(&boxes, at(from), dir));
+
+        assert_eq!(step("a", DuDir::Right), Some("b"));
+        assert_eq!(step("a", DuDir::Down), Some("c"));
+        assert_eq!(step("c", DuDir::Right), Some("d"));
+        assert_eq!(step("d", DuDir::Up), Some("b"));
+        assert_eq!(step("b", DuDir::Left), Some("a"));
+        assert_eq!(step("d", DuDir::Left), Some("c"));
+
+        // No wrapping: a rectangle has no seam to cross, unlike a ring.
+        assert_eq!(step("b", DuDir::Right), None);
+        assert_eq!(step("a", DuDir::Up), None);
+        assert_eq!(step("a", DuDir::Left), None);
+        assert_eq!(step("d", DuDir::Down), None);
+
+        // Nothing focused yet: the first drawable cell, which is the largest.
+        assert_eq!(bx_name(&boxes, rect_step(&boxes, None, DuDir::Right)), Some("a"));
+        assert_eq!(rect_step(&[], None, DuDir::Right), None);
+
+        // Full-width rows stacked on each other: the cell below shares this one's
+        // horizontal centre exactly, and must not count as being to the side of it — a
+        // sideways key here has nowhere to go, and turning it into a downward step would
+        // make the four keys mean three directions.
+        let rows = vec![
+            bx("upper", [0.0, 0.0, 100.0, 20.0]),
+            bx("lower", [0.0, 20.0, 100.0, 20.0]),
+        ];
+        assert_eq!(rect_step(&rows, Some(0), DuDir::Right), None);
+        assert_eq!(rect_step(&rows, Some(0), DuDir::Left), None);
+        assert_eq!(bx_name(&rows, rect_step(&rows, Some(0), DuDir::Down)), Some("lower"));
+    }
+
+    #[test]
+    fn a_sideways_step_stays_in_the_row_it_started_in() {
+        // A squarified treemap is a tiling, not a grid, so a cell in the row above can
+        // have a *nearer* centre than the cell actually beside you. Ranking by distance
+        // alone steps out of the row, which reads as the key having gone astray.
+        //
+        //   0        25   35                             100
+        //   +-------------+-------------------------------+   y 0..20
+        //   |     top     |                               |
+        //   +--+----------+-------------------------------+
+        //   |  |                                          |
+        //   |a |              beside                       |  y 40..60
+        //
+        let boxes = vec![
+            bx("a", [0.0, 40.0, 20.0, 20.0]),      // centre (10, 50)
+            bx("beside", [20.0, 40.0, 60.0, 20.0]), // centre (50, 50): 40px away, same row
+            bx("top", [25.0, 0.0, 10.0, 20.0]),     // centre (30, 10): 20px away, row above
+        ];
+        let a = Some(0);
+        assert_eq!(
+            bx_name(&boxes, rect_step(&boxes, a, DuDir::Right)),
+            Some("beside"),
+            "the nearer centre belongs to a cell that does not touch this row"
+        );
+        // Overlap is a preference, not a requirement: nothing sits directly over `a`, and
+        // the nearest cell above it is still better than refusing the key and stranding
+        // the marker in the corner.
+        assert_eq!(bx_name(&boxes, rect_step(&boxes, a, DuDir::Up)), Some("top"));
+        // Where a cell *does* sit directly over, that is the one the key reaches.
+        assert_eq!(
+            bx_name(&boxes, rect_step(&boxes, Some(1), DuDir::Up)),
+            Some("top"),
+            "`top` overlaps `beside` horizontally"
+        );
+    }
+
+    #[test]
+    fn a_cell_too_thin_to_draw_is_not_a_destination() {
+        // The renderer skips cells under 1.5px on either side; stepping onto one would
+        // move the marker somewhere the user cannot see it, and read out a path with no
+        // cell beside it.
+        let boxes = vec![
+            bx("a", [0.0, 0.0, 50.0, 50.0]),
+            bx("sliver", [50.0, 0.0, 0.4, 50.0]),
+            bx("b", [51.0, 0.0, 49.0, 50.0]),
+        ];
+        assert_eq!(bx_name(&boxes, rect_step(&boxes, Some(0), DuDir::Right)), Some("b"));
+        assert_eq!(bx_name(&boxes, rect_step(&boxes, Some(2), DuDir::Left)), Some("a"));
+        // Including as the opening position, where the largest cell may itself be a sliver
+        // in a window too small to lay the view out in.
+        let thin_first = vec![bx("sliver", [0.0, 0.0, 0.4, 50.0]), bx("a", [1.0, 0.0, 49.0, 50.0])];
+        assert_eq!(bx_name(&thin_first, rect_step(&thin_first, None, DuDir::Right)), Some("a"));
+    }
+
+    #[test]
+    fn stepping_right_across_a_real_squarified_row_never_skips_a_cell() {
+        // The hand-built tilings above are tidy; this one is whatever the real layout
+        // produces for a plausible set of sizes. The assertion is a property rather than a
+        // name, because the point is that it holds for a tiling nobody chose.
+        let weights: Vec<u64> = vec![900, 540, 300, 180, 120, 90, 60, 40, 25, 10];
+        let rects = squarify(&weights, [0.0, 0.0, 640.0, 400.0]);
+        let boxes: Vec<DuBox> = rects
+            .iter()
+            .enumerate()
+            .map(|(i, r)| bx(&format!("c{i}"), *r))
+            .collect();
+
+        let mut seen = vec![0usize];
+        let mut at = 0usize;
+        while let Some(next) = rect_step(&boxes, Some(at), DuDir::Right) {
+            let (cur, to) = (&boxes[at], &boxes[next]);
+            assert!(
+                to.rect[0] + 0.5 * to.rect[2] > cur.rect[0] + 0.5 * cur.rect[2],
+                "a rightward step must move right: {} -> {}",
+                cur.name,
+                to.name
+            );
+            assert!(
+                to.rect[1] < cur.rect[1] + cur.rect[3] && cur.rect[1] < to.rect[1] + to.rect[3],
+                "{} and {} do not share any row",
+                cur.name,
+                to.name
+            );
+            // Nothing drawable lies between them in the same row — the step is to the
+            // neighbour, not over its head.
+            for b in &boxes {
+                let between = b.rect[0] + 0.5 * b.rect[2] > cur.rect[0] + 0.5 * cur.rect[2]
+                    && b.rect[0] + 0.5 * b.rect[2] < to.rect[0] + 0.5 * to.rect[2];
+                let shares_row =
+                    b.rect[1] < cur.rect[1] + cur.rect[3] && cur.rect[1] < b.rect[1] + b.rect[3];
+                let drawable = b.rect[2] >= 1.5 && b.rect[3] >= 1.5;
+                assert!(
+                    !(between && shares_row && drawable),
+                    "{} was skipped stepping {} -> {}",
+                    b.name,
+                    cur.name,
+                    to.name
+                );
+            }
+            assert!(!seen.contains(&next), "a rightward walk must not revisit a cell");
+            seen.push(next);
+            at = next;
+        }
+        assert!(seen.len() > 1, "the layout gave nothing to walk across");
+    }
+
+    #[test]
+    fn the_treemap_marker_survives_a_relayout() {
+        // The same hazard as the rings (see `the_marker_survives_a_mid_scan_relayout`):
+        // the boxes are rebuilt four times a second while the scan runs, and a directory
+        // overtaking its siblings shifts every later cell along. Within one level a name
+        // is unique, so the name is the identity — but the `(files here)` remainder
+        // carries the *view's* path, so a path would not be.
+        let during = vec![bx(".config", [0.0, 0.0, 60.0, 50.0]), bx(".cache", [60.0, 0.0, 40.0, 50.0])];
+        let at = during.iter().position(|b| b.name == ".config").unwrap();
+        let id = box_mark_id(&during, Some(at));
+        assert_eq!(id, Some((".config".to_string(), false)));
+
+        // `Documents` finishes its walk and takes first place; `.config` slides along.
+        let after = vec![
+            bx("Documents", [0.0, 0.0, 50.0, 50.0]),
+            bx(".config", [50.0, 0.0, 30.0, 50.0]),
+            bx(".cache", [80.0, 0.0, 20.0, 50.0]),
+        ];
+        assert!(at < after.len(), "the stale index is still in range — that is the trap");
+        assert_ne!(after[at].name, ".config", "the drift this guards against");
+
+        let moved = box_mark_find(&after, id).expect("still on screen");
+        assert_eq!(after[moved].name, ".config");
+        assert_ne!(moved, at, "it genuinely had to move");
+
+        // A real directory may be named `(files here)`; the flag is what tells it from the
+        // remainder cell, so marking one never re-points onto the other.
+        let mut twins = vec![bx("(files here)", [0.0, 0.0, 50.0, 50.0])];
+        twins.push(DuBox { child: None, ..bx("(files here)", [50.0, 0.0, 50.0, 50.0]) });
+        assert_eq!(box_mark_find(&twins, box_mark_id(&twins, Some(0))), Some(0));
+        assert_eq!(box_mark_find(&twins, box_mark_id(&twins, Some(1))), Some(1));
+
+        // A cell that is gone drops the marker rather than landing on a stranger.
+        assert_eq!(box_mark_find(&after, Some(("nowhere".into(), false))), None);
+        assert_eq!(box_mark_find(&after, None), None);
     }
 
     #[test]

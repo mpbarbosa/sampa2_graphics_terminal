@@ -61,8 +61,9 @@ DESIGN.md §10.1 / §13).
   near 1 so areas are comparable; box **area ∝ disk usage**.
 - Each level shows the current directory's child directories, plus a **`(files here)`**
   remainder box for the bytes in the directory itself (its size minus the children's) so
-  the boxes sum to the whole. Boxes are labelled (name + human size) when large enough; all
-  boxes carry a hover tooltip.
+  the boxes sum to the whole. Boxes are labelled in place (name + human size) when large
+  enough. The native build has no tooltip and no hover state over the boxes — the strip
+  above the chart reads out the keyboard-marked cell instead (§5).
 - The layout depends on the panel's pixel size, so it is computed in the **frontend**; the
   headless core only parses `du` into the tree.
 
@@ -71,10 +72,53 @@ DESIGN.md §10.1 / §13).
 | Input | Action |
 |---|---|
 | Click a box | **Zoom** into that directory (if it has children) |
-| Breadcrumb segment | Jump back to that ancestor level |
-| `Backspace` | Up one level |
-| `Enter` | **`cd` to the directory currently in view** — compose `cd <path>` at the prompt and close |
+| `←` `→` `↑` `↓` | Move the marker **to the neighbouring cell in that direction** |
+| `Space` | **Zoom** into the marked cell — the keyboard's click |
+| `Backspace` | Up one level (clearing the marker) |
+| `t` | Swap to the rings (and back) |
+| `Enter` | **`cd`** — to the marked cell if there is one, else to the directory in view; composed at the prompt, never run |
 | `Esc` / ✕ / backdrop | Close |
+
+The marked cell is drawn lifted toward the foreground with a bright surround, and the strip
+(§4) reads out its full path and size — the same contract the rings' marker has, so `Enter`
+and the readout can never disagree about which directory is meant.
+
+**The four arrow keys mean four directions here, and something else in the rings.** The
+rings have two axes to spend them on — around a ring, and across to the ring inside or
+outside it — whereas a treemap shows a single level tiling a rectangle, where the only
+axes are the screen's. So the two layouts do not share a step type: `DuDir` has `Left`,
+`Right`, `Up`, `Down`, and `DuStep` (spec-du-rings.md §5) has `Prev`, `Next`, `In`, `Out`.
+Folding them into one enum would make one set of names a lie about what the keys do.
+
+Stepping is computed from the layout alone (`rect_step`), as the rings' is. A squarified
+treemap is a *tiling, not a grid* — rows run full-width or full-height, but the cells
+within a row have unequal extent, so "the cell to the right" is not a column index.
+Candidates are the cells whose centre lies in the direction of travel, ranked by whether
+they overlap the current cell on the axis *across* the travel, then by distance along the
+travel, then by offset across it. That first key is what keeps a step along a row from
+leaving the row: a cell sharing an edge with this one is the one the eye calls its
+neighbour, even where a cell in the row above happens to have a nearer centre. Overlap is a
+preference rather than a requirement, so a key still moves where nothing sits directly
+alongside — refusing it would strand the marker in a corner. Cells too thin to draw are
+skipped, since marking one would read out a path with nothing visible beside it.
+
+**The end-stops differ from the rings', and deliberately.** At the edge of the map the
+marker stays where it is: a rectangle has no seam to wrap around, so there is no sideways
+wrap, and nothing corresponds to the rings' `↑`-from-the-hub step that clears the marker —
+every cell here sits at the same level. `Backspace` is what clears a treemap marker, by
+leaving the level the cells belonged to.
+
+**The marker is re-pointed by identity after every relayout**, for the reason set out in
+spec-du-rings.md §5: it is an index into the laid-out cells, §3's progressive scan rebuilds
+them four times a second, and a directory finishing its walk shifts every later cell along.
+Within one level a name is unique, so the name is the identity — paired with whether the
+cell is the `(files here)` remainder, which carries the view's own path and so would be
+indistinguishable by path, and which a real directory could even share a name with. A cell
+that is genuinely gone drops the marker.
+
+The pointer does not mark treemap cells: the boxes are labelled in place, so there is
+nothing a hover readout would add that the layout does not already show. (The rings need
+one because a sector is too narrow to label.)
 
 `Enter` composes the command and **never appends a newline**: the path is shell-quoted when
 it contains whitespace/metacharacters, the tracked line is erased first, and `cd <path> ` is
