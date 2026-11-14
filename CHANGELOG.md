@@ -5,6 +5,37 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.16.0] - 2026-11-13
+
+**The disk-usage views fill in while `du` is still walking.** Until now the overlay was
+blank for the whole scan and then appeared at once, which is why the scan budget had been
+raised twice — from 6 s to 90 s — on the belief that `du` prints nothing until it has
+finished. It doesn't: it prints each directory as it completes it, and measured on a 142 GB
+`$HOME` the rows arrive steadily — 10 924 of them over 91 s, 11 % of those inside the first
+9 s. That output was arriving all along and being discarded until the last row landed. It
+is now streamed into the view and redrawn four times a second, so **a usable treemap of a
+142 GB home is on screen at about 3 seconds** with the strip counting `scanning… N dirs`
+while it fills. Sizes shown mid-scan are lower bounds that only rise, never figures that
+jump about.
+
+The same measurement retired the budget as a concept: the home directory that 90 s was
+sized against had already grown to 91.1 s, one day later. **The timeout is now a 600 s
+backstop** against a `du` wedged on a dead mount rather than the gate on the view, and if
+it ever fires it keeps whatever arrived and says the picture is partial, instead of
+discarding a nearly complete scan. Closing the overlay or re-scanning now **kills the
+child**, so a cancelled scan stops walking a large tree unseen.
+
+### Features
+
+- Stream the `du` scan into the view as it arrives, with a dirs-scanned counter in the
+  breadcrumb, lower-bound sizes while it runs, and cancellation that actually kills `du`
+
+### Documentation
+
+- Correct `spec-du-treemap.md` and `spec-du-rings.md`, which both stated that `du` prints
+  nothing until the walk ends; record the progressive scan that `spec-du-rings.md` §8 had
+  listed as a follow-up
+
 ## [0.15.2] - 2026-11-13
 
 **Two dead ends in the `du` views, both of which told you nothing where they should have
