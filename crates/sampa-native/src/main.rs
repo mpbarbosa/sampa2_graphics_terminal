@@ -3714,6 +3714,7 @@ fn main() -> Result<()> {
         ps_sort: PsSort::Order,
         ps_groups: Vec::new(),
         ps_collapsed: Vec::new(),
+        ps_desc: std::collections::HashMap::new(),
         ps_sel: 0,
         ps_detail: None,
         ps_filter: String::new(),
@@ -4236,6 +4237,9 @@ struct App {
     // 1c inspector (spec §6) — active at the resolved Inspector level.
     ps_groups: Vec<GroupView>,
     ps_collapsed: Vec<bool>, // parallel to ps_groups
+    /// Process name → one-line `whatis` description, looked up once per panel open
+    /// (spec §5). Empty when man-db is absent, which renders a blank column.
+    ps_desc: std::collections::HashMap<String, String>,
     ps_sel: usize,           // index into the current visual-line list
     ps_detail: Option<(u32, PsDetail)>, // enrich for the selected row's pid (cached)
     ps_filter: String,       // incremental filter on command/user (spec §6); empty = off
@@ -5592,6 +5596,206 @@ fn ps_sort_order(rows: &[sampa_ps_decorate::QuietRow], sort: PsSort) -> Vec<usiz
         PsSort::Pid => order.sort_by_key(|&i| rows[i].pid.parse::<u64>().unwrap_or(0)),
     }
     order
+}
+
+/// The widest `whatis` output we ask for. `whatis` truncates its own descriptions to
+/// `COLUMNS` and marks the cut with `...`, so without this a description arrives already
+/// shortened — at the default 80 it cuts python3's at "object-oriented programmi...", and
+/// the panel would then show an ellipsis with room to spare. Measured, not assumed.
+const WHATIS_COLUMNS: &str = "400";
+/// How long to wait for the whole `whatis` batch. One call over the 134 unique names of an
+/// 832-process `ps aux` measured 17 ms, so this is a backstop against a wedged mandb, not a
+/// budget anyone should reach.
+const WHATIS_TIMEOUT_MS: u64 = 1500;
+/// Cap on how many names one batch asks about — a bound on a list built from scrollback
+/// text, which a process can put anything it likes into.
+const WHATIS_MAX_NAMES: usize = 512;
+
+/// The name to look a process up under, for a row that still has a live pid.
+///
+/// `/proc/<pid>/comm` is the kernel's own name for the process, and the reason this is
+/// tried first is the whole reason the column works at all: the scraped `COMMAND` carries
+/// `ps`'s width truncation, so `/usr/lib/systemd/systemd` arrives as `/usr/lib/syst` and
+/// its "basename" is `syst` — a lookup for nothing. Observed: at the width a default
+/// window produces, almost every row was undescribable from the command text alone.
+///
+/// It is read-only and local, no process spawned. A pid from the scrollback may of course
+/// be dead or reused by now; a dead one simply reads nothing and falls back, and a reused
+/// one is the assumption this panel already makes everywhere — `k` composes a `kill` for
+/// these same pids.
+fn comm_name(pid: &str) -> Option<String> {
+    if !pid.chars().all(|c| c.is_ascii_digit()) || pid.is_empty() || pid.len() > 7 {
+        return None;
+    }
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    clean_name(raw.trim())
+}
+
+/// The name to look a process up under: `/proc/<pid>/comm` where that is readable, else
+/// the basename of the command word (spec §5).
+fn lookup_name(pid: &str, command: &str) -> Option<String> {
+    comm_name(pid).or_else(|| whatis_name(command))
+}
+
+/// The name to look a process up under: the basename of its command word.
+///
+/// Returns `None` rather than a doubtful name, because the result is passed to another
+/// program. `ps` output is not trustworthy input — a process controls its own `argv[0]`,
+/// so this is the boundary where "whatever was printed" has to become "a name safe to
+/// hand to `whatis`". Only `[A-Za-z0-9._+-]` survives, which is wider than any real
+/// command name and still contains no shell metacharacter, no path separator and no
+/// whitespace. Leading dashes go too: a login shell prints as `-zsh`, and `whatis` would
+/// read that as an option (it does — the batch fails outright, which is how this was
+/// found), so `--` alone is not enough.
+fn whatis_name(command: &str) -> Option<String> {
+    let word = command.split_whitespace().next()?;
+    // Kernel threads print bracketed. They have no manual page, and taking a basename of
+    // `[kworker/13:2]` yields `13` — a lookup for nothing. They are folded out of the
+    // table long before this, so refusing them here just keeps the batch clean.
+    if word.starts_with('[') {
+        return None;
+    }
+    // `ps` prints some daemons as `name: status...`.
+    let base = word.rsplit('/').next()?.split(':').next()?;
+    clean_name(base)
+}
+
+/// The shared gate on anything that becomes an argument to `whatis`: a leading `-` is
+/// stripped (a login shell prints as `-zsh`, which `whatis` reads as an option — the batch
+/// then dies with `invalid option -- 'z'`, so `--` alone is not enough), and the result
+/// must be a plain name. The permitted set is wider than any real command name and still
+/// holds no shell metacharacter, path separator or whitespace.
+fn clean_name(s: &str) -> Option<String> {
+    let s = s.trim().trim_start_matches('-');
+    if s.is_empty() || s.len() > 64 {
+        return None;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+        .then(|| s.to_string())
+}
+
+/// Parse `whatis` output into name → one-line description.
+///
+/// Each line reads `name (section)  - description`, and a page may list aliases as
+/// `name1, name2 (1) - description`. Two things make this more than a `split`:
+///
+/// * **The output is sorted, not in the order asked.** Verified: asking `zsh bash node`
+///   answers `bash`, `node`, `zsh`. So this keys by name; zipping by position would
+///   attach descriptions to the wrong processes.
+/// * **A name can appear several times**, once per manual section — `passwd` answers for
+///   (1), (1ssl) and (5). The first wins, which is section 1, the executable: for a
+///   process that is the right one of the three.
+///
+/// Pages with no summary render as `(unknown subject)`; those are dropped, so the column
+/// is blank rather than filled with a string that says nothing.
+fn parse_whatis(out: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in out.lines() {
+        let Some((lhs, desc)) = line.split_once(" - ") else {
+            continue;
+        };
+        let desc = desc.trim();
+        if desc.is_empty() || desc == "(unknown subject)" {
+            continue;
+        }
+        // `lhs` is `name (section)`, or `name1, name2 (section)` for an aliased page.
+        let names = lhs.split('(').next().unwrap_or("");
+        for n in names.split(',') {
+            let n = n.trim();
+            if !n.is_empty() {
+                map.entry(n.to_string()).or_insert_with(|| desc.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Look every distinct process name up in the system's `whatis` database, in one call.
+///
+/// Read-only and bounded, like every other external command here: no shell, an explicit
+/// `--` before the names, a timeout, and a cap on how many are asked about. Returns an
+/// empty map when `whatis` is missing or mandb is unbuilt — the column then renders blank,
+/// which is the honest answer and not an error worth a message.
+fn ps_describe(rows: &[(String, String)]) -> std::collections::HashMap<String, String> {
+    let mut names: Vec<String> =
+        rows.iter().filter_map(|(pid, cmd)| lookup_name(pid, cmd)).collect();
+    names.sort();
+    names.dedup();
+    names.truncate(WHATIS_MAX_NAMES);
+    if names.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let mut cmd = std::process::Command::new("whatis");
+    cmd.env("COLUMNS", WHATIS_COLUMNS)
+        .env("MANWIDTH", WHATIS_COLUMNS)
+        .arg("--")
+        .args(&names)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        // Unknown names go to stderr one line each ("foo: nothing appropriate."); that is
+        // the normal case, not a failure, so it is dropped rather than read.
+        .stderr(std::process::Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return std::collections::HashMap::new(); // no man-db on this system
+    };
+    let Some(mut out) = child.stdout.take() else {
+        let _ = child.kill();
+        return std::collections::HashMap::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut s = String::new();
+        let _ = out.read_to_string(&mut s);
+        let _ = tx.send(s);
+    });
+    let text = match rx.recv_timeout(std::time::Duration::from_millis(WHATIS_TIMEOUT_MS)) {
+        Ok(t) => {
+            let _ = child.wait();
+            t
+        }
+        Err(_) => {
+            let _ = child.kill();
+            return std::collections::HashMap::new();
+        }
+    };
+    parse_whatis(&text)
+}
+
+/// Below this many columns the `DESC` column is dropped entirely (spec §5), the same
+/// step-down-a-level rule §8 applies to bars and the inspector. It is a constant rather
+/// than an `[enhance]` setting because the thresholds live in `sampa-config`, which is a
+/// different repository — adding one there is a change this build cannot make alone.
+///
+/// It matches `min_width_bars` deliberately. A first attempt put it at 140, which could
+/// never fire: the 1c inspector takes over at 120 and draws its own rows, so the flat
+/// table only ever runs *below* that — a threshold above it describes a state that does
+/// not exist. Descriptions therefore arrive with the bars, and anyone who prefers the flat
+/// table at any width can pin it with `ps = bars` under `[enhance]`.
+const PS_MIN_WIDTH_DESC: u16 = 100;
+/// The narrowest `DESC` worth drawing, and the most it may take. Under the floor a
+/// description is cut to nothing useful, so the column is dropped instead.
+const PS_DESC_MIN: usize = 14;
+const PS_DESC_MAX: usize = 40;
+/// Split the width left after the fixed columns between `COMMAND` and `DESC`.
+///
+/// `DESC` is the one that yields: it takes a third of what is going spare, capped at
+/// [`PS_DESC_MAX`], and if that comes to less than [`PS_DESC_MIN`] it gets nothing and the
+/// column is not drawn at all. Returns `(command, desc)`, where `desc == 0` means "no
+/// column"; the two always sum to `budget`.
+///
+/// `COMMAND` needs no floor of its own. Taking a third leaves it two thirds, and a `DESC`
+/// wide enough to draw at all needs `budget >= 3 * PS_DESC_MIN`, so `COMMAND` is never left
+/// under twice that — comfortably more than any floor worth writing. A first version did
+/// carry one, at 24 columns; it could not be made to bind, and a guard whose removal no
+/// test can observe is decoration, so it is gone rather than kept for reassurance.
+fn desc_split(budget: usize) -> (usize, usize) {
+    let desc = (budget / 3).min(PS_DESC_MAX);
+    if desc < PS_DESC_MIN {
+        return (budget, 0);
+    }
+    (budget - desc, desc)
 }
 
 /// Which way a keyboard step moves the flat `ps` table's selection (spec §5).
@@ -7690,6 +7894,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
 
         self.ps_groups = Vec::new();
         self.ps_collapsed = Vec::new();
+        self.ps_desc = std::collections::HashMap::new();
         self.ps_sel = 0;
         self.ps_detail = None;
         self.ps_filter.clear();
@@ -7702,6 +7907,11 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
                     self.ps_collapsed = vec![false; self.ps_groups.len()];
                     // Selection starts on the first group header, so no row detail yet.
                 }
+                // One batched lookup per open, not per frame: the table is static until
+                // the panel is reopened, and the descriptions with it.
+                let named: Vec<(String, String)> =
+                    quiet.rows.iter().map(|r| (r.pid.clone(), r.command.clone())).collect();
+                self.ps_desc = ps_describe(&named);
                 PsView::Table(Box::new(quiet))
             }
             None => PsView::Message(
@@ -7716,6 +7926,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.ps_view = None;
         self.ps_groups = Vec::new();
         self.ps_collapsed = Vec::new();
+        self.ps_desc = std::collections::HashMap::new();
         self.ps_detail = None;
         self.ps_filter.clear();
         self.ps_filter_editing = false;
@@ -8114,14 +8325,50 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         // `+ 2` for the selection caret column, which every line now carries.
         let fixed =
             2 + w_pid + 1 + w_user + 1 + w_cpu + bar_w + 1 + w_mem + bar_w + 1 + w_rss + 1 + w_start + 1;
-        let cmd_budget = (self.cols as usize).saturating_sub(fixed).max(8);
+        let spare = (self.cols as usize).saturating_sub(fixed).max(8);
+        // DESC is dropped outright below the width threshold, the same step-down rule §8
+        // applies to bars and the inspector — and again by `desc_split` when what is left
+        // after COMMAND's floor is too little to say anything in.
+        let (cmd_budget, desc_w) = if self.cols >= PS_MIN_WIDTH_DESC {
+            desc_split(spare)
+        } else {
+            (spare, 0)
+        };
+        let cmd_budget = cmd_budget.max(8);
+        // `+ 1` for the space before it; zero width means the column is not drawn at all.
+        let desc_for = |r: &sampa_ps_decorate::QuietRow| -> String {
+            if desc_w == 0 {
+                return String::new();
+            }
+            let d = lookup_name(&r.pid, &r.command)
+                .and_then(|n| self.ps_desc.get(&n))
+                .map(|d| truncate_chars(d, desc_w))
+                .unwrap_or_default();
+            format!(" {d}")
+        };
 
+        // Pad COMMAND to the widest one actually drawn, not to its whole budget: `ps` has
+        // usually already cut these short, and padding to the budget strands DESCRIPTION
+        // at the far right of a gap nothing fills. Capped at the budget, floored so the
+        // header's own label still fits.
+        let cmd_pad = if desc_w == 0 {
+            0
+        } else {
+            q.rows
+                .iter()
+                .map(|r| truncate_chars(&r.command, cmd_budget).chars().count())
+                .max()
+                .unwrap_or(0)
+                .clamp("COMMAND".len(), cmd_budget)
+        };
         // Pinned column header (muted, bold). The bar columns are unlabelled spacers.
         let gap = |on: bool| if on { format!(" {:bw$}", "", bw = sampa_ps_decorate::BAR_CELLS) } else { String::new() };
         let header = format!(
-            "  {:>wp$} {:<wu$} {:>wc$}{cb} {:>wm$}{mb} {:>wr$} {:<ws$} COMMAND",
-            "PID", "USER", "%CPU", "%MEM", "RSS", "START",
+            "  {:>wp$} {:<wu$} {:>wc$}{cb} {:>wm$}{mb} {:>wr$} {:<ws$} {:<wq$}{}",
+            "PID", "USER", "%CPU", "%MEM", "RSS", "START", "COMMAND",
+            if desc_w == 0 { "" } else { " DESCRIPTION" },
             wp = w_pid, wu = w_user, wc = w_cpu, wm = w_mem, wr = w_rss, ws = w_start,
+            wq = cmd_pad,
             cb = gap(bars), mb = gap(bars),
         );
 
@@ -8161,10 +8408,19 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             if let Some(bp) = &bar_pairs {
                 line.push((format!(" {}", bp[i].1), mem_c, false, false));
             }
+            let desc = desc_for(r);
+            // COMMAND is padded to its budget only when a DESC follows it, so the
+            // descriptions line up; without one it stays ragged as before.
+            let cmd_cell =
+                if desc.is_empty() { cmd } else { format!("{cmd:<w$}", w = cmd_pad) };
             line.push((
-                format!(" {:>wr$} {:<ws$} {}", r.rss, r.start, cmd, wr = w_rss, ws = w_start),
+                format!(" {:>wr$} {:<ws$} {cmd_cell}", r.rss, r.start, wr = w_rss, ws = w_start),
                 fg, false, false,
             ));
+            if !desc.is_empty() {
+                // Muted: it is context for the command, not a column to read first.
+                line.push((desc, muted, false, false));
+            }
             rows.push(line);
         }
         if let Some(sum) = q.kernel_summary() {
@@ -15403,6 +15659,188 @@ mod tests {
     }
 
     #[test]
+    fn a_process_name_is_cleaned_before_it_reaches_another_program() {
+        // `ps` output is not trustworthy input: a process controls its own `argv[0]`, and
+        // whatever it puts there is what this hands to `whatis`.
+        assert_eq!(whatis_name("/usr/lib/systemd/systemd --user").as_deref(), Some("systemd"));
+        assert_eq!(whatis_name("zsh").as_deref(), Some("zsh"));
+        // A login shell prints as `-zsh`. `whatis` reads a leading dash as an option and
+        // the whole batch dies with "invalid option -- 'z'" — observed, which is why the
+        // `--` terminator alone is not enough.
+        assert_eq!(whatis_name("-zsh").as_deref(), Some("zsh"));
+        // `ps` prints some daemons as `name: status`, and kernel threads bracketed.
+        assert_eq!(whatis_name("avahi-daemon: running [sampa]").as_deref(), Some("avahi-daemon"));
+        // A kernel thread has no manual page, and a basename of `[kworker/13:2]` would be
+        // `13` — a lookup for nothing. Refused rather than asked about.
+        assert_eq!(whatis_name("[kworker/13:2]"), None);
+        assert_eq!(whatis_name("[kthreadd]"), None);
+
+        // Anything with a character a command name never has is refused outright rather
+        // than quoted or escaped — nothing downstream has to be careful.
+        for hostile in [
+            "sh -c 'rm -rf /'",
+            "foo;rm",
+            "foo|bar",
+            "foo$(id)",
+            "foo`id`",
+            "foo&",
+            "foo>out",
+            "foo\\\\bar",
+            "foo\"bar",
+            "foo'bar",
+            "foo*",
+            "näme",
+        ] {
+            let got = whatis_name(hostile);
+            assert!(
+                got.as_deref().is_none_or(|n| n
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))),
+                "{hostile:?} produced {got:?}"
+            );
+        }
+        assert_eq!(whatis_name(""), None);
+        assert_eq!(whatis_name("   "), None);
+        assert_eq!(whatis_name("-"), None, "a bare dash leaves nothing");
+        assert_eq!(whatis_name(&"a".repeat(65)), None, "absurdly long names are refused");
+        assert_eq!(whatis_name(&"a".repeat(64)).as_deref(), Some("a".repeat(64).as_str()));
+    }
+
+    #[test]
+    fn the_kernels_name_is_preferred_over_the_truncated_command() {
+        // The reason the column works at all. `ps aux` cuts `COMMAND` to the terminal
+        // width, so `/usr/lib/systemd/systemd` arrives as `/usr/lib/syst` and its
+        // "basename" is `syst` — a lookup for nothing. Observed before this: at the width
+        // a default window gives, nearly every row was undescribable from the text alone,
+        // and three different daemons all read `/usr/lib/syst`.
+        assert_eq!(whatis_name("/usr/lib/syst").as_deref(), Some("syst"), "the trap");
+
+        // A pid that cannot be one is refused before it reaches the filesystem.
+        assert_eq!(comm_name("notapid"), None);
+        assert_eq!(comm_name(""), None);
+        assert_eq!(comm_name("../../etc/passwd"), None, "no path traversal through the pid");
+        assert_eq!(comm_name("12345678"), None, "longer than any real pid");
+
+        // With no readable `/proc` entry the command's basename is still the answer, so a
+        // row whose process has exited keeps whatever the text can give.
+        assert_eq!(lookup_name("0", "/usr/bin/zsh --login").as_deref(), Some("zsh"));
+        assert_eq!(lookup_name("notapid", "-zsh").as_deref(), Some("zsh"));
+        assert_eq!(lookup_name("0", "[kworker/1:2]"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pid_shaped_like_a_path_cannot_reach_outside_proc() {
+        // The digits-only check is not redundant with "the read will fail anyway". A pid
+        // comes from scrollback text, `/proc/<pid>/comm` is built by interpolation, and
+        // `..` in that slot escapes `/proc` — `/proc/../tmp/x` *is* `/tmp/x`. The read
+        // only fails for the traversals that happen to land on nothing; this one lands on
+        // a real file, so without the guard it would be read and shown as a process name.
+        let dir = std::env::temp_dir().join(format!("sampa-comm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("comm"), "notaprocess\n").unwrap();
+
+        let escape = format!("..{}", dir.join("x").parent().unwrap().display());
+        // Sanity: the path this pid would build really does resolve to the planted file,
+        // so the assertion below is about the guard and not about a broken path.
+        let built = std::path::PathBuf::from(format!("/proc/{escape}/comm"));
+        assert_eq!(
+            std::fs::read_to_string(&built).ok().as_deref().map(str::trim),
+            Some("notaprocess"),
+            "the traversal reaches the planted file: {built:?}"
+        );
+        assert_eq!(comm_name(&escape), None, "the guard refuses it before the read");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_pid_is_named_by_the_kernel_not_by_the_text() {
+        // pid 1 exists on any Linux that can run this test, and its command text here is
+        // deliberately the truncation that defeats `whatis_name`.
+        let from_text = whatis_name("/usr/lib/syst");
+        let from_proc = lookup_name("1", "/usr/lib/syst");
+        assert_eq!(from_text.as_deref(), Some("syst"));
+        assert!(from_proc.is_some(), "pid 1 should name itself");
+        assert_ne!(from_proc, from_text, "the kernel's name must win over the cut text");
+        // Whatever it is called here (systemd, init, …), it is a plain name fit to pass on.
+        let n = from_proc.unwrap();
+        assert!(n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-')));
+    }
+
+    #[test]
+    fn whatis_output_is_keyed_by_name_not_by_position() {
+        // Two properties of the real output, both measured rather than assumed:
+        //   * it comes back sorted, not in the order asked — `zsh bash node` answers
+        //     bash, node, zsh. Zipping by position would caption the wrong processes.
+        //   * a name can answer several times, once per manual section. The first wins,
+        //     which is section 1 — the executable, and so the right one for a process.
+        let out = "\
+bash (1)             - GNU Bourne-Again SHell
+node (1)             - server-side JavaScript runtime
+passwd (1)           - change user password
+passwd (1ssl)        - OpenSSL application commands
+passwd (5)           - the password file
+zsh (1)              - the Z shell
+";
+        let m = parse_whatis(out);
+        assert_eq!(m.get("zsh").map(String::as_str), Some("the Z shell"));
+        assert_eq!(m.get("bash").map(String::as_str), Some("GNU Bourne-Again SHell"));
+        assert_eq!(
+            m.get("passwd").map(String::as_str),
+            Some("change user password"),
+            "section 1 wins, not the last line seen"
+        );
+
+        // Aliased pages list several names before the section.
+        let aliased = parse_whatis("gunzip, zcat (1)     - compress or expand files\n");
+        assert_eq!(aliased.get("gunzip").map(String::as_str), Some("compress or expand files"));
+        assert_eq!(aliased.get("zcat").map(String::as_str), Some("compress or expand files"));
+
+        // A page with no summary says so; an empty column is better than that string.
+        assert!(parse_whatis("containerd (8)       - (unknown subject)\n").is_empty());
+        // Noise, and `whatis`'s own "nothing appropriate" line, carry no " - " separator.
+        assert!(parse_whatis("notathing: nothing appropriate.\n").is_empty());
+        assert!(parse_whatis("").is_empty());
+    }
+
+    #[test]
+    fn the_description_column_yields_before_the_command_does() {
+        // COMMAND is what a row is identified by, so DESC is the one that gives way.
+        // Well past three times the cap, so a missing cap would show: a third of 300 is
+        // 100. (120 would not prove it — a third of that *is* the cap.)
+        let (cmd, desc) = desc_split(300);
+        assert_eq!(desc, PS_DESC_MAX, "a wide table caps DESC rather than letting it sprawl");
+        assert_eq!(cmd + desc, 300, "the split spends the whole budget");
+        assert!(cmd > desc, "COMMAND keeps the larger share");
+        assert_eq!(desc_split(3 * PS_DESC_MAX).1, PS_DESC_MAX, "the cap binds from here up");
+
+        // A third of what is spare, while that is under the cap.
+        let (cmd, desc) = desc_split(60);
+        assert_eq!((cmd, desc), (40, 20));
+
+        // The narrowest budget that still draws a column, and the one below it.
+        assert_eq!(desc_split(3 * PS_DESC_MIN), (2 * PS_DESC_MIN, PS_DESC_MIN));
+        let narrow = 3 * PS_DESC_MIN - 1;
+        assert_eq!(
+            desc_split(narrow),
+            (narrow, 0),
+            "with no room to say anything, DESC is dropped and COMMAND gets the lot"
+        );
+
+        // Across every width: the budget is spent exactly, a drawn DESC is never too thin
+        // to read, and COMMAND always keeps the larger share. That last one is why no
+        // separate COMMAND floor is needed.
+        for budget in 0..400 {
+            let (cmd, desc) = desc_split(budget);
+            assert_eq!(cmd + desc, budget, "budget {budget} must be spent exactly");
+            assert!(desc == 0 || desc >= PS_DESC_MIN, "budget {budget} drew a DESC too thin to read");
+            assert!(cmd >= desc, "budget {budget} gave DESC the larger share");
+        }
+    }
+
+    #[test]
     fn the_kernel_summary_is_the_last_stop_and_selects_no_process() {
         // The summary sits below the last row and states how many kernel threads were
         // folded and how to unfold them (spec §4). A selection that stopped at the last
@@ -15423,7 +15861,7 @@ mod tests {
         // Landing on it selects no process: the flat lookup is `order.get(sel)`, and the
         // summary's index is one past the end of the order, so `y`/`Y`/`k` find nothing
         // to act on — the same answer a group header gives in the 1c inspector.
-        let order = vec![2usize, 0, 1];
+        let order = [2usize, 0, 1];
         assert_eq!(order.get(3).copied(), None, "the summary indexes past the order");
         assert_eq!(order.get(2).copied(), Some(1), "the last row still resolves");
     }
