@@ -114,7 +114,9 @@ here)`, **leaves it where it is** rather than silently losing it. Along a ring t
 end-stop at all: a ring is a circle, and stopping at the 12 o'clock seam would strand the
 sectors either side of it.
 
-Rings only. The treemap shows one level at a time and is navigated by clicking into it.
+Rings only — `arc_step` and `DuStep` describe a ring and a depth. The treemap reads the
+same four keys as the four screen directions, through its own `rect_step`/`DuDir`; see
+spec-du-treemap.md §5 for why the two are kept apart.
 
 ## 6. Labels, and why there is a hover readout
 
