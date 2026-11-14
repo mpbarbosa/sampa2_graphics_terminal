@@ -7955,7 +7955,20 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         }
     }
 
-    /// `y`/`Y` — copy the selected row's PID, or its full (untruncated) command line.
+    /// `y`/`Y` — copy the selected row's PID, or its command.
+    ///
+    /// Not the *full* command line: this panel decorates text already in the scrollback,
+    /// and `ps aux` truncates `COMMAND` to the terminal width itself, when it ran — so
+    /// `/usr/lib/systemd/systemd --switched-root` may only ever have been written as
+    /// `/usr/lib/systemd/systemd --s`, and no amount of reading the buffer brings the rest
+    /// back. `ps -p <pid> -o args=` is the way to that, which is what `y` is for.
+    ///
+    /// This copies `r.command` while the row renders `truncate_chars(&r.command, budget)`,
+    /// so in principle the copy escapes *this* panel's truncation too — but the panel drops
+    /// `VSZ`, `TTY` and `TIME`, leaving its `COMMAND` column some 25 cells wider than what
+    /// `ps aux` left, so the scraped string nearly always fits whole and the two agree.
+    /// Measured: at 75 columns both were the same 28 characters. Do not describe `Y` as
+    /// giving more than the row shows.
     fn ps_copy_selected(&mut self, full_command: bool) {
         let text = self.ps_selected_row().and_then(|ri| {
             let Some(PsView::Table(q)) = self.ps_view.as_ref() else {
