@@ -5,6 +5,52 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.19.0] - 2026-11-14
+
+**The `ps` table is navigable at every width, not only the widest one.** The two-pane
+inspector has had a moving selection from the start, but it needs a terminal of at least
+120 columns. Below that the panel had a scroll position and nothing else — so the narrow
+terminal, which is where `ps aux` is hardest to read, was the one where nothing could be
+done with a row. Copying a pid or composing a `kill` meant widening the window until the
+inspector appeared.
+
+The flat table now carries a selection of its own. `↑↓` and `j` move it, `PgUp`/`PgDn` move
+a page, `Home`/`End` jump to either end, `y`/`Y` copy the pid or the full command line, and
+`k` composes `kill <pid>` at the prompt without running it. Those four are the same keys
+the inspector binds, so a window resize that steps the level up or down never changes what
+a key does. There is deliberately no `k` for "up": a key that kills should not be one a vim
+reflex reaches for while scrolling.
+
+**The selection is a caret in the first column, not a highlighted row.** The quiet level's
+promise is that its output is plain text — it copies, pipes and renders on a serial console
+unchanged — and a background would not survive a copy while `❯ ` does. The folded-kernel
+summary keeps the same indent so the columns stay aligned, and is reachable as the table's
+last stop; it selects no process, so `y` and `k` do nothing there.
+
+**The window scrolls by the least it can** rather than recentring as the inspector does.
+Recentring suits a short grouped list beside a detail pane; this table runs to hundreds of
+rows and is read by scanning, where a view that jumps half a screen per arrow key loses the
+reader's place. Nothing wraps at either end, either — `k` acts on whatever is selected, so
+a key meaning "one further down" must never move the selection the length of the table.
+
+**A re-sort carries the selection with its process.** The selection is a position in the
+displayed order, and `c`/`m`/`p` reorder the table without re-running `ps`, so holding the
+position would leave it resting on a different process — and `k` would then compose a
+`kill` for one the user never chose. This is the defect 0.17.1 fixed for the disk-usage
+rings, in a place where it costs more, and it has the same remedy: read what is selected
+before the order changes, and find it again afterwards.
+
+### Features
+
+- Move, copy and signal from the flat `ps` table with the keyboard, at every width
+
+### Documentation
+
+- Correct `spec-ps-output-enhancement.md` §6, whose key table listed `j k` as "move
+  selection" when `k` is the signal key and nothing moves the selection up but `↑`
+- Qualify §4's "no interaction" as a property of the enhanced *output* — which is plain
+  text at every level — rather than of the panel drawn over it, which is navigable
+
 ## [0.18.0] - 2026-11-14
 
 **The disk-usage treemap is navigable without a mouse.** 0.17.0 gave the rings arrow keys;
