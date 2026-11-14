@@ -1237,6 +1237,77 @@ fn arc_label_box(arc: &DuArc) -> ([f32; 2], f32, f32) {
     (pos, 2.0 * rm * (0.5 * sweep).sin(), arc.r1 - arc.r0)
 }
 
+/// Which way a keyboard step moves through the rings (spec-du-rings.md §5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DuStep {
+    /// Anticlockwise along the current ring, wrapping at 12 o'clock.
+    Prev,
+    /// Clockwise along the current ring, wrapping at 12 o'clock.
+    Next,
+    /// One ring inward, toward the hub — shallower in the tree.
+    In,
+    /// One ring outward — deeper in the tree, following the focused sector's own angle.
+    Out,
+}
+
+/// Move the keyboard focus one step through a laid-out sunburst, returning the sector to
+/// focus next.
+///
+/// The layout is the only state this needs: a ring is the set of sectors sharing an `r0`,
+/// and the sectors of one ring tile its parent's sweep exactly, so "the child under this
+/// one" is simply the sector in the next ring out whose sweep contains the current
+/// sector's mid-angle. Nothing is stored between steps, so a relayout mid-scan cannot
+/// leave the focus describing a tree that is no longer there.
+///
+/// `None` means there is nowhere to go: at the outermost ring (nothing deeper to enter) or
+/// at the innermost one going in (the hub is not a sector). The caller distinguishes the
+/// two — going in from the innermost ring clears the focus, while a step with no target
+/// leaves it alone rather than dropping it.
+fn arc_step(arcs: &[DuArc], from: Option<usize>, step: DuStep) -> Option<usize> {
+    if arcs.is_empty() {
+        return None;
+    }
+    // Rings compared by `r0` with a half-pixel slack: the band radii are computed per
+    // sector from the same float arithmetic, so they are equal in intent, not in bits.
+    let same_ring = |a: f32, b: f32| (a - b).abs() < 0.5;
+    let Some(i) = from else {
+        // Nothing focused yet: the largest sector of the innermost ring, which is the
+        // first one `sunburst` emits.
+        let inner = arcs.iter().map(|a| a.r0).fold(f32::INFINITY, f32::min);
+        return arcs.iter().position(|a| same_ring(a.r0, inner));
+    };
+    let cur = arcs.get(i)?;
+    match step {
+        DuStep::Prev | DuStep::Next => {
+            let mut ring: Vec<usize> =
+                (0..arcs.len()).filter(|&j| same_ring(arcs[j].r0, cur.r0)).collect();
+            ring.sort_by(|&x, &y| arcs[x].a0.total_cmp(&arcs[y].a0));
+            let at = ring.iter().position(|&j| j == i)?;
+            let n = ring.len();
+            // Wrapping is the right end-stop here: a ring is a circle, and stopping at
+            // 12 o'clock would strand the sector either side of the seam.
+            let to = if step == DuStep::Next { (at + 1) % n } else { (at + n - 1) % n };
+            Some(ring[to])
+        }
+        DuStep::In | DuStep::Out => {
+            let mut radii: Vec<f32> = arcs.iter().map(|a| a.r0).collect();
+            radii.sort_by(f32::total_cmp);
+            radii.dedup_by(|a, b| same_ring(*a, *b));
+            let at = radii.iter().position(|r| same_ring(*r, cur.r0))?;
+            let want = match step {
+                DuStep::Out => *radii.get(at + 1)?,
+                _ => *radii.get(at.checked_sub(1)?)?,
+            };
+            let mid = 0.5 * (cur.a0 + cur.a1);
+            // The same epsilon `arc_hit` uses, for the same reason: accumulated sweeps
+            // leave hairline gaps where sectors meet.
+            arcs.iter().position(|a| {
+                same_ring(a.r0, want) && a.a0 - 1e-3 <= mid && mid <= a.a1 + 1e-3
+            })
+        }
+    }
+}
+
 /// Tight pixel bounding box of an annulus sector, used as the instance's quad so the
 /// fragment shader only runs where the sector can be. Padded a pixel for the edge AA.
 fn arc_bbox(arc: &DuArc) -> [f32; 4] {
@@ -3543,6 +3614,7 @@ fn main() -> Result<()> {
         du_rings: false,
         du_arcs: Vec::new(),
         du_hover: None,
+        du_focus: None,
         du_hub: None,
         du_msg: None,
         du_scanning: None,
@@ -4066,6 +4138,7 @@ struct App {
     du_rings: bool,          // rings (sunburst) instead of the squarified treemap — `t` toggles
     du_arcs: Vec<DuArc>,     // laid-out sectors of the rings view (drawing + hit-test)
     du_hover: Option<usize>, // index into `du_arcs` under the pointer, for the readout strip
+    du_focus: Option<usize>, // index into `du_arcs` moved by the arrow keys, same readout
     du_hub: Option<([f32; 2], f32)>, // rings centre + hub radius, for the centre label
     du_msg: Option<String>,  // status line: "scanning…", a timeout, or "empty"
     du_scanning: Option<usize>, // Some(dirs seen) while a scan is still running
@@ -8182,6 +8255,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.du_boxes.clear();
         self.du_arcs.clear();
         self.du_hover = None;
+        self.du_focus = None;
 
         let Some(cwd) = self.session_cwd() else {
             self.du_msg = Some("Can't determine the current directory.".into());
@@ -8208,6 +8282,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         self.du_boxes.clear();
         self.du_arcs.clear();
         self.du_hover = None;
+        self.du_focus = None;
         self.du_msg = None;
         self.du_scanning = None;
         self.du_note = None;
@@ -8361,9 +8436,13 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             None => return,
         };
         self.du_hub = Some((center, hub));
-        // A hover index kept across a resize or a zoom would name a different directory.
+        // An index kept across a resize, a zoom or a mid-scan update would name a
+        // different directory — and `du_arcs` is rebuilt by every one of those.
         if self.du_hover.is_some_and(|i| i >= self.du_arcs.len()) {
             self.du_hover = None;
+        }
+        if self.du_focus.is_some_and(|i| i >= self.du_arcs.len()) {
+            self.du_focus = None;
         }
     }
 
@@ -8379,6 +8458,10 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         let hit = self.du_arc_at(x, y);
         if hit != self.du_hover {
             self.du_hover = hit;
+            // The pointer wins while it is over a sector: one marker, not two fighting.
+            if hit.is_some() {
+                self.du_focus = None;
+            }
             self.request_redraw();
         }
     }
@@ -8391,10 +8474,21 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             Key::Character(c) if c.eq_ignore_ascii_case("t") => {
                 self.du_rings = !self.du_rings;
                 self.du_hover = None;
+                self.du_focus = None;
                 self.request_redraw();
             }
+            // Arrow keys walk the rings without a pointer: along the current ring, or
+            // across to the ring inside or outside it (spec-du-rings.md §5).
+            Key::Named(NamedKey::ArrowLeft) => self.du_focus_step(DuStep::Prev),
+            Key::Named(NamedKey::ArrowRight) => self.du_focus_step(DuStep::Next),
+            Key::Named(NamedKey::ArrowUp) => self.du_focus_step(DuStep::In),
+            Key::Named(NamedKey::ArrowDown) => self.du_focus_step(DuStep::Out),
+            // Space is the keyboard's click: zoom into whatever is focused. `Enter` keeps
+            // its own meaning (compose a `cd`), so the two are never confused.
+            Key::Named(NamedKey::Space) => self.du_zoom_focus(),
             Key::Named(NamedKey::Backspace) => {
                 if self.du_zoom.pop().is_some() {
+                    self.du_focus = None;
                     self.request_redraw();
                 } else {
                     self.du_close();
@@ -8405,22 +8499,53 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         }
     }
 
+    /// Move the keyboard focus one sector (spec-du-rings.md §5). Rings only — the treemap
+    /// shows one level at a time and is navigated by clicking into it.
+    fn du_focus_step(&mut self, step: DuStep) {
+        if !self.du_rings || self.du_arcs.is_empty() {
+            return;
+        }
+        // The pointer and the keyboard drive one focus between them: arrowing away from a
+        // hovered sector continues from where the pointer left off, rather than jumping.
+        let from = self.du_focus.or(self.du_hover);
+        match arc_step(&self.du_arcs, from, step) {
+            Some(i) => {
+                self.du_focus = Some(i);
+                self.du_hover = None;
+            }
+            // Inward from the innermost ring is the view itself: drop the focus so the
+            // strip reads the whole directory again.
+            None if step == DuStep::In => {
+                self.du_focus = None;
+                self.du_hover = None;
+            }
+            // Nowhere to go (outward from the last ring): leave the focus where it is
+            // rather than silently losing it.
+            None => return,
+        }
+        self.request_redraw();
+    }
+
+    /// `Space` — zoom into the focused sector, exactly as clicking it would.
+    fn du_zoom_focus(&mut self) {
+        let Some(path) = self
+            .du_focus
+            .or(self.du_hover)
+            .and_then(|i| self.du_arcs.get(i))
+            .and_then(|a| a.zoom.clone())
+        else {
+            return;
+        };
+        self.du_zoom_into(path);
+    }
+
     /// A left-click while the overlay is open: zoom into the clicked directory if it has
     /// children (spec §5). In rings mode a sector carries its whole index path, so a click
     /// on an outer ring descends every level at once rather than one at a time.
     fn du_click(&mut self, x: f32, y: f32) {
         if self.du_rings {
-            let Some(path) = self.du_arc_at(x, y).and_then(|i| self.du_arcs[i].zoom.clone()) else {
-                return;
-            };
-            let mut node = self.du_view();
-            for &i in &path {
-                node = node.and_then(|n| n.children.get(i));
-            }
-            if node.is_some_and(|n| !n.children.is_empty()) {
-                self.du_zoom.extend(path);
-                self.du_hover = None;
-                self.request_redraw();
+            if let Some(path) = self.du_arc_at(x, y).and_then(|i| self.du_arcs[i].zoom.clone()) {
+                self.du_zoom_into(path);
             }
             return;
         }
@@ -8440,11 +8565,36 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
         }
     }
 
+    /// Descend by a sector's whole index path — what a click and `Space` both do. A sector
+    /// with no children of its own is not a destination: zooming there would show an empty
+    /// circle, so the step is refused rather than taken.
+    fn du_zoom_into(&mut self, path: Vec<usize>) {
+        let mut node = self.du_view();
+        for &i in &path {
+            node = node.and_then(|n| n.children.get(i));
+        }
+        if node.is_some_and(|n| !n.children.is_empty()) {
+            self.du_zoom.extend(path);
+            self.du_hover = None;
+            self.du_focus = None;
+            self.request_redraw();
+        }
+    }
+
     /// `Enter` — compose `cd <path>` for the directory in view (spec §5, insert-never-run):
     /// relativised to the scan root, shell-quoted, with the typed line cleared first.
     fn du_cd(&mut self) {
-        let (root, path) = match (self.du_root.as_ref(), self.du_view()) {
-            (Some(r), Some(v)) => (r.path.clone(), v.path.clone()),
+        // A focused (or hovered) sector is what the strip is reading out, so that is the
+        // directory `Enter` means — otherwise it is the view itself, as before.
+        let marked = self
+            .du_focus
+            .or(self.du_hover)
+            .and_then(|i| self.du_arcs.get(i))
+            .filter(|a| a.zoom.is_some())
+            .map(|a| a.path.clone());
+        let (root, path) = match (self.du_root.as_ref(), marked, self.du_view()) {
+            (Some(r), Some(p), _) => (r.path.clone(), p),
+            (Some(r), None, Some(v)) => (r.path.clone(), v.path.clone()),
             _ => return,
         };
         let arg = shell_quote(&relativize(&root, &path));
@@ -8469,15 +8619,22 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             (None, Some(note)) => format!("partial — {note} · "),
             (None, None) => String::new(),
         };
-        match self.du_hover.and_then(|i| self.du_arcs.get(i)) {
-            // Hovering: the sector's own path/size, since nothing else can show it.
+        // Rings name the arrow keys; the treemap has no keyboard focus to offer.
+        let keys = if self.du_rings {
+            "←→ ring · ↑↓ depth · Space zoom · Backspace up · Enter cd"
+        } else {
+            "click zoom · Backspace up · Enter cd here"
+        };
+        // Whatever is marked — by the pointer or by the arrows — is what the strip reads
+        // out and what `Enter` acts on, so the two can never disagree.
+        match self.du_focus.or(self.du_hover).and_then(|i| self.du_arcs.get(i)) {
             Some(a) => format!(
-                "du · {state}{} · {}   ·  click zoom · Backspace up · Enter cd here · {mode} · Esc",
+                "du · {state}{} · {}   ·  {keys} · {mode} · Esc",
                 a.path,
                 fmt_kib(a.size_kb),
             ),
             None => format!(
-                "du · {state}{} · {}   ·  click zoom · Backspace up · Enter cd here · {mode} · Esc",
+                "du · {state}{} · {}   ·  {keys} · {mode} · Esc",
                 v.path,
                 fmt_kib(v.size_kb),
             ),
@@ -9905,7 +10062,7 @@ Analyze it and list the visual/UX issues you find, each with a specific fix.",
             boxes: &du_boxes_local,
             arcs: &du_arcs_local,
             rings: self.du_rings,
-            hover: self.du_hover,
+            hover: self.du_focus.or(self.du_hover),
             hub: du_hub_local.as_ref(),
             title: &du_title_local,
             msg: du_msg_local.as_deref(),
@@ -15108,6 +15265,102 @@ mod tests {
         let t = b.tree().unwrap();
         assert_eq!(t.children.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["a"]);
         assert_eq!(t.size_kb, 7);
+    }
+
+    #[test]
+    fn arrow_steps_walk_the_rings() {
+        // Two levels: three children of the view, each with children of its own, so there
+        // are two rings to step between.
+        let tree = du(
+            "root",
+            100,
+            vec![
+                du("a", 50, vec![du("a1", 30, vec![]), du("a2", 20, vec![])]),
+                du("b", 30, vec![du("b1", 30, vec![])]),
+                du("c", 20, vec![du("c1", 20, vec![])]),
+            ],
+        );
+        let arcs = sunburst(&tree, [200.0, 200.0], 40.0, 60.0, 2);
+        let name = |i: usize| arcs[i].name.clone();
+        let inner: Vec<usize> = (0..arcs.len()).filter(|&i| arcs[i].r0 == 40.0).collect();
+        assert_eq!(inner.iter().map(|&i| name(i)).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+
+        // Nothing focused: the first step lands on the largest sector of the inner ring.
+        let start = arc_step(&arcs, None, DuStep::Next).unwrap();
+        assert_eq!(name(start), "a");
+
+        // Along the ring, clockwise, wrapping at 12 o'clock rather than stopping there —
+        // a ring is a circle, and an end-stop would strand the sectors either side of the
+        // seam.
+        let b = arc_step(&arcs, Some(start), DuStep::Next).unwrap();
+        let c = arc_step(&arcs, Some(b), DuStep::Next).unwrap();
+        assert_eq!((name(b).as_str(), name(c).as_str()), ("b", "c"));
+        assert_eq!(name(arc_step(&arcs, Some(c), DuStep::Next).unwrap()), "a");
+        assert_eq!(name(arc_step(&arcs, Some(start), DuStep::Prev).unwrap()), "c");
+
+        // Outward follows the focused sector's own angle, so it lands inside it — `a`'s
+        // first child, not `b`'s.
+        let a1 = arc_step(&arcs, Some(start), DuStep::Out).unwrap();
+        assert_eq!(name(a1), "a1");
+        // Containment is checked through the zoom index path, which is the structural
+        // link the view navigates by. (Not the `path` string: this module's test helper
+        // gives every node a flat `/r/<name>`, so a prefix test there would pass on the
+        // names happening to share letters and prove nothing.)
+        let (parent, child) = (arcs[start].zoom.clone().unwrap(), arcs[a1].zoom.clone().unwrap());
+        assert_eq!(child[..parent.len()], parent[..], "{child:?} is not under {parent:?}");
+        assert_eq!(child.len(), parent.len() + 1);
+        // And back in again returns to the parent, not to wherever the ring starts.
+        assert_eq!(name(arc_step(&arcs, Some(a1), DuStep::In).unwrap()), "a");
+
+        // The two end-stops, which the caller tells apart: nothing outside the last ring,
+        // and nothing inside the first (the hub is not a sector).
+        assert_eq!(arc_step(&arcs, Some(a1), DuStep::Out), None);
+        assert_eq!(arc_step(&arcs, Some(start), DuStep::In), None);
+        assert_eq!(arc_step(&[], None, DuStep::Next), None);
+    }
+
+    #[test]
+    fn stepping_out_stays_inside_the_sector_it_came_from() {
+        // The property behind `Out`: whichever sector is focused, the one it steps to must
+        // be a child of it. A mid-angle that fell outside would hand the user a sector
+        // from a neighbouring branch, which looks like navigation and isn't.
+        let kids: Vec<_> = (0..7)
+            .map(|i| {
+                let gk = (0..3).map(|j| du(&format!("g{i}{j}"), 10 + j, vec![])).collect();
+                du(&format!("k{i}"), 40 + i, gk)
+            })
+            .collect();
+        let tree = du("root", 500, kids);
+        let arcs = sunburst(&tree, [300.0, 300.0], 50.0, 70.0, 2);
+        let mut checked = 0;
+        let mut remainders = 0;
+        for (i, a) in arcs.iter().enumerate() {
+            if a.r0 != 50.0 {
+                continue;
+            }
+            // `(files here)` is a sector like any other to the stepper, and it is reachable
+            // along the ring — but it is the bytes sitting in this directory, not a
+            // directory, so there is nothing to step out into. 500 against 301 of children
+            // puts a large one on the inner ring here, which is why this is checked.
+            if a.zoom.is_none() {
+                assert_eq!(arc_step(&arcs, Some(i), DuStep::Out), None, "the remainder has no children");
+                remainders += 1;
+                continue;
+            }
+            let out = arc_step(&arcs, Some(i), DuStep::Out).expect("every directory here has children");
+            let (parent, child) = (a.zoom.clone().unwrap(), arcs[out].zoom.clone().unwrap());
+            assert_eq!(
+                child[..parent.len()],
+                parent[..],
+                "stepping out of {} reached {}",
+                a.name,
+                arcs[out].name
+            );
+            assert_eq!(child.len(), parent.len() + 1);
+            assert_eq!(arc_step(&arcs, Some(out), DuStep::In), Some(i), "in is not the inverse of out");
+            checked += 1;
+        }
+        assert_eq!((checked, remainders), (7, 1));
     }
 
     #[test]
