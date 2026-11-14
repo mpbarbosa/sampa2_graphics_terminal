@@ -111,6 +111,48 @@ which is what makes a 300-row table scannable rather than readable.
   command. Toggling the kernel fold reveals threads inline and updates the count, the page
   bar, and the row set together.
 
+### The `DESCRIPTION` column
+
+A `DESCRIPTION` column carries a one-line summary of what each process **is** — the gap
+between a table full of paths and knowing which of them matter.
+
+**It comes from `whatis`, the system's own man-db summary database, and nowhere else.** One
+batched call per panel open, read-only, no shell, `--` before the names, a timeout and a
+cap on how many are asked about. Measured on an 832-process `ps aux`: 134 distinct names,
+**17 ms** for the whole table, **80 of them answered**. The misses are desktop and vendor
+binaries that ship no manual page — `chrome`, `code`, `claude`, `accounts-daemon`. Those
+rows stay **blank**, which is the honest answer; there is no curated fallback list to go
+stale or to be wrong on someone else's machine.
+
+**The name is taken from `/proc/<pid>/comm`, not from the `COMMAND` text**, and this is
+what makes the column work at all rather than a refinement of it. `ps aux` truncates
+`COMMAND` to the terminal width (§5), so `/usr/lib/systemd/systemd` arrives as
+`/usr/lib/syst` and its basename is `syst` — a lookup for nothing. Before this, at the
+width a default window gives, almost every row was undescribable, and `systemd-oomd`,
+`systemd-udevd` and `systemd-logind` were three identical `/usr/lib/syst` strings. Read
+from `/proc` they are three different names with three different descriptions. A pid whose
+process has since exited simply falls back to the command's basename.
+
+**Process names are not trusted.** A process controls its own `argv[0]`, and these names
+become arguments to another program. Only `[A-Za-z0-9._+-]` survives; a leading `-` is
+stripped, because a login shell prints as `-zsh` and `whatis` reads that as an option — the
+whole batch then fails with `invalid option -- 'z'`, so `--` on its own is not enough. A
+pid must be digits for the same reason: `/proc/<pid>/comm` is built by interpolation, and
+`..` in that slot escapes `/proc` entirely, since `/proc/../tmp/x` *is* `/tmp/x`.
+
+**Width.** Below `PS_MIN_WIDTH_DESC` (100 columns, matching `min_width_bars`) the column is
+dropped and the table looks exactly as it did — the step-down rule of §8. Above it, `DESC`
+takes a third of what is spare, capped at 40 columns, and is dropped again if that comes to
+under 14; `COMMAND` keeps the rest and needs no floor of its own, since a third off still
+leaves it two thirds. `COMMAND` is padded to the widest one actually drawn rather than to
+its whole budget, so the descriptions sit beside the commands instead of at the far edge of
+a gap nothing fills.
+
+The threshold is a constant rather than an `[enhance]` setting because the width thresholds
+live in `sampa-config`, a different repository. Note that the 1c inspector takes over at 120
+columns and draws its own rows, so the flat table — and this column with it — runs between
+100 and 119 columns, or at any width for anyone who pins `ps = bars`.
+
 ### Keyboard navigation (1a and 1b)
 
 The flat table carries a **moving selection**, not just a scroll position. Without one the
