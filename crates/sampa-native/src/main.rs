@@ -5783,7 +5783,14 @@ const PS_DESC_MAX: usize = 40;
 /// `DESC` is the one that yields: it takes a third of what is going spare, capped at
 /// [`PS_DESC_MAX`], and if that comes to less than [`PS_DESC_MIN`] it gets nothing and the
 /// column is not drawn at all. Returns `(command, desc)`, where `desc == 0` means "no
-/// column"; the two always sum to `budget`.
+/// column".
+///
+/// **The single space between the two columns is paid for here**, so a drawn pair sums to
+/// `budget - 1` and a dropped one to the whole `budget`. Leaving that space out is not a
+/// cosmetic slip. The row then comes to one column more than the panel holds, and the panel
+/// wraps on *word* boundaries rather than clipping — so a one-column overrun drops the
+/// description's whole last word to column 0 of the next line, which looks like a layout
+/// collapse rather than an off-by-one. 0.20.0 shipped with exactly that.
 ///
 /// `COMMAND` needs no floor of its own. Taking a third leaves it two thirds, and a `DESC`
 /// wide enough to draw at all needs `budget >= 3 * PS_DESC_MIN`, so `COMMAND` is never left
@@ -5791,11 +5798,11 @@ const PS_DESC_MAX: usize = 40;
 /// carry one, at 24 columns; it could not be made to bind, and a guard whose removal no
 /// test can observe is decoration, so it is gone rather than kept for reassurance.
 fn desc_split(budget: usize) -> (usize, usize) {
-    let desc = (budget / 3).min(PS_DESC_MAX);
+    let desc = (budget.saturating_sub(1) / 3).min(PS_DESC_MAX);
     if desc < PS_DESC_MIN {
         return (budget, 0);
     }
-    (budget - desc, desc)
+    (budget - 1 - desc, desc)
 }
 
 /// Which way a keyboard step moves the flat `ps` table's selection (spec §5).
@@ -15812,31 +15819,70 @@ zsh (1)              - the Z shell
         // 100. (120 would not prove it — a third of that *is* the cap.)
         let (cmd, desc) = desc_split(300);
         assert_eq!(desc, PS_DESC_MAX, "a wide table caps DESC rather than letting it sprawl");
-        assert_eq!(cmd + desc, 300, "the split spends the whole budget");
+        assert_eq!(cmd + 1 + desc, 300, "the split spends the whole budget");
         assert!(cmd > desc, "COMMAND keeps the larger share");
-        assert_eq!(desc_split(3 * PS_DESC_MAX).1, PS_DESC_MAX, "the cap binds from here up");
+        assert_eq!(
+            desc_split(3 * PS_DESC_MAX + 1).1,
+            PS_DESC_MAX,
+            "the cap binds from here up — one past three times it, because the separator \
+             comes out of the budget before the third is taken"
+        );
 
         // A third of what is spare, while that is under the cap.
         let (cmd, desc) = desc_split(60);
-        assert_eq!((cmd, desc), (40, 20));
+        assert_eq!((cmd, desc), (40, 19));
 
-        // The narrowest budget that still draws a column, and the one below it.
-        assert_eq!(desc_split(3 * PS_DESC_MIN), (2 * PS_DESC_MIN, PS_DESC_MIN));
-        let narrow = 3 * PS_DESC_MIN - 1;
+        // The narrowest budget that still draws a column, and the one below it. Both sit
+        // one higher than three times the floor, for the same reason as the cap above.
+        assert_eq!(desc_split(3 * PS_DESC_MIN + 1), (2 * PS_DESC_MIN, PS_DESC_MIN));
+        let narrow = 3 * PS_DESC_MIN;
         assert_eq!(
             desc_split(narrow),
             (narrow, 0),
             "with no room to say anything, DESC is dropped and COMMAND gets the lot"
         );
 
-        // Across every width: the budget is spent exactly, a drawn DESC is never too thin
-        // to read, and COMMAND always keeps the larger share. That last one is why no
-        // separate COMMAND floor is needed.
+        // Across every width: the budget is spent exactly *including the space between the
+        // columns*, a drawn DESC is never too thin to read, and COMMAND always keeps the
+        // larger share. That last one is why no separate COMMAND floor is needed.
+        //
+        // The first of these is the one that matters. Drop the `- 1` from `desc_split` and
+        // it is the assertion that goes red; the panel wraps on word boundaries, so without
+        // it a full-width row throws its last word onto the next line.
         for budget in 0..400 {
             let (cmd, desc) = desc_split(budget);
-            assert_eq!(cmd + desc, budget, "budget {budget} must be spent exactly");
+            let sep = usize::from(desc > 0);
+            assert_eq!(cmd + sep + desc, budget, "budget {budget} must be spent exactly");
             assert!(desc == 0 || desc >= PS_DESC_MIN, "budget {budget} drew a DESC too thin to read");
             assert!(cmd >= desc, "budget {budget} gave DESC the larger share");
+        }
+    }
+
+    #[test]
+    fn a_full_width_ps_row_fits_the_panel_exactly() {
+        // The bug 0.20.1 fixes, stated as the renderer states it. `ps_render_quiet` lays a
+        // row out as the fixed columns, then COMMAND padded to `cmd_pad`, then one space,
+        // then the description — and `cmd_pad` is clamped up to `cmd_budget`, so the widest
+        // row the table can produce is exactly that sum. It must not exceed `cols`.
+        //
+        // Worked from the width this was caught at: a 111-column window, 7-digit PIDs,
+        // 8-character user names, bars on. `fixed` is then 59.
+        let fixed = 59;
+        for cols in 100..200usize {
+            let spare = cols.saturating_sub(fixed).max(8);
+            let (cmd_budget, desc_w) = desc_split(spare);
+            let cmd_budget = cmd_budget.max(8);
+            // `cmd_pad` is `.clamp("COMMAND".len(), cmd_budget)`, so this is its ceiling —
+            // reached whenever any command is long enough to be cut, which on a real
+            // machine is almost every time.
+            let widest = fixed + cmd_budget + usize::from(desc_w > 0) + desc_w;
+            assert!(
+                widest <= cols,
+                "at {cols} cols a full-width row came to {widest} — it would wrap"
+            );
+            // And the header, which carries its own label rather than the data's width.
+            let header = fixed + cmd_budget + if desc_w == 0 { 0 } else { " DESCRIPTION".len() };
+            assert!(header <= cols, "at {cols} cols the header came to {header}");
         }
     }
 

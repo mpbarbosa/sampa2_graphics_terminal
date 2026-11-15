@@ -148,6 +148,16 @@ leaves it two thirds. `COMMAND` is padded to the widest one actually drawn rathe
 its whole budget, so the descriptions sit beside the commands instead of at the far edge of
 a gap nothing fills.
 
+**The space between `COMMAND` and `DESCRIPTION` is part of the budget, not extra.** 0.20.0
+split the spare width in two and then drew a separator between the halves, so the widest
+row came to one column more than the panel held. That column is not clipped: the panel
+lays its body out as text and wraps on **word** boundaries, so a one-column overrun threw
+the description's whole last word down to column 0 of the next line — `systemd system` on
+one line and `a…` on the next, which reads as a collapsed layout rather than an
+off-by-one. The split now pays for the separator before dividing what is left, and a test
+sweeps every width from 100 to 200 columns asserting that the widest row the renderer can
+produce, header included, still fits.
+
 The threshold is a constant rather than an `[enhance]` setting because the width thresholds
 live in `sampa-config`, a different repository. Note that the 1c inspector takes over at 120
 columns and draws its own rows, so the flat table — and this column with it — runs between
