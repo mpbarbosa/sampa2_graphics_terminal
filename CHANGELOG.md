@@ -5,6 +5,29 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Entries are derived from
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.20.1] - 2026-11-14
+
+### Fixed
+
+- **The `ps` `DESCRIPTION` column no longer wraps onto the next line.** 0.20.0 split the
+  spare width between `COMMAND` and `DESC` and *then* drew a space between them, so the
+  widest row came to one column more than the panel holds. The panel does not clip that
+  column — it lays its body out as text and wraps on word boundaries — so the overrun
+  threw each description's whole last word down to column 0 of the next line (`systemd
+  system` on one line, `a…` on the next). It read as a collapsed layout rather than an
+  off-by-one, and cost about a third of the visible rows. The split now pays for the
+  separator before taking its third.
+
+  Three derived widths shift by one column as a result: `DESC` reaches its 40-column cap,
+  and clears its 14-column floor, one column later than before.
+
+### Testing
+
+- `a_full_width_ps_row_fits_the_panel_exactly` sweeps every width from 100 to 200 columns
+  and asserts that the widest row the renderer can produce — header included — still fits.
+  Deleting the fix turns it red with *"at 101 cols a full-width row came to 102 — it would
+  wrap"*, and takes the budget assertion in `desc_split`'s own test with it.
+
 ## [0.20.0] - 2026-11-14
 
 **The `ps` table says what each process is.** A `DESCRIPTION` column carries a one-line
